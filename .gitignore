@@ -1,0 +1,26 @@
+# Entorno Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secretos
+.env
+.env.local
+*.key
+
+# Memoria y datos privados de GAIA
+lumen-core/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Logs y temporales
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

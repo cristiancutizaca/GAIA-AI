@@ -1,0 +1,8 @@
+# LUMEN Core v0.2 - Python 3.11+
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+httpx==0.27.0
+edge-tts==6.1.12
+openai-whisper==20231117
+python-multipart==0.0.9
+python-dotenv==1.0.1
