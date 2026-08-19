@@ -1,6 +1,7 @@
-# LUMEN PC v0.2 - Python 3.11+
+# GAIA PC v0.4.0 - Python 3.11+
 # Tkinter se incluye en Python de Windows; en Linux instala python3-tk con el sistema.
 httpx==0.27.0
 sounddevice==0.4.7
 numpy==1.26.4
 python-dotenv==1.0.1
+psutil==6.1.1

@@ -5,7 +5,7 @@ import '../services/lumen_service.dart';
 import 'settings_screen.dart';
 
 class ChatMessage {
-  final String text;
+  String text;
   final bool isUser;
   final DateTime timestamp;
   final String? audioUrl;
@@ -35,6 +35,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isLoading = false;
   bool _isConnected = false;
   bool _autoVoice = true;
+  String _profile = 'auto';
   Timer? _proactiveTimer;
 
   @override
@@ -103,21 +104,34 @@ class _ChatScreenState extends State<ChatScreen> {
 
     _textController.clear();
     _addMessage(ChatMessage(text: text, isUser: true));
+    final assistant = ChatMessage(text: '', isUser: false);
+    _addMessage(assistant);
     setState(() => _isLoading = true);
+    final buffer = StringBuffer();
 
     try {
-      final data = await _lumen.sendMessage(text);
-      final response = data['response'] ?? '...';
-      _addMessage(ChatMessage(text: response, isUser: false));
-
-      if (_autoVoice) {
-        await _playVoice(response);
+      await for (final event in _lumen.streamMessage(text, profile: _profile)) {
+        final type = event['event'];
+        if (type == 'token') {
+          buffer.write(event['text'] ?? '');
+          setState(() => assistant.text = buffer.toString());
+        } else if (type == 'action') {
+          final preview = event['preview'] ?? 'Acción validada pendiente de ejecución en el dispositivo correspondiente.';
+          buffer.write(preview);
+          setState(() => assistant.text = buffer.toString());
+        } else if (type == 'error' || type == 'cancelled') {
+          buffer.write(event['detail'] ?? 'Generación cancelada.');
+          setState(() => assistant.text = buffer.toString());
+        }
+      }
+      if (assistant.text.trim().isEmpty) {
+        setState(() => assistant.text = 'GAIA no devolvió texto visible.');
+      }
+      if (_autoVoice && assistant.text.trim().isNotEmpty) {
+        await _playVoice(assistant.text);
       }
     } catch (e) {
-      _addMessage(ChatMessage(
-        text: 'Error de conexión. ¿El Core sigue vivo?',
-        isUser: false,
-      ));
+      setState(() => assistant.text = 'No pude conectar con GAIA. El Core puede seguir funcionando; revisa la red LAN y el token.');
     } finally {
       setState(() => _isLoading = false);
     }
@@ -186,7 +200,7 @@ class _ChatScreenState extends State<ChatScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        const Text('LUMEN', style: TextStyle(
+                        const Text('GAIA', style: TextStyle(
                           color: Colors.white, fontWeight: FontWeight.w700, fontSize: 18,
                           letterSpacing: 1.5,
                         )),
@@ -201,6 +215,20 @@ class _ChatScreenState extends State<ChatScreen> {
                         ),
                       ],
                     ),
+                  ),
+                  DropdownButton<String>(
+                    value: _profile,
+                    dropdownColor: const Color(0xFF1b1a2a),
+                    underline: const SizedBox.shrink(),
+                    style: const TextStyle(color: Color(0xFFb388ff), fontSize: 12),
+                    items: const [
+                      DropdownMenuItem(value: 'auto', child: Text('AUTO')),
+                      DropdownMenuItem(value: 'fast', child: Text('FAST')),
+                      DropdownMenuItem(value: 'normal', child: Text('NORMAL')),
+                      DropdownMenuItem(value: 'reasoning', child: Text('REASONING')),
+                      DropdownMenuItem(value: 'code', child: Text('CODE')),
+                    ],
+                    onChanged: (value) => setState(() => _profile = value ?? 'auto'),
                   ),
                   // Toggle voz
                   IconButton(
@@ -246,7 +274,7 @@ class _ChatScreenState extends State<ChatScreen> {
                             ),
                           ),
                           const SizedBox(height: 20),
-                          const Text('LUMEN', style: TextStyle(
+                          const Text('GAIA', style: TextStyle(
                             color: Colors.white, fontSize: 28, fontWeight: FontWeight.w800,
                             letterSpacing: 3,
                           )),

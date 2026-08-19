@@ -1,4 +1,4 @@
-# LUMEN Core v0.2 - Python 3.11+
+# GAIA Core v0.4.0 - Python 3.11+
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 httpx==0.27.0

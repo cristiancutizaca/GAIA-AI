@@ -1,0 +1,22 @@
+# BASELINE v0.5.2 desde GAIA-AI-v0.5.2-final.zip
+
+## Método
+
+Se extrajo `/home/ubuntu/GAIA-AI-v0.5.2-final.zip` en una ruta aislada y se ejecutaron pruebas desde esa copia, no desde la carpeta de desarrollo original.
+
+## Hallazgos reproducidos
+
+| Comprobación | Resultado | Evidencia |
+|---|---:|---|
+| `.env.example` en la raíz | FAIL | El archivo no estaba presente en la extracción |
+| `.gitignore` en la raíz | FAIL | El archivo no estaba presente en la extracción |
+| `python3 tests/fresh_install_test.py` | FAIL | `FileNotFoundError` al copiar `.env.example` |
+| `python3 tests/v04_test.py` | PASS | La ejecución baseline disponible pasó; no se afirma aquí una reproducción independiente del fallo WAL/SHM |
+
+## Suite baseline observada
+
+`gui_import_test.py`, `smoke_test.py`, `v03_test.py`, `v04_test.py`, `v041_test.py`, `v05_test.py`, `v051_test.py`, `action_plan_llm_test.py`, `device_permissions_test.py`, `device_touch_test.py`, `brain_backup_scheduler_test.py`, `startup_test.py`, `db_upgrade_test.py`, `backup_integrity_test.py`, `process_safety_test.py`, `security_regression_test.py`, `llm_health_test.py`, `vault_missing_test.py` y el resto de suites históricas estaban presentes en la extracción. La prueba independiente repetida sí confirmó el defecto de distribución; el defecto WAL/SHM se cubre en v0.5.3 con una DB WAL real, manifest exacto y round-trip de restore.
+
+## Interpretación honesta
+
+El baseline confirma que la carpeta de trabajo v0.5.2 no era equivalente al ZIP recibido: `.env.example` existía en el workspace histórico, pero no en el artefacto final. No se maquilla el hecho de que `v04_test.py` pasó durante esta reproducción; la nueva prueba no depende de esa falla histórica para demostrar la corrección de Brain Backup.

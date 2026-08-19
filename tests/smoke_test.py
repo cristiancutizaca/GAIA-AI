@@ -1,4 +1,4 @@
-"""Prueba del Core v0.2 sin credenciales ni dispositivos externos."""
+"""Prueba de compatibilidad del Core v0.5.3 sin credenciales ni dispositivos externos."""
 from __future__ import annotations
 import os
 import sys
@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="lumen_test_") as tmp:
     os.environ.update({
         "LUMEN_DATA_DIR": tmp,
         "LUMEN_LLM_BACKEND": "mock",
-        "LUMEN_SECRET": "test-secret-for-lumen-v02",
+        "LUMEN_SECRET": "test-secret-for-gaia-v04",
         "LUMEN_BACKUP_ENABLED": "false",
         "LUMEN_PROACTIVE_ENABLED": "false",
         "LUMEN_AUTO_FACTS_ENABLED": "false",
@@ -31,11 +31,11 @@ with tempfile.TemporaryDirectory(prefix="lumen_test_") as tmp:
         path.write_bytes(b"fake-mp3")
         return str(path)
     api_routes.text_to_speech = fake_tts
-    headers = {"Authorization": "Bearer test-secret-for-lumen-v02"}
+    headers = {"Authorization": "Bearer test-secret-for-gaia-v04"}
 
     with TestClient(app) as client:
         health = client.get("/api/health")
-        assert health.status_code == 200 and health.json()["version"] == "0.2.0-pc", health.text
+        assert health.status_code == 200 and health.json()["version"] == "0.5.3-pc", health.text
         assert client.get("/api/status").status_code == 401
         status = client.get("/api/status", headers=headers)
         assert status.status_code == 200 and status.json()["features"]["auto_facts"] is False, status.text
@@ -61,4 +61,4 @@ with tempfile.TemporaryDirectory(prefix="lumen_test_") as tmp:
         client.post("/api/proactive/test", headers=headers, json={"message": "prueba lista"})
         delivered = client.get("/api/proactive/check", headers=headers)
         assert delivered.json().get("message") == "prueba lista"
-print("SMOKE TEST v0.2 OK: auth, status, chat, memoria manual, voz/API, backup y polling.")
+print("SMOKE TEST v0.5.3 OK: auth, status, chat, memoria manual, voz/API, backup y polling.")

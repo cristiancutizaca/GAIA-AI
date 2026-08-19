@@ -1,11 +1,13 @@
-"""Interfaz gráfica de escritorio de LUMEN v0.2, construida con Tkinter."""
+"""Interfaz gráfica de escritorio de GAIA v0.4.1, construida con Tkinter."""
 from __future__ import annotations
 import argparse
+import os
 import queue
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, messagebox, simpledialog
 from desktop_api import LumenDesktopAPI, LumenAPIError, POLL_SECONDS, record_microphone, play_audio
+from action_response import parse_action_response, response_for_display
 
 BG = "#10121a"
 PANEL = "#171a25"
@@ -25,7 +27,9 @@ class LumenGUI(tk.Tk):
         self.voice_output = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Core: comprobando...")
         self.backend_var = tk.StringVar(value="LLM: --")
-        self.title("LUMEN v0.2 | Cliente PC")
+        self.profile_var = tk.StringVar(value=os.getenv("LUMEN_LLM_PROFILE", "auto"))
+        self.generation_var = tk.StringVar(value="Listo")
+        self.title("GAIA v0.5.3 | Cliente PC")
         self.geometry("960x680")
         self.minsize(760, 520)
         self.configure(bg=BG)
@@ -54,10 +58,11 @@ class LumenGUI(tk.Tk):
     def _build(self) -> None:
         header = ttk.Frame(self, padding=(20, 16, 20, 8))
         header.pack(fill="x")
-        ttk.Label(header, text="L U M E N", style="Header.TLabel").pack(side="left")
+        ttk.Label(header, text="G A I A", style="Header.TLabel").pack(side="left")
         indicators = ttk.Frame(header)
         indicators.pack(side="right")
         ttk.Label(indicators, textvariable=self.backend_var, style="Muted.TLabel").pack(anchor="e")
+        ttk.Label(indicators, textvariable=self.generation_var, style="Muted.TLabel").pack(anchor="e")
         self.status_label = ttk.Label(indicators, textvariable=self.status_var, style="Muted.TLabel")
         self.status_label.pack(anchor="e")
 
@@ -65,7 +70,11 @@ class LumenGUI(tk.Tk):
         toolbar.pack(fill="x")
         ttk.Button(toolbar, text="Backup", style="Tool.TButton", command=self._backup).pack(side="left", padx=(0, 8))
         ttk.Button(toolbar, text="Memoria", style="Tool.TButton", command=self._open_memory).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="Diagnóstico", style="Tool.TButton", command=self._diagnostics).pack(side="left", padx=(0, 8))
         ttk.Button(toolbar, text="Probar aviso", style="Tool.TButton", command=self._test_proactive).pack(side="left")
+        ttk.Label(toolbar, text="Perfil:").pack(side="right", padx=(10, 4))
+        self.profile_combo = ttk.Combobox(toolbar, textvariable=self.profile_var, values=("auto", "fast", "normal", "reasoning", "code"), state="readonly", width=11)
+        self.profile_combo.pack(side="right", padx=(0, 8))
         ttk.Checkbutton(toolbar, text="Responder con voz", variable=self.voice_output).pack(side="right")
 
         chat_panel = tk.Frame(self, bg=PANEL, highlightthickness=0)
@@ -79,7 +88,7 @@ class LumenGUI(tk.Tk):
         self.chat.tag_configure("user", foreground="#bcaeff", spacing1=10, spacing3=6)
         self.chat.tag_configure("assistant", foreground=TEXT, spacing1=10, spacing3=8)
         self.chat.tag_configure("system", foreground=MUTED, spacing1=10, spacing3=8)
-        self._append("system", "LUMEN v0.2 PC. La GUI está activa; el modelo depende del backend que configures.")
+        self._append("system", "GAIA v0.5.3 PC. Streaming activo; memoria jerárquica, RBAC y Action Engine seguro. Qué época para estar vivos.")
 
         composer = ttk.Frame(self, padding=(20, 0, 20, 18))
         composer.pack(fill="x")
@@ -90,6 +99,7 @@ class LumenGUI(tk.Tk):
         controls = ttk.Frame(composer)
         controls.pack(side="right", fill="y")
         ttk.Button(controls, text="Enviar", style="Accent.TButton", command=self._send).pack(fill="x", pady=(0, 6))
+        ttk.Button(controls, text="Detener", style="Tool.TButton", command=self._cancel_generation).pack(fill="x", pady=(0, 6))
         ttk.Button(controls, text="🎙 Hablar", style="Tool.TButton", command=self._record_and_send).pack(fill="x")
         ttk.Label(composer, text="Ctrl + Enter para enviar", style="Muted.TLabel").place(relx=0, rely=1.05)
 
@@ -113,7 +123,7 @@ class LumenGUI(tk.Tk):
         self.after(100, self._drain_events)
 
     def _append(self, role: str, text: str) -> None:
-        label = {"user": "Tú", "assistant": "LUMEN", "system": "Sistema"}.get(role, role)
+        label = {"user": "Tú", "assistant": "GAIA", "system": "Sistema"}.get(role, role)
         self.chat.configure(state="normal")
         self.chat.insert("end", f"{label}: ", role)
         self.chat.insert("end", f"{text}\n", role)
@@ -126,8 +136,10 @@ class LumenGUI(tk.Tk):
 
     def _set_status(self, data: dict) -> None:
         llm = data.get("llm", {})
-        self.status_var.set("Core: conectado")
-        self.backend_var.set(f"LLM: {llm.get('backend', '--')} | {llm.get('status', '--')} | {llm.get('model', '--')}")
+        vault = data.get("vault", {})
+        features = data.get("features", {})
+        self.status_var.set(f"Core: conectado | Vault: {vault.get('status', '--')} | Action Engine: {'activo' if features.get('action_engine') else 'apagado'}")
+        self.backend_var.set(f"LLM: {llm.get('backend', '--')} | {llm.get('status', '--')} | {llm.get('selected_model', llm.get('model', '--'))} | Perfil: {self.profile_var.get()}")
         self.status_label.configure(foreground=GOOD)
 
     def _set_disconnected(self, _exc: Exception) -> None:
@@ -141,13 +153,31 @@ class LumenGUI(tk.Tk):
             return
         self.input.delete("1.0", "end")
         self._append("user", message)
-        self._run(lambda: self.api.send_message(message), self._receive_chat)
+        self.generation_var.set(f"Generando ({self.profile_var.get()})...")
+        speak = bool(self.voice_output.get())
+        profile = self.profile_var.get()
+        self._run(lambda: self.api.send_assistant(message, profile=profile, speak=speak), self._receive_chat)
 
     def _receive_chat(self, data: dict) -> None:
+        self.generation_var.set("Listo" if data.get("kind") != "cancelled" else "Cancelado")
+        parsed = parse_action_response(data)
+        if parsed and parsed.confirmation_required:
+            preview = response_for_display(parsed)
+            title = "Confirmar plan | GAIA" if parsed.is_plan else "Confirmar acción | GAIA"
+            if messagebox.askyesno(title, preview, parent=self):
+                self.generation_var.set("Ejecutando plan confirmado..." if parsed.is_plan else "Ejecutando acción confirmada...")
+                self._run(lambda: self.api.confirm_action(data), self._receive_chat)
+            else:
+                self._run(lambda: self.api.cancel_action(data), lambda _result: self._append("system", "Plan cancelado por el usuario." if parsed.is_plan else "Acción cancelada por el usuario."), self._show_error)
+            return
         text = data.get("response", "")
-        self._append("assistant", text)
-        if self.voice_output.get() and text:
+        if text:
+            self._append("assistant", text)
+        if self.voice_output.get() and text and not data.get("tts_streamed"):
             self._run(lambda: play_audio(self.api.request_tts(text)), None)
+
+    def _cancel_generation(self) -> None:
+        self._run(self.api.cancel_generation, lambda _data: self.generation_var.set("Cancelación solicitada"), self._show_error)
 
     def _record_and_send(self) -> None:
         self._append("system", "Grabando 5 segundos...")
@@ -158,6 +188,10 @@ class LumenGUI(tk.Tk):
 
     def _receive_voice(self, data: dict) -> None:
         self._append("user", f"[voz] {data.get('user_text', '')}")
+        parsed = parse_action_response(data)
+        if parsed and parsed.confirmation_required:
+            self._receive_chat(data)
+            return
         self._append("assistant", data.get("response", ""))
         if data.get("tts_error"):
             self._append("system", f"Texto recibido, pero TTS falló: {data['tts_error']}")
@@ -181,25 +215,53 @@ class LumenGUI(tk.Tk):
         self._run(self.api.poll_proactive, received, lambda _e: None)
         self.after(POLL_SECONDS * 1000, self._poll_proactive)
 
+    def _diagnostics(self) -> None:
+        self._run(self.api.diagnostics, self._show_diagnostics)
+
+    def _show_diagnostics(self, data: dict) -> None:
+        sections = ("core", "database", "vault", "ollama", "voice", "action_engine", "devices")
+        text = "\n".join(f"{section}: {data.get(section, {})}" for section in sections)
+        messagebox.showinfo("Diagnóstico seguro | GAIA", text, parent=self)
+
     def _open_memory(self) -> None:
         self._run(self.api.facts, self._memory_window)
 
     def _memory_window(self, facts: list[dict]) -> None:
         window = tk.Toplevel(self)
-        window.title("Memoria guardada | LUMEN")
-        window.geometry("650x430")
+        window.title("Memoria y continuidad | GAIA")
+        window.geometry("760x520")
         window.configure(bg=BG)
+        search_row = ttk.Frame(window, padding=(16, 12, 16, 4))
+        search_row.pack(fill="x")
+        query = tk.StringVar()
+        ttk.Entry(search_row, textvariable=query).pack(side="left", fill="x", expand=True, padx=(0, 8))
         listbox = tk.Listbox(window, bg=PANEL, fg=TEXT, selectbackground=ACCENT, borderwidth=0, font=("Segoe UI", 10))
-        listbox.pack(fill="both", expand=True, padx=16, pady=(16, 8))
-        for fact in facts:
-            listbox.insert("end", f"#{fact['id']}  [{fact['category']}] {fact['fact']}  ({fact['source']})")
+        listbox.pack(fill="both", expand=True, padx=16, pady=(8, 8))
+        def render(items: list[dict]) -> None:
+            listbox.delete(0, "end")
+            for item in items:
+                if "task" in item:
+                    listbox.insert("end", f"TAREA #{item.get('id')}: {item.get('task')}")
+                else:
+                    listbox.insert("end", f"#{item.get('id')}  [{item.get('category')}] {item.get('fact')}  ({item.get('source', 'search')})")
+        render(facts)
+        def search() -> None:
+            text = query.get().strip()
+            if text:
+                self._run(lambda: self.api.search_memories(text), render)
+            else:
+                render(facts)
+        ttk.Button(search_row, text="Buscar", style="Accent.TButton", command=search).pack(side="right")
+        task_row = ttk.Frame(window, padding=(16, 0, 16, 6))
+        task_row.pack(fill="x")
+        ttk.Button(task_row, text="Mostrar tareas abiertas", style="Tool.TButton", command=lambda: self._run(self.api.open_tasks, render)).pack(side="left")
         buttons = ttk.Frame(window, padding=(16, 0, 16, 16))
         buttons.pack(fill="x")
         def add():
             category = simpledialog.askstring("Categoría", "Categoría del fact:", parent=window)
             if not category:
                 return
-            fact = simpledialog.askstring("Fact", "Dato que LUMEN debe guardar:", parent=window)
+            fact = simpledialog.askstring("Fact", "Dato que GAIA debe guardar:", parent=window)
             if fact:
                 self._run(lambda: self.api.add_fact(category, fact), lambda _x: (window.destroy(), self._open_memory()))
         def delete():
@@ -221,7 +283,7 @@ class LumenGUI(tk.Tk):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LUMEN GUI PC")
+    parser = argparse.ArgumentParser(description="GAIA GUI PC")
     parser.add_argument("--url", default=None, help="URL del Core")
     parser.add_argument("--token", default=None, help="Token local (mejor configurar .env)")
     parser.add_argument("--check", action="store_true", help="Valida importación de la GUI sin abrir ventana")

@@ -1,0 +1,17 @@
+{
+  "projects": [
+    {
+      "name": "gaia",
+      "aliases": ["asistente", "gaia-ai"],
+      "path": ".",
+      "working_directory": ".",
+      "trusted": false,
+      "allowed_os": ["Windows", "Linux", "Darwin"],
+      "commands": {
+        "backend": ["python", "-m", "uvicorn", "main:app", "--app-dir", "lumen-core", "--host", "127.0.0.1", "--port", "8090"],
+        "tests": ["python", "-m", "compileall", "-q", "lumen-core", "lumen-pc", "tests"]
+      },
+      "notes": "Cambia trusted a true solo después de revisar manualmente cada comando y la ruta."
+    }
+  ]
+}

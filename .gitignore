@@ -1,26 +1,47 @@
-# Entorno Python
+.env
+.env.*
+!.env.example
+
 .venv/
 venv/
+env/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+.pytest_cache/
 
-# Secretos
-.env
-.env.local
-*.key
-
-# Memoria y datos privados de GAIA
-lumen-core/data/
+# Bases locales y temporales de SQLite
 *.db
-*.db-shm
 *.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-journal
 
-# Logs y temporales
+# Datos privados y backups generados
+lumen-core/data/
+data/
+logs/
+backups/
+GAIA_VAULT/
 *.log
-.DS_Store
-Thumbs.db
+*.zip
+*.bak
 
-# IDE
-.vscode/
-.idea/
+# Procesos, tokens y configuración local
+.gaia_processes.json
+*.token
+tokens/
+secrets/
+
+# Audio generado o capturado
+audio/
+*.wav
+*.mp3
+*.m4a
+*.webm
+
+# Exportaciones y temporales
+exports/
+emergency/
+tmp/
+*.tmp

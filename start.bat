@@ -7,7 +7,7 @@ if exist "%~dp0.venv\Scripts\python.exe" (
   set "PYTHON=python"
 )
 echo.
-echo   Iniciando LUMEN Core...
+echo   Iniciando GAIA Core...
 echo   Configuracion: .env en %CD%
 echo.
 cd /d "%~dp0lumen-core"

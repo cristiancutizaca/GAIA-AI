@@ -11,7 +11,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final _urlController = TextEditingController();
-  final _secretController = TextEditingController();
+  final _tokenController = TextEditingController();
   final _nameController = TextEditingController();
   bool _testing = false;
   String _testResult = '';
@@ -22,7 +22,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void initState() {
     super.initState();
     _urlController.text = widget.lumen.baseUrl;
-    _secretController.text = widget.lumen.secret;
+    _tokenController.text = widget.lumen.secret;
     _loadData();
   }
 
@@ -39,7 +39,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _testConnection() async {
     setState(() { _testing = true; _testResult = ''; });
     widget.lumen.baseUrl = _urlController.text.trim();
-    widget.lumen.secret = _secretController.text.trim();
+    widget.lumen.secret = _tokenController.text.trim();
 
     final ok = await widget.lumen.testConnection();
     setState(() {
@@ -54,7 +54,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       await widget.lumen.setPreference('user_name', name);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('LUMEN te conocerá como "$name"')),
+        SnackBar(content: Text('GAIA te conocerá como "$name"')),
       );
     } catch (_) {}
   }
@@ -75,7 +75,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _sectionTitle('CONEXIÓN'),
           _inputField('URL del Core', _urlController, 'http://192.168.1.100:8090'),
           const SizedBox(height: 8),
-          _inputField('Token secreto', _secretController, 'lumen-dev-key'),
+          _inputField('Token de dispositivo', _tokenController, 'gaia-device-token'),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -119,7 +119,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           if (_status != null) ...[
             const SizedBox(height: 24),
-            _sectionTitle('ESTADO DE LUMEN'),
+            _sectionTitle('ESTADO DE GAIA'),
             _infoRow('LLM', '${_status!['llm']?['backend']} (${_status!['llm']?['status']})'),
             _infoRow('Modelo', '${_status!['llm']?['model']}'),
             _infoRow('Mensajes', '${_status!['memory']?['total_messages']}'),
@@ -127,9 +127,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _infoRow('Sesiones', '${_status!['memory']?['total_sessions']}'),
           ],
 
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: OutlinedButton(
+              onPressed: () async {
+                try {
+                  final diagnostic = await widget.lumen.getDiagnostics();
+                  if (!mounted) return;
+                  showDialog<void>(context: context, builder: (_) => AlertDialog(title: const Text('Diagnóstico GAIA'), content: SingleChildScrollView(child: Text(diagnostic.toString())), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cerrar'))]));
+                } catch (_) {}
+              },
+              child: const Text('Ver diagnóstico seguro'),
+            ),
+          ),
+
           if (_profile != null && _profile!.isNotEmpty) ...[
             const SizedBox(height: 24),
-            _sectionTitle('LO QUE LUMEN SABE DE TI'),
+            _sectionTitle('LO QUE GAIA SABE DE TI'),
             ..._profile!.entries.map((e) => Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -148,7 +162,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const SizedBox(height: 40),
           Center(
-            child: Text('LUMEN móvil v0.2 (prototipo)', style: TextStyle(color: Colors.grey[700], fontSize: 12)),
+            child: Text('GAIA móvil v0.5.0 (prototipo; validar en Android físico)', style: TextStyle(color: Colors.grey[700], fontSize: 12)),
           ),
         ],
       ),

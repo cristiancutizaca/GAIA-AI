@@ -1,9 +1,10 @@
-"""Cliente PC de LUMEN: terminal, voz push-to-talk y polling proactivo."""
+"""Cliente PC de GAIA: terminal, voz push-to-talk y polling proactivo."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import atexit
+import json
 import os
 import platform
 import subprocess
@@ -12,16 +13,22 @@ import tempfile
 from pathlib import Path
 import httpx
 from dotenv import load_dotenv
+from action_engine import ActionEngine
+from action_coordinator import ActionCoordinator
+from action_response import parse_action_response, response_for_display
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 CORE_URL = os.getenv("LUMEN_CORE_URL", "http://localhost:8090").rstrip("/")
+ASSISTANT_NAME = os.getenv("LUMEN_ASSISTANT_NAME", "GAIA").strip() or "GAIA"
 API_SECRET = os.getenv("LUMEN_SECRET", "lumen-dev-key")
 DEVICE = f"pc-{platform.system().lower()}"
 POLL_SECONDS = max(5, int(os.getenv("LUMEN_PROACTIVE_POLL_SECONDS", "15")))
+LLM_CLIENT_TIMEOUT = max(30.0, float(os.getenv("LUMEN_LLM_TIMEOUT_SECONDS", "600")))
 session_id = ""
+active_request_id = ""
 _temp_audio: list[Path] = []
 
 
@@ -38,9 +45,9 @@ atexit.register(cleanup_temp_audio)
 
 def clear_screen() -> None:
     if platform.system() == "Windows":
-        os.system("cls")
+        subprocess.run(["cls"], shell=False, check=False)
     elif os.getenv("TERM"):
-        os.system("clear")
+        subprocess.run(["clear"], shell=False, check=False)
 
 async def check_connection() -> tuple[bool, dict | None]:
     try:
@@ -52,13 +59,78 @@ async def check_connection() -> tuple[bool, dict | None]:
         return False, None
 
 async def send_message(text: str) -> dict:
+    """Compatibilidad con integraciones antiguas que aún usan POST /chat."""
     global session_id
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=LLM_CLIENT_TIMEOUT) as client:
         response = await client.post(f"{CORE_URL}/api/chat", headers=headers(), json={"message": text, "session_id": session_id, "device": DEVICE})
         response.raise_for_status()
         data = response.json()
     session_id = data.get("session_id", session_id)
     return data
+
+
+async def complete_action(action_data: dict, result: dict) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(f"{CORE_URL}/api/actions/complete", headers=headers(), json={
+            "action_id": action_data["action_id"], "session_id": action_data["session_id"], "device": DEVICE,
+            "success": result["success"], "message": result["message"], "data": result.get("data", {}),
+        })
+        response.raise_for_status()
+        return response.json()
+
+
+async def execute_action_response(data: dict, engine: ActionEngine, confirm_input=None) -> dict:
+    parsed = parse_action_response(data)
+    if not parsed:
+        return data
+    print(f"\n  {ASSISTANT_NAME}: {response_for_display(parsed)}")
+    coordinator = ActionCoordinator(engine, policy=os.getenv("GAIA_ACTION_CONFIRM_POLICY", "CONFIRM_EXECUTION"))
+    ask = confirm_input or (lambda _preview, _parsed: input("  ¿Confirmas la ejecución? [s/N]: ").strip().lower() in {"s", "si", "sí", "y", "yes"})
+    local_result = await asyncio.to_thread(coordinator.execute, data, confirm=ask)
+    print(f"  Resultado: {local_result['message']}\n")
+    if local_result.get("blocked"):
+        return {**data, "response": local_result["message"], "local_result": local_result}
+    completed = await complete_action(data, local_result)
+    completed.update({"kind": "chat", "response": completed.get("response") or local_result["message"], "session_id": data["session_id"], "local_result": local_result, "plan": parsed.plan})
+    return completed
+
+
+async def send_stream(text: str, engine: ActionEngine, print_tokens: bool = True, profile: str = "") -> dict:
+    """Consume el contrato SSE y ejecuta acciones solo después de validarlas."""
+    global session_id, active_request_id
+    final: dict = {}
+    action_data: dict | None = None
+    event_name = ""
+    async with httpx.AsyncClient(timeout=LLM_CLIENT_TIMEOUT) as client:
+        async with client.stream("POST", f"{CORE_URL}/api/assistant/stream", headers=headers(), json={"message": text, "session_id": session_id, "device": DEVICE, "profile": profile}) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if line.startswith("event: "):
+                    event_name = line[7:].strip()
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line[6:])
+                if event_name == "meta":
+                    session_id = payload.get("session_id", session_id)
+                    active_request_id = payload.get("request_id", active_request_id)
+                elif event_name == "token":
+                    if print_tokens:
+                        print(payload.get("text", ""), end="", flush=True)
+                elif event_name == "action":
+                    action_data = payload
+                elif event_name == "done":
+                    final = payload
+                elif event_name == "cancelled":
+                    final = {"kind": "cancelled", "response": payload.get("detail", "Generación cancelada."), "session_id": session_id}
+                elif event_name == "error":
+                    raise RuntimeError(payload.get("detail", "El Core informó un error."))
+    if print_tokens and final.get("kind") == "chat":
+        print("\n")
+    if action_data:
+        return await execute_action_response(action_data, engine)
+    session_id = final.get("session_id", session_id)
+    return final
 
 async def send_voice(audio_path: str) -> dict:
     global session_id
@@ -121,9 +193,15 @@ def record_audio(duration: int = 5) -> str:
         import wave
         print("  🎤 Grabando... habla ahora")
         sample_rate = 16000
-        audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype="int16")
+        try:
+            from desktop_api import get_preferred_microphone
+            preferred_device = get_preferred_microphone()
+        except Exception:
+            preferred_device = None
+        audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype="int16", device=preferred_device)
         sd.wait()
-        tmp_path = tempfile.mktemp(suffix=".wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+            tmp_path = temp.name
         with wave.open(tmp_path, "wb") as wav_file:
             wav_file.setnchannels(1); wav_file.setsampwidth(2); wav_file.setframerate(sample_rate); wav_file.writeframes(audio.tobytes())
         print("  ✓ Grabación completada")
@@ -137,11 +215,11 @@ def record_audio(duration: int = 5) -> str:
 
 def print_banner() -> None:
     clear_screen()
-    print("""
-╔══════════════════════════════════════════════╗
-║              L   U   M   E   N               ║
-║         IA Personal — Cliente PC             ║
-╚══════════════════════════════════════════════╝""")
+    spaced_name = "   ".join(ASSISTANT_NAME.upper())
+    print("╔" + "═" * 46 + "╗")
+    print("║" + spaced_name.center(46) + "║")
+    print("║" + "IA Personal — Cliente PC".center(46) + "║")
+    print("╚" + "═" * 46 + "╝")
 
 
 def print_help() -> None:
@@ -149,36 +227,86 @@ def print_help() -> None:
   Comandos:
     /salir              Cerrar cliente
     /voz                Grabar 5 segundos y enviar audio
+    /microfonos         Listar micrófonos disponibles
+    /microfono n         Guardar el micrófono de entrada n
+    /decir texto        Probar TTS sin usar micrófono
     /estado             Ver estado del Core
+    /diagnostico        Ver diagnóstico seguro del sistema
     /memoria            Ver estadísticas de memoria
     /perfil             Ver datos recordados
     /nombre [nombre]    Guardar tu nombre
-    /backup             Crear backup inmediato
+    /backup             Crear backup SQLite inmediato
+    /brain-backup       Crear GAIA Brain Backup portable
+    /cancelar           Solicitar cancelación de la generación activa
     /probar-proactivo   Encolar un aviso y recibirlo por polling
     /sesion             Ver sesión actual
     /limpiar            Limpiar pantalla
     /ayuda              Mostrar ayuda
 """)
 
-async def handle_command(command: str, argument: str, auto_play: bool) -> bool:
+async def handle_command(command: str, argument: str, auto_play: bool, engine: ActionEngine) -> bool:
     if command in {"/salir", "/exit", "/q"}:
         return False
-    if command == "/voz":
+    if command == "/microfonos":
+        try:
+            from desktop_api import select_microphone
+            devices = select_microphone()
+            print("\n  Micrófonos de entrada:")
+            for item in devices:
+                marker = " *preferido*" if item.get("preferred") else ""
+                print(f"    [{item['index']}] {item['name']} ({item['max_input_channels']} canales){marker}")
+            if not devices:
+                print("    No hay dispositivos de entrada detectados.")
+            print()
+        except Exception as exc:
+            print(f"\n  No pude consultar micrófonos: {exc}\n")
+    elif command == "/microfono":
+        try:
+            from desktop_api import set_preferred_microphone
+            set_preferred_microphone(int(argument))
+            print(f"\n  ✓ Micrófono preferido guardado: {argument}\n")
+        except (ValueError, TypeError, OSError) as exc:
+            print(f"\n  No pude guardar el micrófono: {exc}\n")
+    elif command == "/voz":
         audio_path = record_audio()
         if audio_path:
             try:
-                data = await send_voice(audio_path)
-                print(f"\n  Tú (voz): {data.get('user_text', '?')}\n  LUMEN: {data['response']}\n")
+                data = await execute_action_response(await send_voice(audio_path), engine)
+                print(f"\n  Tú (voz): {data.get('user_text', '?')}\n  {ASSISTANT_NAME}: {data['response']}\n")
                 if auto_play and data.get("audio_url"):
                     await play_remote_audio(data["audio_url"])
             finally:
                 Path(audio_path).unlink(missing_ok=True)
+    elif command == "/decir":
+        if not argument:
+            print("\n  Uso: /decir texto a pronunciar\n")
+        else:
+            await play_local_audio(await request_tts(argument))
+            print("\n  ✓ TTS generado sin usar micrófono.\n")
+    elif command == "/brain-backup":
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(f"{CORE_URL}/api/backup/brain", headers=headers()); response.raise_for_status(); path = response.json()["path"]
+        print(f"\n  ✓ GAIA Brain Backup creado: {path}\n")
+    elif command == "/cancelar":
+        if not active_request_id:
+            print("\n  No hay una generación activa registrada.\n")
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(f"{CORE_URL}/api/assistant/cancel", headers=headers(), json={"request_id": active_request_id}); response.raise_for_status()
+            print("\n  ✓ Cancelación solicitada.\n")
     elif command == "/sesion":
         print(f"\n  Sesión actual: {session_id or '(nueva)'}\n")
+    elif command == "/diagnostico":
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(f"{CORE_URL}/api/diagnostics", headers=headers()); response.raise_for_status(); diagnostic = response.json()
+        print("\n  Diagnóstico GAIA:")
+        for section in ("core", "database", "vault", "ollama", "voice", "action_engine", "devices"):
+            print(f"    {section}: {json.dumps(diagnostic.get(section, {}), ensure_ascii=False)}")
+        print()
     elif command in {"/estado", "/memoria"}:
         ok, data = await check_connection()
         if not ok or not data:
-            print("\n  ⚠ No se puede conectar con LUMEN Core\n")
+            print(f"\n  ⚠ No se puede conectar con {ASSISTANT_NAME} Core\n")
         elif command == "/estado":
             print(f"\n  Estado: {data['status']} | LLM: {data['llm']['backend']} ({data['llm']['status']}) | Modelo: {data['llm']['model']}\n")
         else:
@@ -187,7 +315,7 @@ async def handle_command(command: str, argument: str, auto_play: bool) -> bool:
     elif command == "/perfil":
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(f"{CORE_URL}/api/profile", headers=headers()); response.raise_for_status(); profile = response.json()
-        print("\n  Lo que LUMEN recuerda:" if profile else "\n  Aún no hay datos guardados.")
+        print(f"\n  Lo que {ASSISTANT_NAME} recuerda:" if profile else "\n  Aún no hay datos guardados.")
         for category, facts in profile.items():
             print(f"    [{category}] " + "; ".join(facts))
         print()
@@ -222,7 +350,7 @@ async def proactive_poll(auto_play: bool) -> None:
                 if response.status_code == 200:
                     data = response.json()
                     if data.get("has_message"):
-                        print(f"\n  LUMEN [proactiva]: {data['message']}\n  Tú > ", end="", flush=True)
+                        print(f"\n  {ASSISTANT_NAME} [proactiva]: {data['message']}\n  Tú > ", end="", flush=True)
                         if auto_play:
                             await play_local_audio(await request_tts(data["message"]))
         except httpx.HTTPError:
@@ -231,10 +359,11 @@ async def proactive_poll(auto_play: bool) -> None:
 
 async def main() -> None:
     global CORE_URL
-    parser = argparse.ArgumentParser(description="LUMEN — Cliente PC")
+    parser = argparse.ArgumentParser(description=f"{ASSISTANT_NAME} — Cliente PC")
     parser.add_argument("--voice", action="store_true", help="Habilitar comando /voz")
     parser.add_argument("--auto", action="store_true", help="Reproducir respuestas con voz")
-    parser.add_argument("--wake", action="store_true", help="Activar wake word experimental 'Lumen'")
+    parser.add_argument("--wake", action="store_true", help=f"Activar wake word experimental '{ASSISTANT_NAME.title()}'")
+    parser.add_argument("--profile", choices=("auto", "fast", "normal", "reasoning", "code"), default=os.getenv("LUMEN_LLM_PROFILE", "auto"), help="Perfil LLM para la conversación")
     parser.add_argument("--url", default=CORE_URL, help="URL del Core")
     args = parser.parse_args()
     CORE_URL = args.url.rstrip("/")
@@ -243,17 +372,18 @@ async def main() -> None:
     if not ok or not data:
         print(f"\n  ⚠ No se pudo conectar a {CORE_URL}\n  Inicia el Core con: start.bat\n")
         return
-    print(f"  ✓ Conectado. LLM: {data['llm']['backend']} ({data['llm']['status']})")
+    print(f"  ✓ Conectado. LLM: {data['llm']['backend']} ({data['llm']['status']}) | Modelo: {data['llm'].get('selected_model', data['llm'].get('model', '--'))} | Perfil: {args.profile}")
     if args.voice:
         print("  ✓ Voz push-to-talk disponible con /voz")
+    engine = ActionEngine(PROJECT_DIR)
     listener = None
     if args.wake:
         from wake_word import WakeWordListener
         def on_wake(audio_path: str) -> None:
             async def process() -> None:
                 try:
-                    result = await send_voice(audio_path)
-                    print(f"\n  Tú (voz): {result.get('user_text', '?')}\n  LUMEN: {result['response']}\n")
+                    result = await execute_action_response(await send_voice(audio_path), engine)
+                    print(f"\n  Tú (voz): {result.get('user_text', '?')}\n  {ASSISTANT_NAME}: {result['response']}\n")
                     if args.auto and result.get("audio_url"):
                         await play_remote_audio(result["audio_url"])
                 finally:
@@ -269,13 +399,22 @@ async def main() -> None:
                 continue
             if user_input.startswith("/"):
                 parts = user_input.split(" ", 1)
-                if not await handle_command(parts[0].lower(), parts[1] if len(parts) > 1 else "", args.voice and args.auto):
+                try:
+                    keep_running = await handle_command(parts[0].lower(), parts[1] if len(parts) > 1 else "", args.voice and args.auto, engine)
+                except Exception as exc:
+                    print(f"\n  ⚠ El comando no se pudo completar, pero la sesión continúa: {exc}\n")
+                    keep_running = True
+                if not keep_running:
                     break
             else:
-                data = await send_message(user_input)
-                print(f"\n  LUMEN: {data['response']}\n")
-                if args.voice and args.auto:
-                    await play_local_audio(await request_tts(data["response"]))
+                try:
+                    data = await send_stream(user_input, engine, profile=args.profile)
+                    if data.get("kind") == "chat" and data.get("response"):
+                        print(f"  {ASSISTANT_NAME}: {data['response']}\n")
+                    if args.voice and args.auto and data.get("response"):
+                        await play_local_audio(await request_tts(data["response"]))
+                except Exception as exc:
+                    print(f"\n  ⚠ GAIA no pudo completar este turno; puedes continuar: {exc}\n")
     except (KeyboardInterrupt, EOFError):
         pass
     finally:

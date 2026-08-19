@@ -1,80 +1,93 @@
-# Reporte de validación — LUMEN v0.2.0-pc
+# TEST REPORT — GAIA-AI v0.5.3
 
-Fecha de ejecución: **2026-05-24**
+## Alcance
 
-## Pruebas ejecutadas correctamente en este entorno
+Esta release se valida en dos superficies distintas. **WORKTREE TESTS** comprueba el código durante el desarrollo; **FINAL ZIP EXTRACTED TESTS** debe ejecutarse después de construir, extraer en una ruta limpia y cambiar el working directory a esa copia. El backend es mock y las bases son temporales; estos resultados no certifican Ollama/Qwen, GPU, audio físico, LAN o Android.
+
+## Baseline v0.5.2 desde ZIP
+
+La extracción independiente de `GAIA-AI-v0.5.2-final.zip` confirmó que `.env.example` y `.gitignore` no estaban presentes. `fresh_install_test.py` falló con `FileNotFoundError` al intentar copiar `.env.example`. `v04_test.py` pasó en la reproducción disponible; no se afirma que el fallo WAL/SHM haya sido reproducido por ese comando. El baseline completo está en `BASELINE_V052.txt`.
+
+## WORKTREE TESTS
+
+| Suite | Resultado | Cobertura |
+|---|---:|---|
+| `tests/release_package_test.py` | PASS | Dotfiles, docs, estructura, higiene y git safety |
+| `tests/brain_backup_wal_test.py` | PASS | DB activa WAL preservada; sidecars excluidos |
+| `tests/brain_backup_portability_test.py` | PASS | Conexión abierta, WAL real y 12 round-trips create→restore |
+| `compileall` | PASS | Sintaxis Core, PC, tests y tools |
+| Regresiones históricas v0.3–v0.5.2 | PASS | Contratos y seguridad heredados |
+
+Los tres tests nuevos pasaron en el árbol de trabajo y volvieron a pasar desde la extracción final. La corrida completa también pasó después de estabilizar la DB activa durante restore.
+
+## Brain Backup portable
+
+`create_brain_backup()` usa `BRAIN_BACKUP_FILES` explícito: `memory.db`, `memory_export.json`, `profile.json`, `preferences.json`, `state.json`, `personality.py` y `config.json`. El manifest se calcula solo después de confirmar existencia y cerrar las operaciones temporales; el ZIP se reabre antes de devolver éxito. `memory.db-wal`, `memory.db-shm` y `memory.db-journal` no están permitidos.
+
+`brain_backup_portability_test.py` fuerza `PRAGMA journal_mode=WAL`, mantiene otra conexión abierta, crea actividad, realiza 12 iteraciones de backup y restore en una DB temporal y verifica que el estado A se recupere después de introducir el estado B. `brain_backup_wal_test.py` confirma que la DB activa continúa en WAL después del backup. Restore sigue rechazando tampering, missing, extra, traversal, duplicate, hash mismatch, schema desconocido y SQLite corrupta mediante las regresiones existentes.
+
+## FINAL ZIP EXTRACTED TESTS
+
+La tabla siguiente corresponde a una extracción limpia de `GAIA-AI-v0.5.3-final.zip`; la suite se ejecutó con el working directory dentro de esa copia. No se sustituyó por `unzip -tq` solamente.
+
+| Control | Resultado | Evidencia |
+|---|---:|---|
+| Estructura final y dotfiles | PASS | `release_package_test.py` desde extracción |
+| Fresh install desde extracción | PASS | `fresh_install_test.py` desde extracción |
+| Brain Backup WAL round-trip | PASS | WAL test y 12 round-trips desde extracción |
+| Suite histórica completa | PASS | listado reproducible abajo |
+| Doctor read-only | PASS | JSON desde extracción; `read_only` presente |
+| Package hygiene/path safety | PASS | build allowlist, ZIP test y package test |
+
+## Comandos reproducibles desde una raíz extraída
 
 ```bash
-python -m compileall -q lumen-core lumen-pc tests
-python tests/gui_import_test.py
-python tests/smoke_test.py
+python3 tests/release_package_test.py
+python3 tests/brain_backup_wal_test.py
+python3 tests/brain_backup_portability_test.py
+python3 -m compileall -q lumen-core lumen-pc tests tools
+python3 tests/gui_import_test.py
+python3 tests/smoke_test.py
+python3 tests/v03_test.py
+python3 tests/v04_test.py
+python3 tests/v041_test.py
+python3 tests/v05_test.py
+python3 tests/v051_test.py
+python3 tests/action_plan_llm_test.py
+python3 tests/device_permissions_test.py
+python3 tests/device_touch_test.py
+python3 tests/brain_backup_scheduler_test.py
+python3 tests/startup_test.py
+python3 tests/db_upgrade_test.py
+python3 tests/backup_integrity_test.py
+python3 tests/process_safety_test.py
+python3 tests/security_regression_test.py
+python3 tests/llm_health_test.py
+python3 tests/fresh_install_test.py
+python3 tests/vault_missing_test.py
+python3 tests/gui_import_test.py
+python3 tests/gui_action_contract_test.py
+python3 tests/terminal_plan_test.py
+python3 tests/voice_permissions_test.py
+python3 tests/request_ownership_test.py
+python3 tests/permission_level_test.py
+python3 tests/plan_post_action_test.py
+python3 tools/gaia_doctor.py --json
 ```
 
-Resultados observados:
+## Límites
 
-| Prueba | Resultado |
+| Área | Estado |
 |---|---|
-| Compilación Python de Core, cliente terminal, GUI y tests | Correcta |
-| Importación de `gui.py` sin abrir ventana (`--check`) | Correcta |
-| `GET /api/health` público | Correcto |
-| `GET /api/status` sin token | Rechazado con 401 como se espera |
-| `GET /api/status` autenticado | Correcto |
-| Chat mediante backend `mock` | Correcto |
-| Historial SQLite de la sesión | Correcto |
-| Auto-facts apagado por defecto | Correcto |
-| Alta/borrado manual de facts | Correcto |
-| Flujo HTTP de voz con STT/TTS sustituidos controladamente | Correcto |
-| Descarga autenticada del audio generado | Correcta |
-| Backup manual SQLite | Correcto |
-| Encolado/recepción de mensaje proactivo de prueba | Correcto |
+| Python | 3.11 es objetivo recomendado; 3.12 es el entorno validado; 3.13 no fue probado |
+| Ollama/Qwen | Health gate, errores y mock; servicio, modelo, contexto y rendimiento reales pendientes |
+| GPU | No se afirma reparto CPU/GPU ni velocidad sin drivers y hardware |
+| Micrófono/Whisper/TTS | Orquestación y errores mock; captura, Edge TTS y altavoces pendientes |
+| GUI visual/ventana activa | Importación y callbacks mock; revisión por sistema pendiente |
+| Android | Dart/pubspec y secure storage estáticos; SDK no instalado, sin APK |
+| LAN/TLS | Opt-in implementado; TLS, firewall y red confiable pendientes |
+| Proactividad | Reglas implementadas, automática apagada por defecto |
 
-## Prueba con servidor real y cliente de escritorio
+## Validación manual recomendada
 
-Se inició `lumen-core/main.py` mediante Uvicorn en un puerto temporal con:
-
-```env
-LUMEN_LLM_BACKEND=mock
-LUMEN_SECRET=test-secret-for-live-v02
-LUMEN_PORT=8192
-LUMEN_BACKUP_ENABLED=false
-LUMEN_PROACTIVE_ENABLED=false
-```
-
-Luego se utilizó `lumen-pc/desktop_api.py` como cliente real por HTTP para:
-
-- consultar status autenticado;
-- enviar un mensaje de chat;
-- guardar y leer un fact manual;
-- crear un backup.
-
-Resultado: **correcto**.
-
-## Lo que esta prueba NO demuestra
-
-| Componente | Motivo de no validación completa |
-|---|---|
-| Ventana GUI renderizada en Windows | El entorno de ejecución no es el equipo Windows del usuario |
-| Micrófono físico | Requiere dispositivo de audio disponible |
-| Whisper real | Requiere audio real, FFmpeg/modelo local y mayor tiempo de ejecución |
-| Edge TTS real y reproducción | Requiere red y salida de audio física |
-| Ollama real | Requiere servicio/modelo instalado localmente |
-| OpenAI/Anthropic real | Requiere credenciales del usuario |
-| Flutter Android | No se generó APK ni se ejecutó en Android |
-| Proactividad automática prolongada | Queda desactivada por defecto; solo se comprobó la cola y polling manual |
-
-## Comandos de validación manual recomendados en Windows
-
-Con el Core y la GUI ya configurados:
-
-```powershell
-.\start.bat
-.\start-gui.bat
-```
-
-En la GUI:
-
-1. Enviar un mensaje de texto con Ollama o API configurada.
-2. Activar `Responder con voz` y pulsar `Hablar`.
-3. Abrir `Memoria`, agregar un fact y volver a abrir la ventana.
-4. Pulsar `Backup` y verificar el archivo dentro de `lumen-core\data\backups`.
-5. Pulsar `Probar aviso` y comprobar que aparece el mensaje proactivo.
+En el equipo objetivo, extrae el ZIP final, crea `.env` desde `.env.example`, instala Python 3.11 y dependencias, configura un secreto fuerte, instala manualmente `qwen3.5:9b` si corresponde, inicia Ollama y ejecuta Doctor. Prueba conversación, diagnóstico, memoria, voz, cancelación, confirmación, plan de dos pasos y Brain Backup. No marques proyectos como `trusted` sin revisar cada comando.

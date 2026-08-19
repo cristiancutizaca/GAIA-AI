@@ -1,7 +1,7 @@
 """
-LUMEN — Wake Word Detection
+GAIA — Wake Word Detection
 
-Escucha continuamente el micrófono buscando la palabra "Lumen".
+Escucha continuamente el micrófono buscando la palabra "Gaia".
 Cuando la detecta, graba el mensaje y lo envía al Core.
 
 Usa Whisper en modo ultraligero (tiny) solo para detección.
@@ -12,11 +12,13 @@ import numpy as np
 import tempfile
 import wave
 import os
+import subprocess
+import shutil
 import threading
 from typing import Callable
 
 # Configuración
-WAKE_WORD = "lumen"
+WAKE_WORD = "gaia"
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 2.0  # Segundos por chunk para detección
 RECORD_DURATION = 8.0  # Segundos de grabación después de wake word
@@ -69,7 +71,8 @@ class WakeWordListener:
 
         model = self._load_whisper()
         # Guardar temporalmente
-        tmp = tempfile.mktemp(suffix=".wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+            tmp = temp.name
         self._save_wav(audio, tmp)
 
         try:
@@ -81,7 +84,7 @@ class WakeWordListener:
             )
             text = result["text"].lower().strip()
             # Buscar variaciones de "lumen"
-            return any(w in text for w in ["lumen", "lúmen", "lumen,", "oye lumen", "hey lumen"])
+            return any(w in text for w in ["gaia", "gaya", "gaia,", "oye gaia", "hey gaia", "hey gaya"])
         except:
             return False
         finally:
@@ -124,14 +127,15 @@ class WakeWordListener:
                 silence_frames = 0
 
         audio = np.concatenate(all_audio)
-        output_path = tempfile.mktemp(suffix=".wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+            output_path = temp.name
         self._save_wav(audio, output_path)
         print("  ✓ Mensaje capturado")
         return output_path
 
     def _listen_loop(self):
         """Loop principal de escucha."""
-        print("  👂 Escuchando wake word 'Lumen'...")
+        print("  👂 Escuchando wake word 'Gaia'...")
 
         while self.running:
             try:
@@ -194,17 +198,18 @@ async def wake_word_client(core_url: str, secret: str, device: str = "pc"):
                         )
                     data = r.json()
                     print(f"\n  Tú: {data.get('user_text', '?')}")
-                    print(f"  LUMEN: {data['response']}\n")
+                    print(f"  GAIA: {data['response']}\n")
 
                     # Reproducir audio
                     audio_url = data.get("audio_url")
                     if audio_url:
                         r2 = await client.get(f"{core_url}{audio_url}", headers={"Authorization": f"Bearer {secret}"})
                         if r2.status_code == 200:
-                            tmp = tempfile.mktemp(suffix=".mp3")
-                            with open(tmp, "wb") as f:
-                                f.write(r2.content)
-                            os.system(f"mpv --no-video '{tmp}' > /dev/null 2>&1 || ffplay -nodisp -autoexit '{tmp}' > /dev/null 2>&1")
+                            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp:
+                                tmp = temp.name
+                                temp.write(r2.content)
+                            player = ["mpv", "--no-video", tmp] if shutil.which("mpv") else ["ffplay", "-nodisp", "-autoexit", tmp]
+                            subprocess.run(player, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                             os.unlink(tmp)
             except Exception as e:
                 print(f"  Error: {e}")
@@ -219,7 +224,7 @@ async def wake_word_client(core_url: str, secret: str, device: str = "pc"):
     listener = WakeWordListener(on_wake=on_wake)
     listener.start()
 
-    print("  Wake word activa. Di 'Lumen' para hablar.")
+    print("  Wake word activa. Di 'Gaia' para hablar.")
     print("  Ctrl+C para salir.\n")
 
     try:

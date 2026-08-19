@@ -1,0 +1,60 @@
+GAIA-AI v0.5.3 — VALIDACIÓN FINAL
+================================
+
+Fecha de validación: 2026-08-18 UTC
+Fuente de trabajo: extracción de GAIA-AI-v0.5.2-final.zip
+Versión Core: 0.5.3-pc
+Versión Android heredada: 0.5.2+8; Android no se desarrolla en esta hotfix
+
+RESULTADOS OBLIGATORIOS
+-----------------------
+WORKTREE TESTS: PASS
+FINAL ZIP STRUCTURE: PASS
+FINAL ZIP EXTRACTED TESTS: PASS
+FRESH INSTALL FROM FINAL ZIP: PASS
+BRAIN BACKUP WAL ROUNDTRIP: PASS
+PACKAGE HYGIENE: PASS
+SHA-256: see adjacent GAIA-AI-v0.5.3-final.zip.sha256
+
+BASELINE V0.5.2
+---------------
+La extracción independiente del ZIP v0.5.2 no contenía `.env.example` ni `.gitignore`. `fresh_install_test.py` falló con `FileNotFoundError` al intentar copiar `.env.example`. `v04_test.py` pasó en la reproducción disponible; no se afirma que ese comando reprodujera por sí solo el riesgo WAL/SHM. La evidencia completa está en `BASELINE_V052.txt`.
+
+WORKTREE TESTS
+--------------
+PASS: `tests/release_package_test.py`
+PASS: `tests/brain_backup_wal_test.py`
+PASS: `tests/brain_backup_portability_test.py` — 12 round-trips y conexión abierta
+PASS: `python3 -m compileall -q lumen-core lumen-pc tests tools`
+PASS: suite histórica v0.3–v0.5.2 completa
+PASS: `tools/gaia_doctor.py --json` con `read_only`
+PASS: security grep sin `shell=True`, `os.system(`, `eval(` o `exec(`
+PASS: route-to-route grep sin bypass de Depends
+
+FINAL ZIP EXTRACTED TESTS
+-------------------------
+La validación se ejecutó desde `/home/ubuntu/release_validation_v053/GAIA-AI-v0.5.3`, no desde la carpeta de desarrollo original. Se ejecutaron la prueba de estructura, WAL, portabilidad, compileall, GUI import, smoke, regresiones v0.3–v0.5.2, las seis pruebas de contrato v0.5.2, fresh install, vault missing, Doctor y los dos greps.
+
+PASS: `.env.example` y `.gitignore` presentes en la extracción.
+PASS: instalación limpia crea `.env` desde `.env.example`, inicializa SQLite y conserva defaults para rutas vacías.
+PASS: Brain Backup WAL crea payload canónico sin `memory.db-wal`, `memory.db-shm` ni `memory.db-journal`; restore round-trip pasa 12 veces.
+PASS: manifest y payload ZIP coinciden exactamente.
+PASS: no se importó la carpeta de desarrollo original.
+PASS: Doctor JSON finaliza limpiamente en entorno sin Ollama/GPU/Flutter y declara `read_only`.
+PASS: `unzip -tq` sin errores y package test sin secretos/caches/datos privados.
+
+BRAIN BACKUP CONTROL
+--------------------
+El payload está limitado a `memory.db`, `memory_export.json`, `profile.json`, `preferences.json`, `state.json`, `personality.py` y `config.json`. El manifest se genera solo después de confirmar cada archivo, el ZIP se reabre antes de devolver éxito y restore continúa rechazando extras, missing, traversal, duplicates, hash mismatch, schema desconocido y SQLite corrupta. La DB activa conserva WAL; el journal mode DELETE solo se usa en el snapshot temporal.
+
+PACKAGE HYGIENE
+---------------
+El build usa allowlist explícita y falla ante archivos prohibidos en staging. La release incluye código, tests, tools, documentación, scripts, requirements, Flutter sources, `.env.example` y `.gitignore`. Excluye `.env`, `.git`, `.venv`, `__pycache__`, `*.pyc`, DB, WAL/SHM, logs, backups, audio, tokens, claves y datos privados.
+
+LIMITES NO CERTIFICADOS
+-----------------------
+Python 3.11 es el objetivo recomendado; Python 3.12 es el entorno de esta validación; Python 3.13 no fue probado. No se declara validación física de Ollama/Qwen, GPU, micrófono, Whisper, Edge TTS, altavoces, VS Code, navegador, ventana activa, proyectos trusted, LAN/TLS ni APK Android. Flutter/Dart no está disponible en el sandbox. El backend de las pruebas es mock y las DB son temporales.
+
+EVIDENCIA
+---------
+`TEST_REPORT.md` separa worktree y ZIP extraído. `AUDIT.md` explica los hallazgos del ZIP v0.5.2 y sus controles. `BASELINE_V052.txt` conserva la reproducción del defecto de dotfiles. El hash inmutable final se entrega en el archivo `.sha256` adyacente y en la validación final externa.
