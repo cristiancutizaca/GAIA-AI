@@ -101,6 +101,8 @@ def main():
 
     assert 'if pending.get("cancelled") or not pending.get("approved"):' in CORE_SOURCE
     assert 'Un host diferente ya reclamó esta acción.' in CORE_SOURCE
+    assert '"permission_entries": chat_resp.permission_entries' in CORE_SOURCE, "Voice must expose authority scope"
+    assert '"approved": chat_resp.approved' in CORE_SOURCE, "Voice must expose approval state"
     print("GAIA SINGLE EXECUTOR CONTRACT PASS: remote ownership, reject, voice, Core authorization")
 
 

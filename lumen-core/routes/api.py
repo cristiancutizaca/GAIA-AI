@@ -1887,7 +1887,9 @@ async def chat_voice(
         except Exception as exc:
             tts_error = str(exc)
             logger.warning("Respuesta generada, pero TTS falló: %s", exc)
-    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "audio_url": audio_url, "tts_error": tts_error}
+    # Voice responses must carry the same authority/scope metadata as text.
+    # Without these fields the desktop UI cannot display informed consent.
+    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "permission_entries": chat_resp.permission_entries, "resource_scope_version": chat_resp.resource_scope_version, "requesting_device": chat_resp.requesting_device, "target_host": chat_resp.target_host, "approved": chat_resp.approved, "audio_url": audio_url, "tts_error": tts_error}
 
 
 @router.get("/captures/{capture_id}")
