@@ -4,8 +4,13 @@ on:
     branches: [main]
     paths:
       - "lumen-pc/desktop_shell.py"
+      - "lumen-pc/desktop_api.py"
+      - "lumen-pc/wake_word.py"
       - "lumen-pc/gaia_desktop_launcher.py"
+      - "lumen-core/routes/api.py"
       - "tests/resident_runtime_test.py"
+      - "tests/action_single_executor_contract_test.py"
+      - "tests/remote_action_host_test.py"
       - "tools/gaia_resident_doctor.py"
       - "start-gaia.bat"
       - "install-gaia.ps1"
