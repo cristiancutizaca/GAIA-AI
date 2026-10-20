@@ -83,8 +83,9 @@ with tempfile.TemporaryDirectory(prefix="gaia_v04_test_") as tmp:
         assert structured_response.status_code == 200 and structured_response.json()["kind"] == "action"
         assert structured_response.json()["confirmation_required"] is True
         action_data = structured_response.json()
-        completed = client.post("/api/actions/complete", headers=headers, json={"action_id": action_data["action_id"], "session_id": action_data["session_id"], "device": "test", "success": True, "message": "VS Code abierto.", "data": {"path": str(project_dir)}})
-        assert completed.status_code == 200 and completed.json()["generated_by_llm"] is True
+        completed = client.post("/api/actions/complete", headers=headers, json={"action_id": action_data["action_id"], "session_id": action_data["session_id"], "device": "test", "success": True, "message": "VS Code abierto.", "data": {"path": str(project_dir)}, "effect_verified": True, "side_effect_performed": True, "execution_verified": True})
+        assert completed.status_code == 200 and completed.json()["generated_by_llm"] is False
+        assert completed.json()["success"] is True and completed.json()["verified_result"]["execution_verified"] is True
         history = client.get("/api/actions/history", headers=headers)
         assert history.status_code == 200 and history.json()
         vault = client.get("/api/vault/status", headers=headers)

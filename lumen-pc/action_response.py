@@ -1,4 +1,4 @@
-"""Contrato común para respuestas de acciones de GAIA v0.5.3.
+"""Contrato común para respuestas de acciones de GAIA v0.6.0.
 
 El Core es la autoridad que produce el contrato. Este módulo solo normaliza
 la respuesta para los clientes; no concede permisos ni ejecuta acciones.

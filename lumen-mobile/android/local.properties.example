@@ -1,0 +1,4 @@
+# Copia este archivo a android/local.properties en tu equipo y ajusta la ruta.
+# Flutter lo genera normalmente al ejecutar flutter pub get.
+sdk.dir=C:\\Users\\TU_USUARIO\\AppData\\Local\\Android\\sdk
+flutter.sdk=C:\\src\\flutter

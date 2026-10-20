@@ -16,12 +16,14 @@ from dotenv import load_dotenv
 from action_engine import ActionEngine
 from action_coordinator import ActionCoordinator
 from action_response import parse_action_response, response_for_display
+from context_providers import collect_desktop_context
+from request_envelope import build_request_envelope
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
-CORE_URL = os.getenv("LUMEN_CORE_URL", "http://localhost:8090").rstrip("/")
+CORE_URL = os.getenv("LUMEN_CORE_URL", "http://127.0.0.1:8090").rstrip("/")
 ASSISTANT_NAME = os.getenv("LUMEN_ASSISTANT_NAME", "GAIA").strip() or "GAIA"
 API_SECRET = os.getenv("LUMEN_SECRET", "lumen-dev-key")
 DEVICE = f"pc-{platform.system().lower()}"
@@ -34,6 +36,19 @@ _temp_audio: list[Path] = []
 
 def headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {API_SECRET}"}
+
+
+def desktop_context() -> dict:
+    try:
+        return collect_desktop_context(base_dir=PROJECT_DIR, projects_file=PROJECT_DIR / "projects.json", level="FOREGROUND")
+    except Exception:
+        return {"active_window": None, "ollama": {"status": "unavailable"}, "project": {"active_project": None, "status": "unavailable"}, "system": {}, "desktop_snapshot": {"desktop_available": False, "context_level": "FOREGROUND"}}
+
+
+def request_payload(text: str = "", *, channel: str = "terminal") -> dict:
+    context = desktop_context()
+    snapshot = context.get("desktop_snapshot") if isinstance(context.get("desktop_snapshot"), dict) else context
+    return {"message": text, "session_id": session_id, "device": DEVICE, "channel": channel, "pc_context": context, "desktop_snapshot": snapshot, "request_envelope": build_request_envelope(session_id=session_id, channel=channel, requesting_device=DEVICE, message=text, desktop_snapshot=snapshot)}
 
 
 def cleanup_temp_audio() -> None:
@@ -62,7 +77,7 @@ async def send_message(text: str) -> dict:
     """Compatibilidad con integraciones antiguas que aún usan POST /chat."""
     global session_id
     async with httpx.AsyncClient(timeout=LLM_CLIENT_TIMEOUT) as client:
-        response = await client.post(f"{CORE_URL}/api/chat", headers=headers(), json={"message": text, "session_id": session_id, "device": DEVICE})
+        response = await client.post(f"{CORE_URL}/api/chat", headers=headers(), json=request_payload(text, channel="terminal"))
         response.raise_for_status()
         data = response.json()
     session_id = data.get("session_id", session_id)
@@ -102,7 +117,9 @@ async def send_stream(text: str, engine: ActionEngine, print_tokens: bool = True
     action_data: dict | None = None
     event_name = ""
     async with httpx.AsyncClient(timeout=LLM_CLIENT_TIMEOUT) as client:
-        async with client.stream("POST", f"{CORE_URL}/api/assistant/stream", headers=headers(), json={"message": text, "session_id": session_id, "device": DEVICE, "profile": profile}) as response:
+        stream_payload = request_payload(text, channel="terminal")
+        stream_payload["profile"] = profile
+        async with client.stream("POST", f"{CORE_URL}/api/assistant/stream", headers=headers(), json=stream_payload) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
                 if line.startswith("event: "):
@@ -134,9 +151,13 @@ async def send_stream(text: str, engine: ActionEngine, print_tokens: bool = True
 
 async def send_voice(audio_path: str) -> dict:
     global session_id
+    context = desktop_context()
+    snapshot = context.get("desktop_snapshot") if isinstance(context.get("desktop_snapshot"), dict) else context
+    envelope = build_request_envelope(session_id=session_id, channel="terminal", requesting_device=DEVICE, desktop_snapshot=snapshot)
+    form = {"channel": "terminal", "request_envelope": json.dumps(envelope, ensure_ascii=False), "desktop_snapshot": json.dumps(snapshot, ensure_ascii=False)}
     async with httpx.AsyncClient(timeout=180.0) as client:
         with open(audio_path, "rb") as audio_file:
-            response = await client.post(f"{CORE_URL}/api/chat/voice", headers=headers(), params={"session_id": session_id, "device": DEVICE}, files={"audio": ("audio.wav", audio_file, "audio/wav")})
+            response = await client.post(f"{CORE_URL}/api/chat/voice", headers=headers(), params={"session_id": session_id, "device": DEVICE}, data=form, files={"audio": ("audio.wav", audio_file, "audio/wav")})
         response.raise_for_status()
         data = response.json()
     session_id = data.get("session_id", session_id)

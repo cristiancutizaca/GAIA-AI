@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import '../services/lumen_service.dart';
+import 'pairing_screen.dart';
+import 'automation_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   final LumenService lumen;
@@ -11,18 +13,18 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   final _urlController = TextEditingController();
-  final _tokenController = TextEditingController();
   final _nameController = TextEditingController();
   bool _testing = false;
   String _testResult = '';
   Map<String, dynamic>? _status;
   Map<String, dynamic>? _profile;
+  Map<String, dynamic>? _actionControl;
+  Map<String, dynamic>? _hostStatus;
 
   @override
   void initState() {
     super.initState();
     _urlController.text = widget.lumen.baseUrl;
-    _tokenController.text = widget.lumen.secret;
     _loadData();
   }
 
@@ -33,14 +35,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
       final profile = await widget.lumen.getProfile();
       setState(() => _profile = profile);
+      final actionControl = await widget.lumen.getActionControl();
+      setState(() => _actionControl = actionControl);
+      final hostStatus = await widget.lumen.getRemoteHostStatus();
+      setState(() => _hostStatus = hostStatus);
     } catch (_) {}
   }
 
   Future<void> _testConnection() async {
     setState(() { _testing = true; _testResult = ''; });
-    widget.lumen.baseUrl = _urlController.text.trim();
-    widget.lumen.secret = _tokenController.text.trim();
-
+    await widget.lumen.saveConfig(url: _urlController.text.trim(), token: widget.lumen.secret, pairedDeviceId: widget.lumen.deviceId);
     final ok = await widget.lumen.testConnection();
     setState(() {
       _testing = false;
@@ -75,7 +79,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _sectionTitle('CONEXIÓN'),
           _inputField('URL del Core', _urlController, 'http://192.168.1.100:8090'),
           const SizedBox(height: 8),
-          _inputField('Token de dispositivo', _tokenController, 'gaia-device-token'),
+          _infoRow('Token de dispositivo', widget.lumen.secret.isEmpty ? 'no configurado' : 'guardado de forma segura'),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -93,6 +97,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ],
+          ),
+          OutlinedButton.icon(
+            onPressed: () async {
+              await Navigator.push(context, MaterialPageRoute(builder: (_) => PairingScreen(lumen: widget.lumen)));
+              if (mounted) _loadData();
+            },
+            icon: const Icon(Icons.qr_code_2),
+            label: const Text('Volver a emparejar / QR'),
           ),
           if (_testResult.isNotEmpty)
             Padding(
@@ -125,7 +137,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _infoRow('Mensajes', '${_status!['memory']?['total_messages']}'),
             _infoRow('Hechos', '${_status!['memory']?['total_facts']}'),
             _infoRow('Sesiones', '${_status!['memory']?['total_sessions']}'),
+            _infoRow('Acciones PC', (_actionControl?['enabled'] == true) ? 'habilitadas' : 'detenidas'),
+            _infoRow('Modo', '${_actionControl?['mode'] ?? 'desconocido'}'),
+            _infoRow('Dispositivo', widget.lumen.deviceId),
+            _infoRow('PC Action Host', _hostStatus?['online'] == true ? 'ONLINE' : 'OFFLINE'),
+            if (_hostStatus?['last_seen'] != null) _infoRow('Host visto', '${_hostStatus?['last_seen']}'),
           ],
+
+          Padding(
+            padding: const EdgeInsets.only(top: 10),
+            child: OutlinedButton.icon(
+              onPressed: () async {
+                await Navigator.push(context, MaterialPageRoute(builder: (_) => AutomationScreen(lumen: widget.lumen)));
+                if (mounted) _loadData();
+              },
+              icon: const Icon(Icons.autorenew),
+              label: const Text('Automatizaciones y notificaciones'),
+            ),
+          ),
 
           Padding(
             padding: const EdgeInsets.only(top: 10),
@@ -162,7 +191,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
           const SizedBox(height: 40),
           Center(
-            child: Text('GAIA móvil v0.5.0 (prototipo; validar en Android físico)', style: TextStyle(color: Colors.grey[700], fontSize: 12)),
+            child: Text('GAIA móvil v1.0-RC6 (companion; automatizaciones seguras pasan por el PC Action Host)', style: TextStyle(color: Colors.grey[700], fontSize: 12)),
           ),
         ],
       ),

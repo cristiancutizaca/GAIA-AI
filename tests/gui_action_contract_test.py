@@ -22,6 +22,14 @@ class FakeVar:
         self.value = value
 
 
+class FakeWidget:
+    def __init__(self):
+        self.state = "normal"
+
+    def configure(self, **kwargs):
+        self.state = kwargs.get("state", self.state)
+
+
 class FakeAPI:
     def __init__(self):
         self.confirmed = []
@@ -41,6 +49,9 @@ def make_gui(api: FakeAPI):
     instance.api = api
     instance.generation_var = FakeVar("Generando")
     instance.voice_output = FakeVar(False)
+    instance.send_button = FakeWidget()
+    instance.voice_button = FakeWidget()
+    instance.stop_button = FakeWidget()
     instance._run = lambda func, on_success=None, on_error=None: on_success(func()) if on_success else func()
     instance._append = lambda _role, _text: None
     return instance

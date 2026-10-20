@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
-from config import LLM_FALLBACK_MODEL, LLM_MODEL, MODEL_BY_PROFILE
+from config import LLM_CONTEXT, LLM_FALLBACK_MODEL, LLM_MODEL, MODEL_BY_PROFILE, PERFORMANCE_PROFILE
 
 logger = logging.getLogger("lumen.model_router")
 
@@ -62,8 +62,18 @@ def resolve_profile(message: str = "", requested: str | None = None, default: st
 def profile_options(profile: str | None, context_override: int | None = None) -> dict[str, int | float]:
     selected = profile if profile in PROFILES else "normal"
     options = dict(PROFILES[selected])
+    if PERFORMANCE_PROFILE == "eco":
+        options["num_ctx"] = max(1024, min(int(options["num_ctx"]), 4096))
+        options["num_predict"] = max(256, min(int(options["num_predict"]), 1024))
+    elif PERFORMANCE_PROFILE == "performance":
+        options["num_ctx"] = min(16384, max(int(options["num_ctx"]), 4096))
+        options["num_predict"] = min(4096, max(int(options["num_predict"]), 1024))
+    # GAIA_LLM_CONTEXT/LUMEN_LLM_CONTEXT actúa como techo global de memoria.
+    # Un override explícito por petición puede aumentarlo de forma deliberada.
     if context_override is not None:
         options["num_ctx"] = min(32768, max(512, int(context_override)))
+    else:
+        options["num_ctx"] = min(int(options["num_ctx"]), int(LLM_CONTEXT))
     return options
 
 

@@ -1,0 +1,30 @@
+{
+  "added_files": [
+    "platform_runtime.py",
+    "automation_persistent.py",
+    "v13_core_e2e_test.py",
+    "v13_platform_integration_test.py",
+    "v1.3 reports and guides"
+  ],
+  "modified_files": [
+    "main.py",
+    "routes/api.py",
+    "gaia_platform/browser_real.py"
+  ],
+  "deleted_files": [],
+  "new_dependencies": [],
+  "removed_dependencies": [],
+  "database_migrations": [
+    "platform_memory_v13.db",
+    "automations_v13.db"
+  ],
+  "config_migrations": [
+    "none"
+  ],
+  "api_changes": [
+    "GET /api/platform/status",
+    "GET /api/capabilities",
+    "POST /api/chat now delegates capability requests to PlatformRuntime"
+  ],
+  "breaking_changes": []
+}

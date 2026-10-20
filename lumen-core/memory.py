@@ -6,13 +6,49 @@ import json
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from config import BACKUP_DIR, BACKUP_INTERVAL_HOURS, DB_PATH, DEVICE_TOKEN_TTL_DAYS, MAX_BACKUPS, MEMORY_RELEVANCE_LIMIT, SESSION_SUMMARY_EVERY_TURNS
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 9
+
+
+@dataclass(frozen=True)
+class MemoryAccessContext:
+    """Authenticated memory boundary carried through chat, API and retrieval."""
+
+    principal_id: str = ""
+    device_id: str = ""
+    session_id: str = ""
+    project_id: str = ""
+    capabilities: frozenset[str] = frozenset()
+    request_id: str = ""
+    source_channel: str = "internal"
+    is_master: bool = False
+
+
+
+def _derive_memory_namespace(kind: str, project: str, session_id: str, device_id: str) -> tuple[str, str]:
+    kind = str(kind or "").strip().lower()
+    project = str(project or "").strip()
+    session_id = str(session_id or "").strip()
+    device_id = str(device_id or "").strip()
+    if kind == "device_system":
+        return "device", f"device:{device_id or 'unknown'}"
+    if kind == "working":
+        return "working", f"device:{device_id or 'unknown'}/session:{session_id or 'unknown'}"
+    if kind in {"session", "task"} and session_id:
+        return "session", f"session:{session_id}"
+    if kind == "project" or project:
+        return "project", f"project:{project or 'unknown'}"
+    if device_id:
+        return "device", f"device:{device_id}"
+    return "global", "global:user"
+
+
 FTS5_AVAILABLE = False
 _SOURCE_PRIORITY = {"SYSTEM": 0.7, "INFERRED": 0.6, "AUTO_EXTRACT": 0.6, "manual": 1.0, "MANUAL": 1.0, "USER_EXPLICIT": 1.0}
 _TOKEN_RE = re.compile(r"[\wáéíóúüñ]{2,}", re.IGNORECASE)
@@ -45,6 +81,110 @@ def _try_fts(conn: sqlite3.Connection) -> None:
         FTS5_AVAILABLE = True
     except sqlite3.OperationalError:
         FTS5_AVAILABLE = False
+
+
+def _migrate_memory_namespace(conn: sqlite3.Connection) -> None:
+    """Upgrade schema-8 memory rows without dropping data or history."""
+    memory_columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_items)").fetchall()}
+    if "namespace_type" not in memory_columns:
+        _ensure_column(conn, "memory_items", "namespace_type", "TEXT NOT NULL DEFAULT 'global'")
+    if "namespace_id" not in memory_columns:
+        _ensure_column(conn, "memory_items", "namespace_id", "TEXT NOT NULL DEFAULT 'global:user'")
+    table_sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_items'").fetchone()
+    table_sql = str(table_sql_row[0] or "").lower() if table_sql_row else ""
+    if "unique(namespace_type" not in table_sql:
+        conn.execute("""
+            CREATE TABLE memory_items_v091 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref TEXT NOT NULL DEFAULT '',
+                provenance_type TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.6,
+                importance REAL NOT NULL DEFAULT 0.5,
+                scope TEXT NOT NULL DEFAULT 'personal',
+                project TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                namespace_type TEXT NOT NULL DEFAULT 'global',
+                namespace_id TEXT NOT NULL DEFAULT 'global:user',
+                user_confirmed INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                content_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                last_used_at TIMESTAMP,
+                UNIQUE(namespace_type, namespace_id, memory_key, content_hash)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO memory_items_v091
+            (id, memory_key, kind, category, content, source_type, source_ref, provenance_type,
+             confidence, importance, scope, project, session_id, device_id, namespace_type,
+             namespace_id, user_confirmed, pinned, status, content_hash, created_at, updated_at,
+             expires_at, last_used_at)
+            SELECT id, memory_key, kind, category, content, source_type, source_ref, provenance_type,
+                   confidence, importance, scope, project, session_id, device_id,
+                   CASE WHEN kind='device_system' OR device_id<>'' THEN 'device'
+                        WHEN kind='working' THEN 'working'
+                        WHEN kind IN ('session','task') AND session_id<>'' THEN 'session'
+                        WHEN kind='project' OR project<>'' THEN 'project'
+                        ELSE 'global' END,
+                   CASE WHEN kind='device_system' OR device_id<>'' THEN 'device:' || COALESCE(NULLIF(device_id,''),'unknown')
+                        WHEN kind='working' THEN 'device:' || COALESCE(NULLIF(device_id,''),'unknown') || '/session:' || COALESCE(NULLIF(session_id,''),'unknown')
+                        WHEN kind IN ('session','task') AND session_id<>'' THEN 'session:' || session_id
+                        WHEN kind='project' OR project<>'' THEN 'project:' || COALESCE(NULLIF(project,''),'unknown')
+                        ELSE 'global:user' END,
+                   user_confirmed, pinned, status, content_hash, created_at, updated_at,
+                   expires_at, last_used_at
+            FROM memory_items
+        """)
+        conn.execute("DROP TABLE memory_items")
+        conn.execute("ALTER TABLE memory_items_v091 RENAME TO memory_items")
+    for row in conn.execute("SELECT id, kind, project, session_id, device_id FROM memory_items").fetchall():
+        namespace_type, namespace_id = _derive_memory_namespace(row[1], row[2], row[3], row[4])
+        conn.execute("UPDATE memory_items SET namespace_type=?, namespace_id=? WHERE id=?", (namespace_type, namespace_id, int(row[0])))
+    history_columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_item_history)").fetchall()}
+    if "namespace_type" not in history_columns:
+        _ensure_column(conn, "memory_item_history", "namespace_type", "TEXT NOT NULL DEFAULT 'global'")
+    if "namespace_id" not in history_columns:
+        _ensure_column(conn, "memory_item_history", "namespace_id", "TEXT NOT NULL DEFAULT 'global:user'")
+    conn.execute("""
+        UPDATE memory_item_history
+        SET namespace_type=COALESCE((SELECT namespace_type FROM memory_items m WHERE m.id=memory_item_history.memory_id), namespace_type),
+            namespace_id=COALESCE((SELECT namespace_id FROM memory_items m WHERE m.id=memory_item_history.memory_id), namespace_id)
+    """)
+
+
+def _ensure_session_owner(conn: sqlite3.Connection, session_id: str, device_id: str = "", principal_id: str = "") -> bool:
+    session_id = str(session_id or "").strip()[:80]
+    device_id = str(device_id or "").strip()[:80]
+    principal_id = str(principal_id or "").strip()[:120]
+    if not session_id:
+        return False
+    row = conn.execute("SELECT owner_device_id, owner_principal_id, status FROM session_owners WHERE session_id=?", (session_id,)).fetchone()
+    meaningful_device = device_id if device_id not in {"", "unknown"} else ""
+    if not row:
+        conn.execute("INSERT INTO session_owners(session_id, owner_device_id, owner_principal_id, status) VALUES (?, ?, ?, 'active')", (session_id, meaningful_device, principal_id))
+        return True
+    if str(row[2]) != "active":
+        return False
+    owner_device = str(row[0] or "")
+    owner_principal = str(row[1] or "")
+    if owner_device and meaningful_device and owner_device != meaningful_device:
+        return False
+    if owner_principal and principal_id and owner_principal != principal_id:
+        return False
+    if not owner_device and meaningful_device:
+        conn.execute("UPDATE session_owners SET owner_device_id=?, updated_at=CURRENT_TIMESTAMP WHERE session_id=?", (meaningful_device, session_id))
+    if not owner_principal and principal_id:
+        conn.execute("UPDATE session_owners SET owner_principal_id=?, updated_at=CURRENT_TIMESTAMP WHERE session_id=?", (principal_id, session_id))
+    return True
 
 
 def init_db() -> None:
@@ -106,6 +246,14 @@ def init_db() -> None:
                 important_decisions_json TEXT NOT NULL DEFAULT '[]',
                 open_tasks_json TEXT NOT NULL DEFAULT '[]',
                 turn_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS session_owners (
+                session_id TEXT PRIMARY KEY,
+                owner_device_id TEXT NOT NULL DEFAULT '',
+                owner_principal_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','quarantined')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS devices (
@@ -175,6 +323,164 @@ def init_db() -> None:
                 result TEXT NOT NULL,
                 details_json TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS permission_grants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                principal_type TEXT NOT NULL,
+                principal_id TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                capability TEXT NOT NULL,
+                resource_scope TEXT NOT NULL DEFAULT '',
+                decision TEXT NOT NULL CHECK(decision IN ('ALLOW_ONCE','ALWAYS_ALLOW','ASK','ALWAYS_ASK','DENY','ALWAYS_DENY')),
+                risk_level_at_grant INTEGER NOT NULL DEFAULT 0,
+                capability_version TEXT NOT NULL DEFAULT '1',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                UNIQUE(principal_type, principal_id, device_id, capability, resource_scope)
+            );
+            CREATE TABLE IF NOT EXISTS automation_rules (
+                rule_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner_device TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                trigger_json TEXT NOT NULL DEFAULT '{}',
+                conditions_json TEXT NOT NULL DEFAULT '[]',
+                routine_id TEXT,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+                quiet_hour_policy TEXT NOT NULL DEFAULT 'skip',
+                run_limit INTEGER NOT NULL DEFAULT 0,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS routines (
+                routine_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner_device TEXT NOT NULL,
+                steps_json TEXT NOT NULL DEFAULT '[]',
+                required_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                max_risk INTEGER NOT NULL DEFAULT 0,
+                failure_policy TEXT NOT NULL DEFAULT 'stop',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS schedules (
+                schedule_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                owner_device TEXT NOT NULL,
+                schedule_type TEXT NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                spec_json TEXT NOT NULL DEFAULT '{}',
+                missed_policy TEXT NOT NULL DEFAULT 'SKIP',
+                routine_id TEXT,
+                rule_id TEXT,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                next_due_at TIMESTAMP,
+                last_due_at TIMESTAMP,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                max_runs_per_day INTEGER NOT NULL DEFAULT 10,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS automation_runs (
+                run_id TEXT PRIMARY KEY,
+                rule_id TEXT,
+                schedule_id TEXT,
+                routine_id TEXT,
+                event_id TEXT,
+                dedup_key TEXT NOT NULL DEFAULT '',
+                chain_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                notification_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',
+                source TEXT NOT NULL DEFAULT 'automation',
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                device_scope TEXT NOT NULL DEFAULT '',
+                read INTEGER NOT NULL DEFAULT 0,
+                dismissed INTEGER NOT NULL DEFAULT 0,
+                sensitive INTEGER NOT NULL DEFAULT 0,
+                expires_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS automation_event_log (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL DEFAULT '',
+                host TEXT NOT NULL DEFAULT '',
+                device TEXT NOT NULL DEFAULT '',
+                timestamp TIMESTAMP NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                severity TEXT NOT NULL DEFAULT 'info',
+                dedup_key TEXT NOT NULL DEFAULT '',
+                chain_id TEXT NOT NULL DEFAULT '',
+                chain_depth INTEGER NOT NULL DEFAULT 0,
+                expires_at TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS memory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_key TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_ref TEXT NOT NULL DEFAULT '',
+                provenance_type TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.6,
+                importance REAL NOT NULL DEFAULT 0.5,
+                scope TEXT NOT NULL DEFAULT 'personal',
+                project TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                device_id TEXT NOT NULL DEFAULT '',
+                namespace_type TEXT NOT NULL DEFAULT 'global',
+                namespace_id TEXT NOT NULL DEFAULT 'global:user',
+                user_confirmed INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                content_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                last_used_at TIMESTAMP,
+                UNIQUE(namespace_type, namespace_id, memory_key, content_hash)
+            );
+            CREATE TABLE IF NOT EXISTS memory_item_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER,
+                memory_key TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                importance REAL NOT NULL,
+                scope TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                namespace_type TEXT NOT NULL DEFAULT 'global',
+                namespace_id TEXT NOT NULL DEFAULT 'global:user',
+                status TEXT NOT NULL,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                change_reason TEXT NOT NULL DEFAULT 'update'
+            );
+            CREATE INDEX IF NOT EXISTS idx_automation_rules_enabled ON automation_rules(enabled, owner_device);
+            CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_due_at);
+            CREATE INDEX IF NOT EXISTS idx_automation_runs_dedup ON automation_runs(dedup_key, created_at);
+            CREATE INDEX IF NOT EXISTS idx_notifications_pending ON notifications(device_scope, dismissed, read, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_event_log_created ON automation_event_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_active ON memory_items(namespace_type, namespace_id, status, scope, project, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_key ON memory_items(namespace_type, namespace_id, memory_key, status);
+            CREATE INDEX IF NOT EXISTS idx_memory_items_expiry ON memory_items(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_history_key ON memory_item_history(memory_key, changed_at);
             CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id, id);
             CREATE INDEX IF NOT EXISTS idx_conv_created ON conversations(created_at);
             CREATE INDEX IF NOT EXISTS idx_facts_category ON user_facts(category);
@@ -185,6 +491,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON open_tasks(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_project_notes_project ON project_notes(project, updated_at);
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at);
+            CREATE INDEX IF NOT EXISTS idx_permissions_lookup ON permission_grants(principal_type, principal_id, device_id, capability, resource_scope);
         """)
         _ensure_column(conn, "user_facts", "memory_key", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "user_facts", "updated_at", "TIMESTAMP")
@@ -197,8 +504,12 @@ def init_db() -> None:
         _ensure_column(conn, "action_history", "step", "INTEGER")
         _ensure_column(conn, "action_history", "status", "TEXT")
         _ensure_column(conn, "action_history", "duration_ms", "REAL")
+        _migrate_memory_namespace(conn)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_key_status ON user_facts(memory_key, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_items_namespace ON memory_items(namespace_type, namespace_id, memory_key, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_session_owners_device ON session_owners(owner_device_id, status)")
         conn.execute("UPDATE user_facts SET memory_key = lower(category || ':' || fact) WHERE memory_key = '' OR memory_key IS NULL")
+        _migrate_session_owners(conn)
         conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
         _try_fts(conn)
         if FTS5_AVAILABLE:
@@ -214,29 +525,88 @@ def schema_version() -> int:
     return int(row["value"]) if row else SCHEMA_VERSION
 
 
-def save_message(session_id: str, role: str, content: str, device: str = "unknown") -> None:
+def _migrate_session_owners(conn: sqlite3.Connection) -> None:
+    """Infer one owner only when legacy conversation data is unambiguous."""
+    rows = conn.execute("SELECT session_id, GROUP_CONCAT(DISTINCT device) AS devices FROM conversations GROUP BY session_id").fetchall()
+    for row in rows:
+        session_id = str(row[0] or "").strip()[:80]
+        devices = {part.strip() for part in str(row[1] or "").split(",") if part.strip() and part.strip() != "unknown"}
+        owner_device = next(iter(devices)) if len(devices) == 1 else ""
+        status = "active" if len(devices) <= 1 else "quarantined"
+        conn.execute("INSERT OR IGNORE INTO session_owners(session_id, owner_device_id, owner_principal_id, status) VALUES (?, ?, '', ?)", (session_id, owner_device, status))
+
+
+def claim_session(session_id: str, *, device_id: str = "", principal_id: str = "", is_master: bool = False) -> bool:
+    init_db()
     with get_db() as conn:
+        return bool(is_master or _ensure_session_owner(conn, session_id, device_id, principal_id))
+
+
+def get_session_owner(session_id: str) -> dict[str, Any]:
+    init_db()
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM session_owners WHERE session_id=?", (str(session_id or "").strip()[:80],)).fetchone()
+    return dict(row) if row else {}
+
+
+def session_access_allowed(session_id: str, *, device_id: str = "", principal_id: str = "", is_master: bool = False) -> bool:
+    if is_master:
+        return True
+    owner = get_session_owner(session_id)
+    if not owner or owner.get("status") != "active":
+        return False
+    owner_device = str(owner.get("owner_device_id") or "")
+    owner_principal = str(owner.get("owner_principal_id") or "")
+    return bool(owner_device and str(device_id or "") == owner_device and (not owner_principal or owner_principal == str(principal_id or "")))
+
+
+def save_message(session_id: str, role: str, content: str, device: str = "unknown", principal_id: str = "", is_master: bool = False) -> None:
+    init_db()
+    with get_db() as conn:
+        if not is_master and not _ensure_session_owner(conn, session_id, device, principal_id):
+            raise PermissionError("La sesión pertenece a otro dispositivo o está en cuarentena.")
+        if is_master:
+            _ensure_session_owner(conn, session_id, device, principal_id)
         conn.execute("INSERT INTO conversations (session_id, role, content, device) VALUES (?, ?, ?, ?)", (session_id, role, content[:20000], device[:80]))
 
 
-def get_conversation_history(session_id: str, limit: int = 50) -> list[dict]:
+def save_verified_owner_message(session_id: str, content: str, owner_device: str) -> None:
+    """Record a verified system result under the already established session owner."""
+    init_db()
+    with get_db() as conn:
+        row = conn.execute("SELECT owner_device_id, status FROM session_owners WHERE session_id=?", (session_id,)).fetchone()
+        if not row or row[1] != "active" or str(row[0] or "") != str(owner_device or ""):
+            raise PermissionError("No existe ownership verificable para la sesión.")
+        conn.execute("INSERT INTO conversations (session_id, role, content, device) VALUES (?, 'assistant', ?, ?)", (session_id, content[:20000], str(owner_device)[:80]))
+
+
+def get_conversation_history(session_id: str, limit: int = 50, access_context: MemoryAccessContext | None = None) -> list[dict]:
+    if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
+        raise PermissionError("La sesión no pertenece al Principal autenticado.")
     with get_db() as conn:
         rows = conn.execute("SELECT role, content, device, created_at FROM conversations WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
-def get_recent_messages(limit: int = 20, session_id: str | None = None) -> list[dict]:
+def get_recent_messages(limit: int = 20, session_id: str | None = None, access_context: MemoryAccessContext | None = None) -> list[dict]:
+    if access_context and session_id and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
+        raise PermissionError("La sesión no pertenece al Principal autenticado.")
     with get_db() as conn:
         if session_id:
             rows = conn.execute("SELECT role, content, device, session_id, created_at FROM conversations WHERE session_id=? ORDER BY id DESC LIMIT ?", (session_id, limit)).fetchall()
+        elif access_context and not access_context.is_master:
+            rows = conn.execute("SELECT role, content, device, session_id, created_at FROM conversations WHERE device=? ORDER BY id DESC LIMIT ?", (access_context.device_id, limit)).fetchall()
         else:
             rows = conn.execute("SELECT role, content, device, session_id, created_at FROM conversations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
-def get_all_sessions() -> list[dict]:
+def get_all_sessions(access_context: MemoryAccessContext | None = None) -> list[dict]:
     with get_db() as conn:
-        rows = conn.execute("SELECT session_id, MIN(created_at) AS started, MAX(created_at) AS last_message, COUNT(*) AS message_count, MAX(device) AS device FROM conversations GROUP BY session_id ORDER BY last_message DESC LIMIT 100").fetchall()
+        if access_context and not access_context.is_master:
+            rows = conn.execute("SELECT session_id, MIN(created_at) AS started, MAX(created_at) AS last_message, COUNT(*) AS message_count, MAX(device) AS device FROM conversations WHERE device=? GROUP BY session_id ORDER BY last_message DESC LIMIT 100", (access_context.device_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT session_id, MIN(created_at) AS started, MAX(created_at) AS last_message, COUNT(*) AS message_count, MAX(device) AS device FROM conversations GROUP BY session_id ORDER BY last_message DESC LIMIT 100").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -439,7 +809,9 @@ def get_work_session() -> dict:
     return dict(row) if row else {}
 
 
-def set_session_summary(session_id: str, summary: str, topics: list[str] | None = None, projects: list[str] | None = None, decisions: list[str] | None = None, open_tasks: list[str] | None = None, turn_count: int = 0) -> None:
+def set_session_summary(session_id: str, summary: str, topics: list[str] | None = None, projects: list[str] | None = None, decisions: list[str] | None = None, open_tasks: list[str] | None = None, turn_count: int = 0, access_context: MemoryAccessContext | None = None) -> None:
+    if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
+        raise PermissionError("La sesión no pertenece al Principal autenticado.")
     with get_db() as conn:
         conn.execute("INSERT INTO session_summaries(session_id, summary, topics_json, projects_json, important_decisions_json, open_tasks_json, turn_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(session_id) DO UPDATE SET summary=excluded.summary, topics_json=excluded.topics_json, projects_json=excluded.projects_json, important_decisions_json=excluded.important_decisions_json, open_tasks_json=excluded.open_tasks_json, turn_count=excluded.turn_count, updated_at=CURRENT_TIMESTAMP", (session_id, summary[:6000], json.dumps(topics or [], ensure_ascii=False), json.dumps(projects or [], ensure_ascii=False), json.dumps(decisions or [], ensure_ascii=False), json.dumps(open_tasks or [], ensure_ascii=False), int(turn_count)))
 
@@ -486,36 +858,47 @@ def _summary_topics(messages: list[dict]) -> tuple[list[str], list[str], list[st
     return list(dict.fromkeys(topics))[:8], list(dict.fromkeys(projects))[:8], list(dict.fromkeys(decisions))[:8], list(dict.fromkeys(tasks))[:8]
 
 
-def build_session_summary(session_id: str, limit: int = 32) -> str:
-    messages = get_conversation_history(session_id, limit=limit)
+def build_session_summary(session_id: str, limit: int = 32, access_context: MemoryAccessContext | None = None) -> str:
+    messages = get_conversation_history(session_id, limit=limit, access_context=access_context)
     if not messages:
         return ""
     topics, projects, decisions, tasks = _summary_topics(messages)
     lines = [f"{item['role']}: {item['content'][:260]}" for item in messages[-12:]]
     summary = "\n".join(lines)
-    set_session_summary(session_id, summary, topics, projects, decisions, tasks, turn_count=len(messages) // 2)
+    set_session_summary(session_id, summary, topics, projects, decisions, tasks, turn_count=len(messages) // 2, access_context=access_context)
     return summary
 
 
-def maybe_update_session_summary(session_id: str, force: bool = False) -> str:
+def maybe_update_session_summary(session_id: str, force: bool = False, access_context: MemoryAccessContext | None = None) -> str:
+    if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
+        raise PermissionError("La sesión no pertenece al Principal autenticado.")
     record = get_session_summary_record(session_id)
-    messages = get_conversation_history(session_id, limit=SESSION_SUMMARY_EVERY_TURNS * 4)
+    messages = get_conversation_history(session_id, limit=SESSION_SUMMARY_EVERY_TURNS * 4, access_context=access_context)
     turn_count = len(messages) // 2
     last_count = int(record.get("turn_count", 0) or 0)
     if force or (turn_count >= 1 and turn_count - last_count >= SESSION_SUMMARY_EVERY_TURNS):
-        return build_session_summary(session_id)
+        return build_session_summary(session_id, access_context=access_context)
     return str(record.get("summary", ""))
 
 
-def get_context_bundle(session_id: str, user_message: str, recent_limit: int = 10) -> dict:
-    summary = maybe_update_session_summary(session_id)
+def get_context_bundle(session_id: str, user_message: str, recent_limit: int = 10, access_context: MemoryAccessContext | None = None) -> dict:
+    if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
+        raise PermissionError("La sesión no pertenece al Principal autenticado.")
+    summary = maybe_update_session_summary(session_id, access_context=access_context)
     memories = search_memories(user_message, limit=MEMORY_RELEVANCE_LIMIT)
     active_project = get_active_project()
     project_notes = get_project_notes(active_project) if active_project else []
+    advanced: dict[str, Any] = {"items": [], "context_text": "", "truncated": False, "retrieval_ms": 0}
+    try:
+        from advanced_memory import retrieve
+        advanced = retrieve(user_message, project=active_project or None, session_id=session_id, device_id=access_context.device_id if access_context and not access_context.is_master else None, include_all_devices=bool(access_context and access_context.is_master), limit=MEMORY_RELEVANCE_LIMIT, max_chars=4000)
+    except (ImportError, OSError, ValueError):
+        # Advanced memory is an additive layer; legacy facts remain available.
+        advanced = {"items": [], "context_text": "", "truncated": False, "retrieval_ms": 0}
     work_session = get_work_session()
     tasks = get_open_tasks(12)
     recent_actions = get_action_history(session_id, 8)
-    return {"recent_messages": get_conversation_history(session_id, recent_limit), "session_summary": get_session_summary_record(session_id), "relevant_memories": memories, "active_project": active_project, "project_notes": project_notes, "work_session": work_session, "open_tasks": tasks, "recent_actions": recent_actions, "summary_text": summary}
+    return {"recent_messages": get_conversation_history(session_id, recent_limit, access_context=access_context), "session_summary": get_session_summary_record(session_id), "relevant_memories": memories, "advanced_memories": advanced.get("items", []), "advanced_memory_text": str(advanced.get("context_text", ""))[:4000], "advanced_memory_truncated": bool(advanced.get("truncated")), "summary_text": summary, "active_project": active_project, "project_notes": project_notes, "work_session": work_session, "open_tasks": tasks, "recent_actions": recent_actions}
 
 
 def _normalize_capabilities(capabilities: list[str] | None) -> list[str]:
@@ -566,6 +949,24 @@ def create_device_token(device_id: str, *, ttl_days: int = DEVICE_TOKEN_TTL_DAYS
     token_id = secrets.token_hex(12)
     expires_at = datetime.now() + timedelta(days=max(1, int(ttl_days)))
     with get_db() as conn:
+        conn.execute("INSERT INTO device_tokens(token_id, device_id, token_hash, expires_at) VALUES (?, ?, ?, ?)", (token_id, safe_device, token_hash, expires_at.isoformat()))
+    return {"token_id": token_id, "device_id": safe_device, "token": token, "expires_at": expires_at.isoformat()}
+
+
+def rotate_device_token(device_id: str, *, ttl_days: int = DEVICE_TOKEN_TTL_DAYS) -> dict:
+    """Rotate all active device tokens atomically; return the new secret once."""
+    safe_device = str(device_id or "").strip()[:80]
+    if not safe_device:
+        raise ValueError("device_id vacío")
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    token_id = secrets.token_hex(12)
+    expires_at = datetime.now() + timedelta(days=max(1, int(ttl_days)))
+    with get_db() as conn:
+        device = conn.execute("SELECT device_id, revoked FROM devices WHERE device_id=?", (safe_device,)).fetchone()
+        if not device or int(device["revoked"]):
+            raise ValueError("Dispositivo inexistente o revocado.")
+        conn.execute("UPDATE device_tokens SET revoked=1 WHERE device_id=? AND revoked=0", (safe_device,))
         conn.execute("INSERT INTO device_tokens(token_id, device_id, token_hash, expires_at) VALUES (?, ?, ?, ?)", (token_id, safe_device, token_hash, expires_at.isoformat()))
     return {"token_id": token_id, "device_id": safe_device, "token": token, "expires_at": expires_at.isoformat()}
 
@@ -657,12 +1058,13 @@ def save_action(action_id: str, session_id: str, device: str, action: dict, resu
     """Persist aggregate action and bounded per-step records for plans."""
     with get_db() as conn:
         plan_id = str(action.get("plan_id") or action_id) if action.get("type") == "plan" else None
-        conn.execute("INSERT INTO action_history(action_id, session_id, device, action_name, risk_level, success, request_json, result_json, plan_id, step, status, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (action_id, session_id, device, str(action.get("name") or action.get("type") or "unknown"), int(action.get("risk_level", 0)), int(bool(result.get("success"))), json.dumps(action, ensure_ascii=False), json.dumps(result, ensure_ascii=False), plan_id, 0 if plan_id else None, "success" if result.get("success") else ("cancelled" if result.get("cancelled") else "failed"), result.get("duration_ms")))
+        aggregate_status = str(result.get("status") or ("SUCCESS" if result.get("success") else ("CANCELLED" if result.get("cancelled") else "FAILED"))).lower()
+        conn.execute("INSERT INTO action_history(action_id, session_id, device, action_name, risk_level, success, request_json, result_json, plan_id, step, status, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (action_id, session_id, device, str(action.get("name") or action.get("type") or "unknown"), int(action.get("risk_level", 0)), int(bool(result.get("success"))), json.dumps(action, ensure_ascii=False), json.dumps(result, ensure_ascii=False), plan_id, 0 if plan_id else None, aggregate_status, result.get("duration_ms")))
         if action.get("type") == "plan":
             steps = result.get("data", {}).get("actions", []) if isinstance(result.get("data"), dict) else []
             for index, step_result in enumerate(steps, 1):
                 step_action = step_result.get("action") if isinstance(step_result, dict) else "unknown"
-                status = "success" if step_result.get("success") else ("cancelled" if step_result.get("cancelled") else "failed")
+                status = str(step_result.get("status") or ("SUCCESS" if step_result.get("success") else ("CANCELLED" if step_result.get("cancelled") else "FAILED"))).lower()
                 step_data = step_result.get("data") if isinstance(step_result.get("data"), dict) else {}
                 conn.execute("INSERT INTO action_history(action_id, session_id, device, action_name, risk_level, success, request_json, result_json, plan_id, step, status, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (f"{action_id}:{index}", session_id, device, str(step_action), int(step_result.get("risk_level", action.get("risk_level", 0))), int(bool(step_result.get("success"))), json.dumps({"plan_id": plan_id, "step": index, "action": step_result}, ensure_ascii=False), json.dumps(step_result, ensure_ascii=False), plan_id, index, status, step_result.get("duration_ms", step_data.get("duration_ms"))))
 
@@ -735,3 +1137,167 @@ def get_stats() -> dict:
         action_count = conn.execute("SELECT COUNT(*) AS c FROM action_history").fetchone()["c"]
         task_count = conn.execute("SELECT COUNT(*) AS c FROM open_tasks WHERE status='open'").fetchone()["c"]
     return {"total_messages": msg_count, "total_facts": fact_count, "total_sessions": session_count, "first_interaction": first_msg, "db_size_mb": round(DB_PATH.stat().st_size / (1024 * 1024), 2) if DB_PATH.exists() else 0, "pending_proactive": pending, "total_actions": action_count, "open_tasks": task_count, "schema_version": schema_version(), "fts5": FTS5_AVAILABLE, "last_backup_time": get_state("last_backup_time", "")}
+
+
+_PERMISSION_DECISIONS = frozenset({"ALLOW_ONCE", "ALWAYS_ALLOW", "ASK", "ALWAYS_ASK", "DENY", "ALWAYS_DENY"})
+
+
+def default_permission_decision(risk_level: int, device_id: str = "pc-main") -> str:
+    """Personal pc-main auto-runs read/trivial work; other devices stay conservative."""
+    risk = int(risk_level)
+    if risk <= 1 and str(device_id) == "pc-main":
+        return "AUTO"
+    if risk <= 1:
+        return "ASK"
+    if risk == 2:
+        return "ASK"
+    return "ALWAYS_ASK"
+
+
+def save_permission_grant(
+    *,
+    principal_type: str,
+    principal_id: str = "",
+    device_id: str = "",
+    capability: str,
+    resource_scope: str = "",
+    decision: str,
+    risk_level: int,
+    capability_version: str = "1",
+    expires_at: str | None = None,
+) -> int:
+    """Persist a scoped permission decision; no token or secret is stored."""
+    init_db()
+    decision = str(decision).strip().upper()
+    if decision not in _PERMISSION_DECISIONS:
+        raise ValueError("Decisión de permiso inválida.")
+    clean_scope = str(resource_scope or "").strip()[:500]
+    if decision in {"ALWAYS_ALLOW", "ALWAYS_DENY"} and (not clean_scope or clean_scope == "*" or "unresolved" in clean_scope.casefold()):
+        raise ValueError("Los grants persistentes requieren un resource_scope explícito y resuelto.")
+    resource_scope = clean_scope
+    risk_level = int(risk_level)
+    if risk_level not in range(5):
+        raise ValueError("risk_level debe estar entre 0 y 4.")
+    fields = (str(principal_type)[:40], str(principal_id)[:120], str(device_id)[:120], str(capability)[:160], str(resource_scope)[:500], decision, risk_level, str(capability_version)[:40], expires_at)
+    with get_db() as conn:
+        row = conn.execute("""
+            INSERT INTO permission_grants(principal_type, principal_id, device_id, capability, resource_scope, decision, risk_level_at_grant, capability_version, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(principal_type, principal_id, device_id, capability, resource_scope)
+            DO UPDATE SET decision=excluded.decision, risk_level_at_grant=excluded.risk_level_at_grant, capability_version=excluded.capability_version, updated_at=CURRENT_TIMESTAMP, expires_at=excluded.expires_at
+            RETURNING id
+        """, fields).fetchone()
+    return int(row["id"])
+
+
+def _permission_row(*, principal_type: str, principal_id: str, device_id: str, capability: str, resource_scope: str) -> sqlite3.Row | None:
+    init_db()
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT * FROM permission_grants
+            WHERE principal_type=? AND principal_id=? AND device_id=? AND capability=? AND resource_scope=?
+              AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+            ORDER BY id DESC LIMIT 1
+        """, (principal_type, principal_id, device_id, capability, resource_scope)).fetchone()
+
+
+def _permission_rows(*, principal_type: str, principal_id: str, device_id: str, capability: str, resource_scope: str) -> list[sqlite3.Row]:
+    init_db()
+    with get_db() as conn:
+        return conn.execute("""
+            SELECT *, CASE WHEN resource_scope=? THEN 2 WHEN resource_scope='*' THEN 1 ELSE 0 END AS scope_specificity
+            FROM permission_grants
+            WHERE principal_type=? AND principal_id=? AND device_id=? AND capability=?
+              AND resource_scope IN (?, '*')
+              AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+            ORDER BY scope_specificity DESC, updated_at DESC, id DESC
+        """, (resource_scope, principal_type, principal_id, device_id, capability, resource_scope)).fetchall()
+
+
+def resolve_permission(
+    *,
+    principal_type: str,
+    principal_id: str = "",
+    device_id: str = "",
+    capability: str,
+    resource_scope: str = "",
+    current_risk_level: int,
+    capability_version: str = "1",
+    include_default: bool = False,
+) -> dict | None:
+    """Resolve most-specific scope and invalidate grants that would under-ask after risk increases."""
+    rows = _permission_rows(principal_type=principal_type, principal_id=principal_id, device_id=device_id, capability=capability, resource_scope=resource_scope)
+    row = rows[0] if rows else None
+    if not row:
+        if not include_default:
+            return None
+        decision = default_permission_decision(current_risk_level, device_id)
+        return {
+            "id": None,
+            "principal_type": str(principal_type),
+            "principal_id": str(principal_id),
+            "device_id": str(device_id),
+            "capability": str(capability),
+            "resource_scope": str(resource_scope),
+            "decision": decision,
+            "effective_decision": decision,
+            "risk_level_at_grant": int(current_risk_level),
+            "capability_version": str(capability_version),
+            "risk_escalated": False,
+            "version_changed": False,
+            "source": "default_policy",
+            "scope_specificity": 0,
+        }
+    data = dict(row)
+    data["risk_escalated"] = int(current_risk_level) > int(row["risk_level_at_grant"])
+    data["version_changed"] = str(capability_version) != str(row["capability_version"])
+    if data["risk_escalated"] or data["version_changed"]:
+        data["effective_decision"] = "ALWAYS_ASK" if row["decision"] in {"ALWAYS_ALLOW", "ALLOW_ONCE"} else row["decision"]
+    else:
+        data["effective_decision"] = row["decision"]
+    return data
+
+
+def mark_permission_used(permission_id: int) -> None:
+    init_db()
+    with get_db() as conn:
+        row = conn.execute("SELECT decision FROM permission_grants WHERE id=?", (int(permission_id),)).fetchone()
+        if not row:
+            return
+        if row["decision"] == "ALLOW_ONCE":
+            conn.execute("DELETE FROM permission_grants WHERE id=?", (int(permission_id),))
+        else:
+            conn.execute("UPDATE permission_grants SET last_used_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(permission_id),))
+
+
+def revoke_permission(*, principal_type: str, principal_id: str = "", device_id: str = "", capability: str, resource_scope: str = "") -> int:
+    init_db()
+    with get_db() as conn:
+        cursor = conn.execute("DELETE FROM permission_grants WHERE principal_type=? AND principal_id=? AND device_id=? AND capability=? AND resource_scope=?", (principal_type, principal_id, device_id, capability, resource_scope))
+    return int(cursor.rowcount)
+
+
+def list_permissions(*, principal_type: str | None = None, principal_id: str | None = None, device_id: str | None = None) -> list[dict]:
+    init_db()
+    clauses: list[str] = []
+    values: list[str] = []
+    for column, value in (("principal_type", principal_type), ("principal_id", principal_id), ("device_id", device_id)):
+        if value is not None:
+            clauses.append(f"{column}=?")
+            values.append(str(value))
+    query = "SELECT * FROM permission_grants" + (" WHERE " + " AND ".join(clauses) if clauses else "") + " ORDER BY updated_at DESC, id DESC"
+    with get_db() as conn:
+        return [dict(row) for row in conn.execute(query, values).fetchall()]
+
+
+
+def list_states(prefix: str = "") -> list[dict]:
+    with get_db() as conn:
+        rows = conn.execute("SELECT key, value, updated_at FROM lumen_state WHERE key LIKE ? ORDER BY updated_at DESC", (str(prefix) + "%",)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_states_prefix(prefix: str) -> int:
+    with get_db() as conn:
+        cursor = conn.execute("DELETE FROM lumen_state WHERE key LIKE ?", (str(prefix) + "%",))
+    return int(cursor.rowcount)

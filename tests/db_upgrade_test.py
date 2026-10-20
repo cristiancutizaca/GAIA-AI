@@ -1,4 +1,4 @@
-"""Prueba de migración SQLite desde el esquema v4 mínimo al v5."""
+"""Prueba de migración SQLite desde el esquema v4 mínimo al schema 9."""
 from __future__ import annotations
 
 import os
@@ -24,14 +24,14 @@ with tempfile.TemporaryDirectory(prefix="gaia_upgrade_") as tmp:
     import memory
 
     memory.init_db()
-    assert memory.schema_version() == 5
+    assert memory.schema_version() == 9
     with memory.get_db() as conn:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_facts)").fetchall()}
         tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert {"memory_key", "status", "pinned", "last_used_at"}.issubset(columns)
-    assert {"device_tokens", "fact_history", "open_tasks", "project_notes", "work_sessions", "session_summaries"}.issubset(tables)
+    assert {"device_tokens", "fact_history", "open_tasks", "project_notes", "work_sessions", "session_summaries", "permission_grants", "automation_rules", "routines", "schedules", "automation_runs", "notifications", "automation_event_log", "memory_items", "memory_item_history", "session_owners"}.issubset(tables)
     facts = memory.get_facts()
     assert facts and facts[0]["fact"] == "Cris"
     assert memory.search_memories("Cris")
 
-print("DB UPGRADE TEST OK: v4 -> v5 conserva datos y crea tablas nuevas.")
+print("DB UPGRADE TEST OK: v4 -> schema 9 conserva datos, crea namespaces/session ownership y mantiene contratos heredados.")

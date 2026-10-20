@@ -11,6 +11,8 @@ class LumenService {
   String secret;
   String sessionId = '';
   String activeRequestId = '';
+  String lastHostVersion = '';
+  String deviceId = 'android';
   final String device = 'android';
   static const FlutterSecureStorage _secureStorage = FlutterSecureStorage();
 
@@ -30,15 +32,57 @@ class LumenService {
     return '$operation $status: ${body.length > 300 ? body.substring(0, 300) : body}';
   }
 
+  Map<String, dynamic> _requestEnvelope(String channel, String message) => {
+    'schema_version': '1',
+    'request_id': DateTime.now().microsecondsSinceEpoch.toRadixString(16),
+    'session_id': sessionId,
+    'channel': channel,
+    'requesting_device': deviceId,
+    'target_host': '',
+    'timestamp': DateTime.now().toUtc().toIso8601String(),
+    'protocol_version': '1.0-RC6',
+    'text': message.length > 12000 ? message.substring(0, 12000) : message,
+  };
+
   void _requireDeviceToken() {
     if (secret.trim().isEmpty) {
       throw Exception('Configura un token de dispositivo; el secreto maestro no se usa en Android.');
     }
   }
 
+  /// Parses the one-shot QR/deep-link payload produced by the PC pairing flow.
+  /// It contains no long-lived token: only pairing id, short-lived code and Core URL.
+  static Map<String, String> parsePairingUri(String raw) {
+    final value = raw.trim();
+    if (value.isEmpty) throw const FormatException('URI de pairing vacío.');
+    final parsed = Uri.tryParse(value);
+    if (parsed == null || parsed.scheme.toLowerCase() != 'gaia' || parsed.host.toLowerCase() != 'pair') {
+      throw const FormatException('El QR no contiene un URI gaia://pair válido.');
+    }
+    final pairingId = (parsed.queryParameters['id'] ?? parsed.queryParameters['pairing_id'] ?? '').trim();
+    final code = (parsed.queryParameters['code'] ?? '').trim();
+    final rawUrl = (parsed.queryParameters['url'] ?? parsed.queryParameters['server'] ?? '').trim();
+    final server = Uri.tryParse(rawUrl);
+    final validServer = server != null &&
+        {'http', 'https'}.contains(server.scheme.toLowerCase()) &&
+        server.host.isNotEmpty &&
+        server.userInfo.isEmpty &&
+        server.fragment.isEmpty;
+    if (pairingId.isEmpty || code.isEmpty || !validServer) {
+      throw const FormatException('El QR no contiene todos los datos seguros de pairing.');
+    }
+    return {
+      'url': rawUrl.replaceFirst(RegExp(r'\/$'), ''),
+      'pairing_id': pairingId,
+      'code': code,
+    };
+  }
+
   Future<void> loadSavedConfig() async {
     final prefs = await SharedPreferences.getInstance();
     baseUrl = prefs.getString('gaia_base_url') ?? baseUrl;
+    sessionId = prefs.getString('gaia_session_id') ?? sessionId;
+    deviceId = prefs.getString('gaia_device_id') ?? deviceId;
     final secureToken = await _secureStorage.read(key: 'gaia_device_token');
     final legacyToken = prefs.getString('gaia_secret');
     secret = secureToken ?? legacyToken ?? secret;
@@ -48,13 +92,34 @@ class LumenService {
     }
   }
 
-  Future<void> saveConfig({required String url, required String token}) async {
+  Future<void> clearSavedConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('gaia_base_url');
+    await prefs.remove('gaia_session_id');
+    await prefs.remove('gaia_device_id');
+    await prefs.remove('gaia_secret');
+    await _secureStorage.delete(key: 'gaia_device_token');
+    secret = '';
+    sessionId = '';
+    deviceId = 'android';
+  }
+
+  Future<void> saveConfig({required String url, required String token, String? pairedDeviceId}) async {
     baseUrl = url.trim().replaceFirst(RegExp(r'\/$'), '');
     secret = token.trim();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('gaia_base_url', baseUrl);
+    if (pairedDeviceId != null && pairedDeviceId.trim().isNotEmpty) {
+      deviceId = pairedDeviceId.trim();
+      await prefs.setString('gaia_device_id', deviceId);
+    }
     await _secureStorage.write(key: 'gaia_device_token', value: secret);
     await prefs.remove('gaia_secret');
+  }
+
+  Future<void> _saveSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (sessionId.isNotEmpty) await prefs.setString('gaia_session_id', sessionId);
   }
 
   // === Chat compatible ===
@@ -66,8 +131,11 @@ class LumenService {
       body: jsonEncode({
         'message': message,
         'session_id': sessionId,
-        'device': device,
+        'device': deviceId,
         'profile': profile,
+        'channel': 'android_text',
+        'request_envelope': _requestEnvelope('android_text', message),
+        // Android does not authoritatively know the PC foreground window.
         if (context != null) 'context': context,
       }),
     ).timeout(const Duration(seconds: 620));
@@ -78,6 +146,7 @@ class LumenService {
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     sessionId = data['session_id'] ?? sessionId;
+    await _saveSession();
     return data;
   }
 
@@ -89,8 +158,12 @@ class LumenService {
     request.body = jsonEncode({
       'message': message,
       'session_id': sessionId,
-      'device': device,
+              'device': deviceId,
+
       'profile': profile,
+      'channel': 'android_text',
+      'request_envelope': _requestEnvelope('android_text', message),
+      // Android does not authoritatively know the PC foreground window.
       if (context != null) 'context': context,
     });
     final client = http.Client();
@@ -109,6 +182,7 @@ class LumenService {
           if (event == 'meta') {
             sessionId = data['session_id'] ?? sessionId;
             activeRequestId = data['request_id'] ?? activeRequestId;
+            await _saveSession();
           }
           yield data;
           if (event == 'done' || event == 'error' || event == 'cancelled') break;
@@ -135,15 +209,19 @@ class LumenService {
     _requireDeviceToken();
     final request = http.MultipartRequest(
       'POST',
-      Uri.parse('$baseUrl/api/chat/voice?session_id=$sessionId&device=$device'),
+      Uri.parse('$baseUrl/api/chat/voice?session_id=$sessionId&device=$deviceId'),
     );
     request.headers['Authorization'] = 'Bearer $secret';
+    request.fields['channel'] = 'android_voice';
+    request.fields['request_envelope'] = jsonEncode(_requestEnvelope('android_voice', ''));
+    request.fields['desktop_snapshot'] = jsonEncode({});
     request.files.add(await http.MultipartFile.fromPath('audio', audioPath));
     final streamedResponse = await request.send().timeout(const Duration(seconds: 620));
     final response = await http.Response.fromStream(streamedResponse);
     if (response.statusCode != 200) throw Exception(_error('Voz', response.statusCode, response.body));
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     sessionId = data['session_id'] ?? sessionId;
+    await _saveSession();
     return data;
   }
 
@@ -161,6 +239,20 @@ class LumenService {
     return file.path;
   }
 
+  Future<String> downloadCapture(String captureId) async {
+    _requireDeviceToken();
+    final candidate = captureId.trim();
+    if (!RegExp(r'^cap_[A-Za-z0-9_-]{20,80}$').hasMatch(candidate)) {
+      throw const FormatException('capture_id inválido.');
+    }
+    final response = await http.get(Uri.parse('$baseUrl/api/captures/$candidate'), headers: {'Authorization': 'Bearer $secret'});
+    if (response.statusCode != 200) throw Exception(_error('Captura', response.statusCode, response.body));
+    final dir = await getTemporaryDirectory();
+    final file = File('${dir.path}/$candidate.png');
+    await file.writeAsBytes(response.bodyBytes);
+    return file.path;
+  }
+
   Future<String> downloadAudio(String audioUrl) async {
     final response = await http.get(Uri.parse('$baseUrl$audioUrl'), headers: _headers);
     if (response.statusCode != 200) throw Exception('Audio ${response.statusCode}');
@@ -168,6 +260,112 @@ class LumenService {
     final file = File('${dir.path}/gaia_voice.mp3');
     await file.writeAsBytes(response.bodyBytes);
     return file.path;
+  }
+
+  // === Acciones remotas: Android solicita y aprueba; el PC host ejecuta ===
+  Future<Map<String, dynamic>> approveAction(String actionId, String actionSessionId, {String? decision}) async {
+    _requireDeviceToken();
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/actions/approve'),
+      headers: _headers,
+      body: jsonEncode({'action_id': actionId, 'session_id': actionSessionId, if (decision != null) 'decision': decision}),
+    );
+    if (response.statusCode != 200) throw Exception(_error('Aprobación', response.statusCode, response.body));
+    return jsonDecode(response.body);
+  }
+
+  Future<Map<String, dynamic>> rejectAction(String actionId, String actionSessionId) async {
+    _requireDeviceToken();
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/actions/reject'),
+      headers: _headers,
+      body: jsonEncode({'action_id': actionId, 'session_id': actionSessionId}),
+    );
+    if (response.statusCode != 200) throw Exception(_error('Rechazo', response.statusCode, response.body));
+    return jsonDecode(response.body);
+  }
+
+  Future<Map<String, dynamic>> getActionControl() async {
+    _requireDeviceToken();
+    final response = await http.get(Uri.parse('$baseUrl/api/actions/control'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Control de acciones', response.statusCode, response.body));
+    return jsonDecode(response.body);
+  }
+
+  Future<Map<String, dynamic>> negotiateFeatures(Map<String, String> features, {bool requestRemoteActions = false}) async {
+    _requireDeviceToken();
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/devices/negotiate'),
+      headers: _headers,
+      body: jsonEncode({'features': features, 'request_remote_actions': requestRemoteActions}),
+    );
+    if (response.statusCode != 200) throw Exception(_error('Negociación', response.statusCode, response.body));
+    return jsonDecode(response.body);
+  }
+
+  Future<Map<String, dynamic>> completePairing(String pairingId, String code, Map<String, String> features) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/pairing/complete'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'pairing_id': pairingId, 'code': code, 'features': features}),
+    );
+    if (response.statusCode != 200) throw Exception(_error('Pairing', response.statusCode, response.body));
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final pairedToken = data['token']?.toString() ?? '';
+    final pairedDevice = data['device_id']?.toString() ?? '';
+    if (pairedToken.isEmpty || pairedDevice.isEmpty) throw Exception('Pairing no devolvió onboarding completo.');
+    await saveConfig(url: baseUrl, token: pairedToken, pairedDeviceId: pairedDevice);
+    return data;
+  }
+
+  Future<Map<String, dynamic>> getRemoteHostStatus() async {
+    _requireDeviceToken();
+    final response = await http.get(Uri.parse('$baseUrl/api/action-host/status'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Estado del PC Action Host', response.statusCode, response.body));
+    return jsonDecode(response.body);
+  }
+
+  // === Automatizaciones v0.9.0 ===
+  Future<Map<String, dynamic>> getAutomationStatus() async {
+    _requireDeviceToken();
+    final response = await http.get(Uri.parse('$baseUrl/api/automation/status'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Automatizaciones', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> getAutomations() async {
+    _requireDeviceToken();
+    final response = await http.get(Uri.parse('$baseUrl/api/automations'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Reglas', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> getNotifications() async {
+    _requireDeviceToken();
+    final response = await http.get(Uri.parse('$baseUrl/api/notifications'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Notificaciones', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> pauseAutomation(bool paused) async {
+    _requireDeviceToken();
+    final response = await http.post(Uri.parse('$baseUrl/api/automation/pause?paused=$paused'), headers: _headers);
+    if (response.statusCode != 200) throw Exception(_error('Pausa de automatizaciones', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> setAutomationMode(String mode) async {
+    _requireDeviceToken();
+    final response = await http.post(Uri.parse('$baseUrl/api/automation/mode'), headers: _headers, body: jsonEncode({'mode': mode}));
+    if (response.statusCode != 200) throw Exception(_error('Modo de automatización', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> updateNotification(String id, {bool? read, bool? dismissed}) async {
+    _requireDeviceToken();
+    final response = await http.patch(Uri.parse('$baseUrl/api/notifications/$id'), headers: _headers, body: jsonEncode({if (read != null) 'read': read, if (dismissed != null) 'dismissed': dismissed}));
+    if (response.statusCode != 200) throw Exception(_error('Notificación', response.statusCode, response.body));
+    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   // === Estado, memoria y backup ===
@@ -220,6 +418,10 @@ class LumenService {
   Future<bool> testConnection() async {
     try {
       final response = await http.get(Uri.parse('$baseUrl/api/status'), headers: _headers).timeout(const Duration(seconds: 5));
+      if (response.statusCode == 401) {
+        await clearSavedConfig();
+        return false;
+      }
       return response.statusCode == 200;
     } catch (_) {
       return false;

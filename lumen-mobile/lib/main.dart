@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'screens/chat_screen.dart';
 import 'screens/settings_screen.dart';
+import 'screens/pairing_screen.dart';
+import 'services/lumen_service.dart';
 
 void main() {
   runApp(const LumenApp());
@@ -29,7 +31,39 @@ class LumenApp extends StatelessWidget {
           elevation: 0,
         ),
       ),
-      home: const ChatScreen(),
+      home: const BootstrapScreen(),
     );
+  }
+}
+
+
+class BootstrapScreen extends StatefulWidget {
+  const BootstrapScreen({super.key});
+
+  @override
+  State<BootstrapScreen> createState() => _BootstrapScreenState();
+}
+
+class _BootstrapScreenState extends State<BootstrapScreen> {
+  final LumenService _lumen = LumenService();
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    await _lumen.loadSavedConfig();
+    if (!mounted) return;
+    setState(() => _loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (_lumen.secret.trim().isEmpty) return PairingScreen(lumen: _lumen);
+    return ChatScreen(lumen: _lumen);
   }
 }

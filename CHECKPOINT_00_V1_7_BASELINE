@@ -1,0 +1,9 @@
+# CHECKPOINT_00_V1_7_BASELINE
+
+Immutable source checkpoint for the final completion run.
+
+- Source archive: `GAIA-AI-v1.7-DESKTOP-UPSTREAM-INTEGRATION.zip`
+- SHA-256: `6b87b8309af138d6435ed727118ea3bd76f6f3b459eaaac42b73ff1680bbbfef`
+- Extracted workspace: `/home/ubuntu/gaia_v17_final_work/source`
+- Changes after this checkpoint are the v1.8 final-candidate hardening run.
+- Do not edit this checkpoint.

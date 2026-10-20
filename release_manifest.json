@@ -1,0 +1,11 @@
+{
+  "deterministic": true,
+  "documentation_projection": "all current Markdown/TXT members of project archive",
+  "manifest_format": 2,
+  "product": "GAIA-AI",
+  "protocol": "1.0-RC6",
+  "release": "2.0-RESIDENT-DESKTOP-ASSISTANT",
+  "schema_max": 9,
+  "schema_min": 8,
+  "version": "2.0.0"
+}

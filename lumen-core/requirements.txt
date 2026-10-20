@@ -6,3 +6,7 @@ edge-tts==6.1.12
 openai-whisper==20231117
 python-multipart==0.0.9
 python-dotenv==1.0.1
+pydantic>=2.12,<3
+
+# DeepSeek Harness SDK oficial + runtime emparejado (instala deepseek-harness-runtime-bin).
+deepseek-harness-sdk==0.1.5rc1

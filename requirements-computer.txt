@@ -1,0 +1,3 @@
+# Optional GAIA Computer Use group
+# UI-TARS 0.5.1 is available as an optional provider; a physical GUI and its model/runtime are required.
+ui-tars==0.5.1

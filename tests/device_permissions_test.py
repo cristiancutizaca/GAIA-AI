@@ -1,4 +1,4 @@
-"""Matriz mínima de autorización por token de dispositivo para v0.5.3."""
+"""Matriz mínima de autorización por token de dispositivo para v0.5.4."""
 from __future__ import annotations
 
 import os

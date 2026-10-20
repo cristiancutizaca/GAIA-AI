@@ -11,6 +11,7 @@ import httpx
 
 from config import (
     ANTHROPIC_API_KEY,
+    DSH_FALLBACK_TO_OLLAMA,
     LLM_BACKEND,
     LLM_CONTEXT,
     LLM_HIDE_REASONING,
@@ -18,6 +19,7 @@ from config import (
     LLM_MODEL,
     LLM_PROFILE,
     LLM_RETRY_COUNT,
+    MAX_CONCURRENT_LLM_REQUESTS,
     LLM_STREAM_ENABLED,
     LLM_TIMEOUT_SECONDS,
     OLLAMA_URL,
@@ -26,6 +28,36 @@ from config import (
 from model_router import PROFILES, ModelSelection, fallback_selection, profile_options, resolve_profile, selection_for
 
 logger = logging.getLogger("lumen.llm")
+_LLM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+_HTTP_CLIENT_LOOP_ID: int | None = None
+_METRICS = {"queued": 0, "generating": 0, "completed": 0, "cancelled": 0, "failed": 0, "llm_calls": 0, "queue_wait_ms": 0.0, "llm_ttft_ms": 0.0, "llm_total_ms": 0.0}
+
+
+async def _http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP_ID
+    loop_id = id(asyncio.get_running_loop())
+    if _HTTP_CLIENT is None or _HTTP_CLIENT_LOOP_ID != loop_id:
+        _HTTP_CLIENT = httpx.AsyncClient(timeout=_timeout())
+        _HTTP_CLIENT_LOOP_ID = loop_id
+    return _HTTP_CLIENT
+
+
+async def shutdown_http_client() -> None:
+    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP_ID
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
+    _HTTP_CLIENT = None
+    _HTTP_CLIENT_LOOP_ID = None
+    try:
+        from harness_backend import shutdown_harnesses
+        await shutdown_harnesses()
+    except ImportError:
+        pass
+
+
+def metrics() -> dict:
+    return {key: round(float(value), 3) if isinstance(value, float) else int(value) for key, value in _METRICS.items()}
 
 
 class LLMError(RuntimeError):
@@ -56,19 +88,53 @@ async def chat_completion(system_prompt: str, messages: list[dict], temperature:
     selection = selection_for(selected_profile)
     options = profile_options(selected_profile, context_override)
     started = time.perf_counter()
+    queued_at = time.perf_counter()
+    _METRICS["queued"] += 1
+    _METRICS["llm_calls"] += 1
+    acquired = False
     try:
-        text = await _chat_once(system_prompt, messages, options, selection)
-    except LLMError as first_error:
-        fallback = fallback_selection(selection, str(first_error))
-        if not fallback:
-            raise
-        text = await _chat_once(system_prompt, messages, options, fallback)
-        selection = fallback
-    logger.info("LLM completion backend=%s model=%s profile=%s duration_ms=%.0f chars=%s fallback=%s", LLM_BACKEND, selection.selected_model, selected_profile, (time.perf_counter() - started) * 1000, len(text), selection.used_fallback)
-    return text
+        async with _LLM_SEMAPHORE:
+            acquired = True
+            _METRICS["queued"] -= 1
+            queue_wait = (time.perf_counter() - queued_at) * 1000
+            _METRICS["queue_wait_ms"] += queue_wait
+            _METRICS["generating"] += 1
+            try:
+                text = await _chat_once(system_prompt, messages, options, selection)
+            except LLMError as first_error:
+                fallback = fallback_selection(selection, str(first_error))
+                if not fallback:
+                    raise
+                text = await _chat_once(system_prompt, messages, options, fallback)
+                selection = fallback
+            _METRICS["completed"] += 1
+            return text
+    except asyncio.CancelledError:
+        _METRICS["cancelled"] += 1
+        raise
+    except Exception:
+        _METRICS["failed"] += 1
+        raise
+    finally:
+        if not acquired and _METRICS["queued"] > 0:
+            _METRICS["queued"] -= 1
+        if _METRICS["generating"] > 0:
+            _METRICS["generating"] -= 1
+        total_ms = (time.perf_counter() - started) * 1000
+        _METRICS["llm_total_ms"] += total_ms
+        logger.info("LLM completion backend=%s model=%s profile=%s total_ms=%.0f queue_wait_ms=%.0f llm_calls=%s chars=%s fallback=%s", LLM_BACKEND, selection.selected_model, selected_profile, total_ms, (time.perf_counter() - queued_at) * 1000, _METRICS["llm_calls"], len(locals().get("text", "")), selection.used_fallback)
 
 
 async def _chat_once(system_prompt: str, messages: list[dict], options: dict, selection: ModelSelection) -> str:
+    if LLM_BACKEND in {"deepseek-harness", "dsh"}:
+        from harness_backend import HarnessBackendError, harness_chat
+        try:
+            return await harness_chat(system_prompt, messages, options, selection.selected_model)
+        except HarnessBackendError as exc:
+            if not DSH_FALLBACK_TO_OLLAMA:
+                raise LLMError(str(exc)) from exc
+            logger.warning("DeepSeek Harness no disponible; fallback directo a Ollama local: %s", exc)
+            return await _ollama_chat(system_prompt, messages, options, selection.selected_model)
     if LLM_BACKEND == "ollama":
         return await _ollama_chat(system_prompt, messages, options, selection.selected_model)
     if LLM_BACKEND == "openai":
@@ -77,41 +143,76 @@ async def _chat_once(system_prompt: str, messages: list[dict], options: dict, se
         return await _anthropic_chat(system_prompt, messages, options, selection.selected_model)
     if LLM_BACKEND == "mock":
         latest = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
-        if "clasificador de intenciones" in system_prompt.casefold():
+        if any(marker in system_prompt.casefold() for marker in ("clasificador de intenciones", "clasificador estructurado")):
             return _mock_classifier_response(system_prompt, latest)
         return f"Modo técnico de prueba activo. Recibí: {latest[:180]}" if latest else "Modo técnico de prueba activo."
     raise LLMError(f"Backend LLM no soportado: {LLM_BACKEND}")
 
 
 async def chat_completion_stream(system_prompt: str, messages: list[dict], profile: str | None = None, context_override: int | None = None) -> AsyncIterator[str]:
-    """Entrega fragmentos visibles y permite cancelación propagada por el cliente."""
+    """Entrega fragmentos visibles, registra TTFT y permite cancelación queued."""
     selected_profile = resolve_profile(_latest_user_message(messages), requested=profile or LLM_PROFILE)
     selection = selection_for(selected_profile)
     options = profile_options(selected_profile, context_override)
     emitted = False
     started = time.perf_counter()
+    queued_at = time.perf_counter()
+    _METRICS["queued"] += 1
+    _METRICS["llm_calls"] += 1
+    acquired = False
     try:
-        async for chunk in _stream_once(system_prompt, messages, options, selection):
-            emitted = True
-            yield chunk
+        async with _LLM_SEMAPHORE:
+            acquired = True
+            _METRICS["queued"] -= 1
+            _METRICS["queue_wait_ms"] += (time.perf_counter() - queued_at) * 1000
+            _METRICS["generating"] += 1
+            try:
+                async for chunk in _stream_once(system_prompt, messages, options, selection):
+                    emitted = True
+                    yield chunk
+            except LLMError as first_error:
+                fallback = fallback_selection(selection, str(first_error))
+                if not fallback or emitted:
+                    _METRICS["failed"] += 1
+                    raise
+                async for chunk in _stream_once(system_prompt, messages, options, fallback):
+                    emitted = True
+                    yield chunk
+                selection = fallback
+            _METRICS["completed"] += 1
     except asyncio.CancelledError:
+        _METRICS["cancelled"] += 1
         logger.info("LLM stream cancelado backend=%s model=%s profile=%s", LLM_BACKEND, selection.selected_model, selected_profile)
         raise
-    except LLMError as first_error:
-        fallback = fallback_selection(selection, str(first_error))
-        if not fallback or emitted:
-            raise
-        async for chunk in _stream_once(system_prompt, messages, options, fallback):
-            emitted = True
-            yield chunk
-        selection = fallback
-    logger.info("LLM stream backend=%s model=%s profile=%s duration_ms=%.0f fallback=%s", LLM_BACKEND, selection.selected_model, selected_profile, (time.perf_counter() - started) * 1000, selection.used_fallback)
+    except Exception:
+        _METRICS["failed"] += 1
+        raise
+    finally:
+        if not acquired and _METRICS["queued"] > 0:
+            _METRICS["queued"] -= 1
+        if _METRICS["generating"] > 0:
+            _METRICS["generating"] -= 1
+        total_ms = (time.perf_counter() - started) * 1000
+        _METRICS["llm_total_ms"] += total_ms
+        logger.info("LLM stream backend=%s model=%s profile=%s total_ms=%.0f queue_wait_ms=%.0f llm_calls=%s fallback=%s", LLM_BACKEND, selection.selected_model, selected_profile, total_ms, (time.perf_counter() - queued_at) * 1000, _METRICS["llm_calls"], selection.used_fallback)
 
 
 async def _stream_once(system_prompt: str, messages: list[dict], options: dict, selection: ModelSelection) -> AsyncIterator[str]:
     if not LLM_STREAM_ENABLED:
         yield await _chat_once(system_prompt, messages, options, selection)
         return
+    if LLM_BACKEND in {"deepseek-harness", "dsh"}:
+        from harness_backend import HarnessBackendError, harness_chat
+        try:
+            yield await harness_chat(system_prompt, messages, options, selection.selected_model)
+            return
+        except HarnessBackendError as exc:
+            if not DSH_FALLBACK_TO_OLLAMA:
+                raise LLMError(str(exc)) from exc
+            logger.warning("DeepSeek Harness no disponible durante streaming; fallback a Ollama local: %s", exc)
+            async for chunk in _ollama_chat_stream(system_prompt, messages, options, selection.selected_model):
+                yield chunk
+            return
     if LLM_BACKEND == "ollama":
         async for chunk in _ollama_chat_stream(system_prompt, messages, options, selection.selected_model):
             yield chunk
@@ -139,10 +240,10 @@ async def _post_json(url: str, **kwargs) -> dict:
     last_error: Exception | None = None
     for attempt in range(LLM_RETRY_COUNT + 1):
         try:
-            async with httpx.AsyncClient(timeout=_timeout()) as client:
-                response = await client.post(url, **kwargs)
-                response.raise_for_status()
-                return response.json()
+            client = await _http_client()
+            response = await client.post(url, **kwargs)
+            response.raise_for_status()
+            return response.json()
         except asyncio.CancelledError:
             raise
         except httpx.ConnectError as exc:
@@ -185,7 +286,8 @@ async def _ollama_chat(system_prompt: str, messages: list[dict], options: dict, 
     data = await _post_json(f"{OLLAMA_URL}/api/chat", json=payload)
     text = _visible_text(data.get("message", {}).get("content", ""))
     if not text:
-        raise LLMError("Ollama no devolvió texto visible.")
+        logger.warning("event=llm_empty_visible_output backend=ollama model=%s reasoning_filtered=true", model)
+        return ""
     return text
 
 
@@ -195,7 +297,8 @@ async def _openai_chat(system_prompt: str, messages: list[dict], options: dict, 
     data = await _post_json("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}, json={"model": model, "messages": _payload_messages(system_prompt, messages), "temperature": options["temperature"], "max_tokens": options["num_predict"]})
     text = _visible_text(data["choices"][0]["message"]["content"])
     if not text:
-        raise LLMError("OpenAI no devolvió texto visible.")
+        logger.warning("event=llm_empty_visible_output backend=openai model=%s reasoning_filtered=true", model)
+        return ""
     return text
 
 
@@ -205,15 +308,16 @@ async def _anthropic_chat(system_prompt: str, messages: list[dict], options: dic
     data = await _post_json("https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}, json={"model": model, "system": system_prompt, "messages": messages, "temperature": options["temperature"], "max_tokens": options["num_predict"]})
     text = _visible_text(data["content"][0]["text"])
     if not text:
-        raise LLMError("Anthropic no devolvió texto visible.")
+        logger.warning("event=llm_empty_visible_output backend=anthropic model=%s reasoning_filtered=true", model)
+        return ""
     return text
 
 
 async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options: dict, model: str) -> AsyncIterator[str]:
     payload = {"model": model, "messages": _payload_messages(system_prompt, messages), "stream": True, "keep_alive": LLM_KEEP_ALIVE, "options": _ollama_options(options)}
     try:
-        async with httpx.AsyncClient(timeout=_timeout()) as client:
-            async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as response:
+        client = await _http_client()
+        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as response:
                 if response.status_code == 404:
                     raise LLMError(f"Ollama no encuentra el modelo {model!r}. Instálalo o configura GAIA_MODEL_FALLBACK.")
                 response.raise_for_status()
@@ -235,7 +339,9 @@ async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options:
                     visible = filterer.feed(chunk)
                     if visible:
                         if first_token:
-                            logger.info("LLM first_token_ms=%.0f backend=ollama model=%s", (time.perf_counter() - started) * 1000, model)
+                            first_token_ms = (time.perf_counter() - started) * 1000
+                            _METRICS["llm_ttft_ms"] += first_token_ms
+                            logger.info("LLM first_token_ms=%.0f backend=ollama model=%s", first_token_ms, model)
                             first_token = False
                         yield visible
                 tail = filterer.finish()
@@ -257,8 +363,8 @@ async def _openai_chat_stream(system_prompt: str, messages: list[dict], options:
         raise LLMError("No hay API key de OpenAI configurada en .env.")
     payload = {"model": model, "messages": _payload_messages(system_prompt, messages), "temperature": options["temperature"], "max_tokens": options["num_predict"], "stream": True}
     try:
-        async with httpx.AsyncClient(timeout=_timeout()) as client:
-            async with client.stream("POST", "https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, json=payload) as response:
+        client = await _http_client()
+        async with client.stream("POST", "https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, json=payload) as response:
                 response.raise_for_status()
                 filterer = _ReasoningFilter()
                 async for line in response.aiter_lines():
@@ -293,8 +399,8 @@ async def _anthropic_chat_stream(system_prompt: str, messages: list[dict], optio
         raise LLMError("No hay API key de Anthropic configurada en .env.")
     payload = {"model": model, "system": system_prompt, "messages": messages, "temperature": options["temperature"], "max_tokens": options["num_predict"], "stream": True}
     try:
-        async with httpx.AsyncClient(timeout=_timeout()) as client:
-            async with client.stream("POST", "https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"}, json=payload) as response:
+        client = await _http_client()
+        async with client.stream("POST", "https://api.anthropic.com/v1/messages", headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"}, json=payload) as response:
                 response.raise_for_status()
                 filterer = _ReasoningFilter()
                 async for line in response.aiter_lines():
@@ -376,7 +482,10 @@ def _visible_text(text: str) -> str:
 async def check_backend() -> dict:
     info = {"backend": LLM_BACKEND, "model": LLM_MODEL, "profile": LLM_PROFILE, "streaming": LLM_STREAM_ENABLED, "hide_reasoning": LLM_HIDE_REASONING, "timeout_seconds": LLM_TIMEOUT_SECONDS, "keep_alive": LLM_KEEP_ALIVE, "context": LLM_CONTEXT, "status": "unknown"}
     try:
-        if LLM_BACKEND == "ollama":
+        if LLM_BACKEND in {"deepseek-harness", "dsh"}:
+            from harness_backend import harness_health
+            info.update(await harness_health())
+        elif LLM_BACKEND == "ollama":
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(f"{OLLAMA_URL}/api/tags")
                 response.raise_for_status()

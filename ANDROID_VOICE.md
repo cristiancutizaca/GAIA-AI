@@ -1,0 +1,9 @@
+# Android Companion — Pairing y voz
+
+El primer arranque muestra **Conectar a GAIA** cuando no existe un token de dispositivo en `FlutterSecureStorage`. En v0.6.2 la GUI PC devuelve un URI `gaia://pair?id=...&code=...&url=...`; PairingScreen lo valida con `parsePairingUri()` y permite pegarlo como fallback cuando el lector de cámara no está disponible. El formulario manual sigue aceptando URL, pairing ID y código. `/api/pairing/complete` registra el dispositivo Android, crea un token hashado y devuelve el valor en claro una sola vez; el companion lo guarda junto con `device_id` y `session_id`. La versión declarada es `0.6.2+1`.
+
+Android conserva únicamente las capabilities de companion: chat, lectura de memoria, solicitud de acciones y, si fue solicitado durante pairing, voz. No recibe `actions_execute` ni `action_host`. La tarjeta remota muestra preview, scope y opciones de policy; **Permitir una vez**, **Permitir siempre** o **Cancelar** se envían al Core, que aplica riesgo, device y principal antes de liberar el claim.
+
+El flujo de voz es push-to-talk. El usuario mantiene pulsado el micrófono, Android solicita permiso de micrófono y graba un archivo temporal AAC/M4A; al soltar, realiza upload autenticado a `/api/chat/voice`, donde Core ejecuta Whisper y opcionalmente TTS. Android reproduce el audio devuelto y elimina el archivo local temporal en `finally`. No existe wake word continuo ni retención de audio del lado del Core cuando `GAIA_AUDIO_RETENTION=false`.
+
+Si un endpoint devuelve 401 por token expirado o revocado, `LumenService.testConnection()` elimina el secreto seguro y la sesión; ChatScreen devuelve al usuario a PairingScreen sin borrar el token ante una simple caída de red. La compilación y la prueba física del APK requieren Flutter/Android SDK. En el entorno de validación actual Flutter no está disponible, por lo que el contrato Dart se verifica estáticamente y se reporta la validación física como **PENDING**.

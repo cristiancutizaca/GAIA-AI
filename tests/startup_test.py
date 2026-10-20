@@ -33,7 +33,7 @@ thread.start()
 port = server.server_address[1]
 foreign = subprocess.run([sys.executable, str(PROBE), "--port", str(port)], capture_output=True, text=True)
 assert foreign.returncode == 2, foreign.stdout + foreign.stderr
-Handler.payload = {"name": "GAIA", "version": "0.5.3-pc", "status": "online"}
+Handler.payload = {"name": "GAIA", "version": "1.0.0-rc6-pc", "status": "online"}
 active = subprocess.run([sys.executable, str(PROBE), "--port", str(port)], capture_output=True, text=True)
 assert active.returncode == 0, active.stdout + active.stderr
 server.shutdown()

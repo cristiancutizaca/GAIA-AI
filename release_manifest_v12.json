@@ -1,0 +1,8 @@
+{
+  "authority": "GAIA Core / Permission Layer / Action Host",
+  "baseline": "GAIA-AI-v1.1-EVOLUTION-FOUNDATION",
+  "deterministic": true,
+  "new_integrations_default": "disabled",
+  "product": "GAIA-AI",
+  "release": "1.2-INTEGRATED-AGENT-PLATFORM"
+}

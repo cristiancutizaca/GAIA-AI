@@ -1,0 +1,3 @@
+# Optional GAIA coding group
+openhands-sdk==1.52.0
+smolagents==1.26.0

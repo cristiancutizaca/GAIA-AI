@@ -10,6 +10,7 @@ set "PORT=%LUMEN_PORT%"
 if not defined PORT set "PORT=8090"
 set "HOST=%LUMEN_HOST%"
 if not defined HOST set "HOST=127.0.0.1"
+if not defined GAIA_REMOTE_HOST_ENABLED set "GAIA_REMOTE_HOST_ENABLED=true"
 if exist "%ROOT%.env" (
   for /f "tokens=1,* delims==" %%A in ('findstr /b "LUMEN_PORT=" "%ROOT%.env"') do set "PORT=%%B"
   for /f "tokens=1,* delims==" %%A in ('findstr /b "LUMEN_HOST=" "%ROOT%.env"') do set "HOST=%%B"
@@ -18,6 +19,7 @@ if exist "%ROOT%.env" (
 set "CODE=%ERRORLEVEL%"
 if "%CODE%"=="0" (
   echo GAIA Core ya esta activo. Abriendo GUI.
+  if /i "%GAIA_REMOTE_HOST_ENABLED%"=="true" start "GAIA Action Host" /b "%PYTHON%" "%ROOT%tools\run_remote_action_host.py" >> "%ROOT%lumen-core\data\logs\start-gaia-host.log" 2>&1
   "%PYTHON%" "%ROOT%lumen-pc\gui.py" --url "http://%HOST%:%PORT%"
   exit /b %ERRORLEVEL%
 )
@@ -33,6 +35,7 @@ for /l %%N in (1,1,30) do (
   set "CODE=!ERRORLEVEL!"
   if "!CODE!"=="0" (
     type "%TEMP%\gaia_startup_probe.out"
+    if /i "%GAIA_REMOTE_HOST_ENABLED%"=="true" start "GAIA Action Host" /b "%PYTHON%" "%ROOT%tools\run_remote_action_host.py" >> "%ROOT%lumen-core\data\logs\start-gaia-host.log" 2>&1
     "%PYTHON%" "%ROOT%lumen-pc\gui.py" --url "http://%HOST%:%PORT%"
     exit /b !ERRORLEVEL!
   )

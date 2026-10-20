@@ -1,0 +1,6 @@
+{
+  "minimal": "all new integrations disabled",
+  "standard": "MCP and visualizer enabled by policy, validate before use",
+  "full": "optional components enabled except Computer Use",
+  "development": "all optional testable components except Computer Use"
+}

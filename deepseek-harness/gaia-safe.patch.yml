@@ -1,0 +1,6 @@
+# GAIA mantiene la autoridad sobre acciones, archivos y permisos del equipo.
+# El Harness aporta razonamiento y bucle de agente, sin shell directo.
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true

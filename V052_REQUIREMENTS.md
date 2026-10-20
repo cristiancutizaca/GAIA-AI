@@ -1,3 +1,7 @@
+HISTORICAL DOCUMENT — DO NOT USE FOR RC6 OPERATIONS
+
+This document is preserved for historical traceability only. For current RC6 operations use WINDOWS_RC6_VALIDATION_CHECKLIST.md, UPDATE_ROLLBACK_GUIDE.md and PHYSICAL_VALIDATION_RC6.md.
+
 # Requisitos de GAIA-AI v0.5.2
 
 Fuente original: `/home/ubuntu/upload/pasted_content_6.txt`, instrucciones del usuario, 1861 líneas. La release debe partir de `GAIA-AI-v0.5.1-final.zip`, llamarse `GAIA-AI v0.5.2` y cerrar inconsistencias concretas antes de Android/LAN/Action Host v0.6. No se permite reescritura, migración interna LUMEN→GAIA, control remoto Android→PC, TLS server, browser agent, screen automation, mouse autonomy, filesystem modification, admin privileges, niveles 3–4, multi-agent o agentes recursivos.

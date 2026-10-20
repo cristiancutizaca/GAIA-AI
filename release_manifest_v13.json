@@ -1,0 +1,8 @@
+{
+  "authority": "GAIA Core / Permission Layer / Action Host",
+  "baseline": "GAIA-AI-v1.2-INTEGRATED-AGENT-PLATFORM",
+  "new_mandatory_dependencies": [],
+  "product": "GAIA-AI",
+  "release": "1.3-PRODUCTION-INTEGRATED",
+  "status": "INTEGRATED_NOT_PRODUCTION_READY"
+}

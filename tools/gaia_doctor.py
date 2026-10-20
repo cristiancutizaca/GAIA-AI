@@ -14,10 +14,14 @@ import platform
 import shutil
 import sqlite3
 import sys
+sys.dont_write_bytecode = True
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lumen-core"))
+from gaia_version import PRODUCT_VERSION, RELEASE
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -88,8 +92,11 @@ def _check_db(checks: list[Check], db_path: Path) -> None:
             integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             schema = row[0] if row else "desconocido"
+            tables = {str(item[0]) for item in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         if integrity == "ok":
             add(checks, "database_integrity", "PASS", f"SQLite íntegra; schema {schema}.")
+            advanced_ready = str(schema) == "9" and {"memory_items", "memory_item_history", "session_owners"}.issubset(tables)
+            add(checks, "advanced_memory", "PASS" if advanced_ready else "WARN", "Advanced Memory activo: schema 9, namespaces y session_owners presentes." if advanced_ready else f"Advanced Memory pendiente: schema {schema}; tablas requeridas ausentes o incompletas.", "Inicia la migración normal de GAIA antes de usar memoria avanzada." if not advanced_ready else "")
         else:
             add(checks, "database_integrity", "FAIL", f"SQLite integrity_check: {integrity}", "Detén GAIA y usa un Brain Backup/migración validada.")
     except (OSError, sqlite3.DatabaseError) as exc:
@@ -101,17 +108,59 @@ def _check_ollama(checks: list[Check]) -> None:
     try:
         with urllib.request.urlopen(f"{base}/api/tags", timeout=2.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        names = [str(item.get("name", "")) for item in payload.get("models", []) if isinstance(item, dict)]
-        if any(name == "qwen3.5:9b" or name.startswith("qwen3.5:9b") for name in names):
-            add(checks, "ollama", "PASS", f"Responde en {base}; qwen3.5:9b está listado.")
+        names = [str(item.get("name", item.get("model", ""))) for item in payload.get("models", []) if isinstance(item, dict)]
+        model = env("LUMEN_LLM_MODEL", default="qwen3.5:4b").strip() or "qwen3.5:4b"
+        if any(name == model or name.startswith(model + ":") for name in names):
+            add(checks, "ollama", "PASS", f"Responde en {base}; {model} está listado.")
         else:
-            add(checks, "ollama", "WARN", f"Responde en {base}, pero qwen3.5:9b no aparece.", "Si corresponde, ejecuta manualmente: ollama pull qwen3.5:9b")
+            add(checks, "ollama", "WARN", f"Responde en {base}, pero {model} no aparece.", f"Si corresponde, ejecuta manualmente: ollama pull {model}")
     except (OSError, ValueError, urllib.error.URLError) as exc:
-        add(checks, "ollama", "FAIL", f"No responde en {base}: {exc}", "Inicia Ollama manualmente y verifica OLLAMA_URL.")
+        add(checks, "ollama", "PENDING", f"No responde en {base}: {exc}; Ollama real no medido en este entorno.", "Inicia Ollama manualmente y verifica OLLAMA_URL antes de una prueba física.")
 
 
-def run_checks() -> list[Check]:
+def _check_resources(checks: list[Check]) -> None:
+    core_dir = ROOT / "lumen-core"
+    inserted = False
+    try:
+        if str(core_dir) not in sys.path:
+            sys.path.insert(0, str(core_dir))
+            inserted = True
+        from resource_governor import ResourceGovernor
+        requested = env("GAIA_HARDWARE_PROFILE", default="auto").strip().lower()
+        governor = ResourceGovernor(requested_profile=requested)
+        policy = governor.observe()
+        status = governor.status()
+        sample = status.get("last_sample") or {}
+        detail = (
+            f"requested={status.get('requested_profile')}; profile={status.get('profile')}; "
+            f"thermal={status.get('thermal_state')}; cpu={sample.get('cpu_percent')}; "
+            f"ram={sample.get('memory_percent')}; battery={sample.get('battery_present')}; "
+            f"background_concurrency={policy.get('background_concurrency')}; "
+            f"context_cap={policy.get('llm_context_cap')}"
+        )
+        add(checks, "resource_profile", "PASS", detail + "; read_only=true")
+    except (ImportError, OSError, TypeError, ValueError) as exc:
+        add(checks, "resource_profile", "WARN", f"No se pudo consultar ResourceGovernor: {exc}", "Verifica que el árbol lumen-core esté completo; el diagnóstico no cambia la configuración.")
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(core_dir))
+            except ValueError:
+                pass
+
+
+DOCTOR_MODES = {"normal", "preflight", "postflight", "recovery", "safe"}
+
+
+def run_checks(mode: str = "normal") -> list[Check]:
+    mode = str(mode).strip().lower()
+    if mode not in DOCTOR_MODES:
+        raise ValueError(f"modo Doctor no permitido: {mode}")
     checks: list[Check] = []
+    safe_configured = env("GAIA_SAFE_MODE", default="false").strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
+    safe_effective = safe_configured or mode == "safe"
+    add(checks, "operation_mode", "PASS", f"mode={mode}; read_only=true; no services started or stopped")
+    add(checks, "runtime_safe_mode", "PASS", f"configured={safe_configured}; effective_for_doctor={safe_effective}; runtime policy blocks external mutations when enabled; read_only=true")
     version = sys.version_info
     if version >= (3, 11):
         add(checks, "python", "PASS", f"Python {version.major}.{version.minor}.{version.micro} en {sys.executable}")
@@ -122,6 +171,8 @@ def run_checks() -> list[Check]:
     add(checks, "venv", "PASS" if Path(venv).exists() else "WARN", f"Entorno: {venv}", "Activa .venv antes de instalar dependencias." if not Path(venv).exists() else "")
 
     required_modules = {"fastapi": "Core FastAPI", "httpx": "HTTP/LLM", "dotenv": "python-dotenv"}
+    if env("LUMEN_LLM_BACKEND", default="ollama").strip().lower() in {"deepseek-harness", "dsh"}:
+        required_modules["deepseek_harness"] = "DeepSeek Harness SDK"
     missing = [label for module, label in required_modules.items() if importlib.util.find_spec(module) is None]
     add(checks, "dependencies", "PASS" if not missing else "FAIL", "Dependencias principales disponibles." if not missing else "Faltan: " + ", ".join(missing), "Instala los requirements manualmente; Doctor no ejecuta pip." if missing else "")
 
@@ -159,7 +210,7 @@ def run_checks() -> list[Check]:
         inputs = sum(1 for item in devices if int(item.get("max_input_channels", 0)) > 0)
         add(checks, "audio_devices", "PASS" if inputs else "WARN", f"{inputs} dispositivo(s) de entrada detectado(s).", "Conecta y selecciona un micrófono para voz." if not inputs else "")
     except Exception as exc:
-        add(checks, "audio_devices", "WARN", f"No se pudo consultar audio: {exc}", "La voz requiere hardware y dependencias del sistema.")
+        add(checks, "audio_devices", "PENDING", f"No se pudo consultar audio: {exc}; hardware de audio no medido.", "La voz requiere hardware y dependencias del sistema.")
 
     code = shutil.which("code") or shutil.which("code.cmd")
     add(checks, "vscode", "PASS" if code else "WARN", code or "VS Code no está en PATH.", "Instala VS Code o ajusta PATH si quieres usar open_vscode." if not code else "")
@@ -179,22 +230,32 @@ def run_checks() -> list[Check]:
     action_enabled = env("LUMEN_ACTION_ENGINE_ENABLED", default="true")
     confirm = env("GAIA_ACTION_CONFIRM_POLICY", default="CONFIRM_EXECUTION")
     add(checks, "action_engine", "PASS" if action_enabled.lower() in {"1", "true", "yes", "si"} and confirm in {"AUTO_SAFE", "CONFIRM_EXECUTION", "BLOCKED"} else "WARN", f"enabled={action_enabled}, policy={confirm}", "Usa CONFIRM_EXECUTION mientras validas el equipo físico.")
+    remote_host = os.getenv("GAIA_REMOTE_HOST_ENABLED", "true").strip().lower()
+    add(checks, "remote_action_host", "PASS" if remote_host in {"1", "true", "yes", "si", "on"} else "WARN", f"enabled={remote_host}; device={os.getenv('GAIA_PC_DEVICE_ID', 'pc-main')}", "Activa GAIA_REMOTE_HOST_ENABLED para ejecución remota aprobada." if remote_host not in {"1", "true", "yes", "si", "on"} else "")
+    automation_mode = os.getenv("GAIA_AUTOMATION_MODE", "OFF").strip().upper()
+    add(checks, "automation_mode", "PASS" if automation_mode in {"OFF", "NOTIFY_ONLY", "ROUTINES", "FULL_CONFIGURED"} else "WARN", f"mode={automation_mode}; default=OFF", "Usa OFF, NOTIFY_ONLY, ROUTINES o FULL_CONFIGURED.")
+    performance = os.getenv("GAIA_PERFORMANCE_PROFILE", "balanced").strip().lower()
+    add(checks, "performance_profile", "PASS" if performance in {"eco", "balanced", "performance"} else "WARN", performance, "Usa eco, balanced o performance.")
+    _check_resources(checks)
     flutter = shutil.which("flutter")
-    add(checks, "flutter", "PASS" if flutter else "WARN", flutter or "Flutter no encontrado; Android queda pendiente.", "Instala Flutter manualmente solo para compilar Android." if not flutter else "")
+    add(checks, "flutter", "PASS" if flutter else "PENDING", flutter or "Flutter no encontrado; Android queda pendiente.", "Instala Flutter manualmente solo para compilar Android." if not flutter else "")
     add(checks, "platform", "PASS", f"{platform.system()} {platform.release()} ({platform.machine()})")
     return checks
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Diagnóstico read-only de GAIA")
+    parser = argparse.ArgumentParser(description=f"Diagnóstico read-only de GAIA {PRODUCT_VERSION}")
     parser.add_argument("--json", action="store_true", help="Imprime JSON sin secretos")
     parser.add_argument("--strict", action="store_true", help="Devuelve código 1 si existe FAIL")
+    parser.add_argument("--mode", choices=sorted(DOCTOR_MODES), default="normal", help="Modo read-only del diagnóstico")
+    parser.add_argument("--safe-mode", action="store_true", help="Alias de --mode safe; no inicia ni detiene servicios")
     args = parser.parse_args()
-    checks = run_checks()
+    mode = "safe" if args.safe_mode else args.mode
+    checks = run_checks(mode)
     if args.json:
-        print(json.dumps({"doctor": "0.5.3", "read_only": True, "checks": [asdict(item) for item in checks]}, ensure_ascii=False, indent=2))
+        print(json.dumps({"doctor": PRODUCT_VERSION, "release": RELEASE, "base_version": PRODUCT_VERSION, "mode": mode, "safe_mode_configured": env("GAIA_SAFE_MODE", default="false"), "read_only": True, "checks": [asdict(item) for item in checks]}, ensure_ascii=False, indent=2))
     else:
-        print("GAIA Doctor v0.5.3")
+        print(f"GAIA Doctor v{PRODUCT_VERSION} [{mode}; read-only]")
         for item in checks:
             print(f"[{item.status}] {item.name}: {item.detail}")
             if item.suggestion:

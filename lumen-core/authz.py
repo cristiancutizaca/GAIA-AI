@@ -1,4 +1,4 @@
-"""Autenticación y autorización centralizada de GAIA v0.5.3.
+"""Autenticación y autorización centralizada de GAIA v0.6.0.
 
 El secreto maestro es un Principal administrativo. Los tokens de dispositivo
 solo reciben las capacidades persistidas para ese dispositivo. La interfaz no
@@ -13,6 +13,7 @@ from typing import Annotated, Callable
 from fastapi import Depends, Header, HTTPException
 
 from config import API_SECRET, DEVICE_TOKENS_ENABLED
+from lan_protocol import GLOBAL_RATE_LIMITER
 import hmac
 import memory
 
@@ -75,6 +76,9 @@ def _master_principal() -> Principal:
 
 def authenticate(authorization: str = Header(default="")) -> Principal:
     """Authenticate bearer credentials; distinguish invalid auth from denied auth."""
+    allowed, retry_after = GLOBAL_RATE_LIMITER.check(authorization[:512])
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Límite de solicitudes alcanzado.", headers={"Retry-After": str(retry_after)})
     expected = f"Bearer {API_SECRET}"
     if hmac.compare_digest(authorization, expected):
         return _master_principal()

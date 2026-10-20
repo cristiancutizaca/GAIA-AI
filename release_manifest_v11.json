@@ -1,0 +1,8 @@
+{
+  "base_release": "1.0-RC6-REPAIRED-STABLE",
+  "deterministic": true,
+  "feature_flags_default": "all_disabled",
+  "product": "GAIA-AI",
+  "release": "1.1-EVOLUTION-FOUNDATION",
+  "security_authority": "GAIA Core / Permission Layer / Action Host"
+}

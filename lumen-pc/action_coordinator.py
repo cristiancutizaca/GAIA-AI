@@ -17,8 +17,8 @@ class ActionCoordinatorError(RuntimeError):
 
 
 class ActionCoordinator:
-    MAX_STEPS = 3
-    MAX_RISK = 2
+    MAX_STEPS = 5
+    MAX_RISK = 4
 
     def __init__(self, engine: ActionEngine, cancel_event: threading.Event | None = None, policy: str = "CONFIRM_EXECUTION") -> None:
         self.engine = engine
@@ -37,7 +37,7 @@ class ActionCoordinator:
         except (TypeError, ValueError):
             return False, "Nivel de riesgo inválido."
         allowed_risk = int(self.engine.SAFE_ACTIONS[name][0])
-        if risk < 1 or risk > self.MAX_RISK or risk > allowed_risk:
+        if risk < 0 or risk > self.MAX_RISK or risk > allowed_risk:
             return False, "Nivel de riesgo fuera de los límites locales."
         return True, ""
 
@@ -56,7 +56,7 @@ class ActionCoordinator:
             raise ActionCoordinatorError("Respuesta de acción inválida o incompleta.")
         steps = parsed.steps
         if not 1 <= len(steps) <= self.MAX_STEPS:
-            raise ActionCoordinatorError("El plan debe contener entre 1 y 3 acciones.")
+            raise ActionCoordinatorError("El plan debe contener entre 1 y 5 acciones.")
         for step in steps:
             valid, reason = self._validate_step(step)
             if not valid:

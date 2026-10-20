@@ -1,4 +1,4 @@
-"""Prueba de compatibilidad del Core v0.5.3 sin credenciales ni dispositivos externos."""
+"""Prueba de compatibilidad del Core v0.6.1 sin credenciales ni dispositivos externos."""
 from __future__ import annotations
 import os
 import sys
@@ -35,10 +35,11 @@ with tempfile.TemporaryDirectory(prefix="lumen_test_") as tmp:
 
     with TestClient(app) as client:
         health = client.get("/api/health")
-        assert health.status_code == 200 and health.json()["version"] == "0.5.3-pc", health.text
+        assert health.status_code == 200 and health.json()["version"] == "2.0.0", health.text
         assert client.get("/api/status").status_code == 401
         status = client.get("/api/status", headers=headers)
         assert status.status_code == 200 and status.json()["features"]["auto_facts"] is False, status.text
+        assert client.get("/api/automation/status", headers=headers).json()["automation"]["mode"] == "OFF"
         chat = client.post("/api/chat", headers=headers, json={"message": "Me llamo Cris", "device": "test"})
         assert chat.status_code == 200, chat.text
         session_id = chat.json()["session_id"]
@@ -61,4 +62,4 @@ with tempfile.TemporaryDirectory(prefix="lumen_test_") as tmp:
         client.post("/api/proactive/test", headers=headers, json={"message": "prueba lista"})
         delivered = client.get("/api/proactive/check", headers=headers)
         assert delivered.json().get("message") == "prueba lista"
-print("SMOKE TEST v0.5.3 OK: auth, status, chat, memoria manual, voz/API, backup y polling.")
+print("SMOKE TEST RC1 OK: auth, status, chat, memoria manual, voz/API, backup y polling.")

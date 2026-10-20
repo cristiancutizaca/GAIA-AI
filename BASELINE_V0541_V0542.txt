@@ -1,0 +1,25 @@
+# Baseline v0.5.4.1 para v0.5.4.2
+
+## Entorno
+
+La release `GAIA-AI-v0.5.4.1-final.zip` se extrajo en `/home/ubuntu/gaia-v0542-baseline-extracted/GAIA-AI-v0.5.4.1`. Se ejecutó la suite existente desde esa extracción limpia con Python 3.12 en Linux sandbox.
+
+## Suite baseline
+
+Los 36 scripts, `compileall` y los dos greps de seguridad pasaron. La salida final fue `ZIP EXTRACTED SUITE PASS: 36 scripts + compileall + security greps`.
+
+## Bug A reproducido: detección natural incompleta
+
+`_is_action_request()` devolvió `True` para `abre Photoshop`, pero `False` para `¿puedes abrir Photoshop?`, `me abres Photoshop`, `quiero que abras Photoshop`, `por favor abre Photoshop`, `necesito que abras Photoshop`, `podrías abrir Photoshop` y `hazme el favor de abrir Chrome`. Esto confirma que el estado arquitectónico actual solo reconoce imperativos directos mediante `_ACTION_REQUEST_RE`.
+
+Las preguntas informativas `¿Qué aplicaciones puedes abrir?`, `¿Tienes capacidad para abrir Spotify?`, `¿Cómo funciona tu acción para abrir Spotify?`, `¿Qué pasaría si abrieras Chrome?` y `¿Por qué no puedes abrir Photoshop?` devolvieron `False`, lo cual es consistente con su clasificación conversacional y no constituye un fallo.
+
+## Bug B reproducido: scope post-action insuficiente
+
+Con `VerifiedActionResult(action=open_calculator, success=True, message='Calculadora abierta.')`, `_ground_post_action_response()` devolvió sin filtrar `Calculadora abierta. También cerré Spotify.`, `Listo, abrí la calculadora y Spotify.`, `Calculadora abierta. También eliminé prueba.txt.` y `Calculadora abierta. Reinicié Windows.`. Solo la frase factual y el comentario humorístico pasaron como deberían.
+
+Con `open_spotify` y `success=False`, el helper sí devolvió el mensaje factual de fallo y no propagó el claim adicional de Chrome porque el camino de fallo ya usa el hecho determinista. El hueco crítico confirmado es el scope de claims en éxito.
+
+## Consecuencia de seguridad
+
+Una petición natural desconocida puede permanecer en `CONVERSATION` y llegar al LLM libre; una respuesta inventada como “Listo, ya lo abrí” no queda bloqueada por el request state. Un resultado verificado de una acción permite claims adicionales no respaldados cuando la respuesta post-action se acepta sin validación de scope.

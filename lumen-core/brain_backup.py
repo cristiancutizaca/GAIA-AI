@@ -120,7 +120,8 @@ def _create_brain_backup_locked(output_dir: Path | None = None) -> str:
             _assert_no_sqlite_sidecars(root)
             if _integrity_check(snapshot) != "ok":
                 raise RuntimeError("El snapshot de memoria no supera integrity_check.")
-            _write_json(root / "memory_export.json", {"conversations": memory.get_recent_messages(500), "facts": memory.get_facts()})
+            from advanced_memory import export_items
+            _write_json(root / "memory_export.json", {"conversations": memory.get_recent_messages(500), "facts": memory.get_facts(), "advanced_items": export_items(5000)})
             _write_json(root / "profile.json", _safe_profile())
             _write_json(root / "preferences.json", memory.get_all_preferences())
             _write_json(root / "state.json", _safe_state())
@@ -273,7 +274,8 @@ def restore_brain_backup(archive_path: Path, *, create_current_backup: bool = Tr
 
 def _safe_profile() -> dict:
     try:
-        return {"user_name": memory.get_preference("user_name", ""), "facts_count": len(memory.get_facts())}
+        from advanced_memory import export_items
+        return {"user_name": memory.get_preference("user_name", ""), "facts_count": len(memory.get_facts()), "advanced_items_count": len(export_items(5000))}
     except Exception:
         return {}
 

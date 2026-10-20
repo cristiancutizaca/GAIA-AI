@@ -1,0 +1,65 @@
+[
+  {
+    "name": "browser-use",
+    "version": "0.13.10-observed",
+    "repository": "https://github.com/browser-use/browser-use",
+    "license": "MIT",
+    "purpose": "optional rendered browser worker",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "pipecat",
+    "version": "current-observed",
+    "repository": "https://github.com/pipecat-ai/pipecat",
+    "license": "BSD-2-Clause",
+    "purpose": "optional realtime voice",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "silero-vad",
+    "version": "current-observed",
+    "repository": "https://github.com/snakers4/silero-vad",
+    "license": "MIT",
+    "purpose": "optional VAD",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "mem0",
+    "version": "2.0.18-observed",
+    "repository": "https://github.com/mem0ai/mem0",
+    "license": "Apache-2.0",
+    "purpose": "optional memory provider",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "graphiti",
+    "version": "0.30.2-observed",
+    "repository": "https://github.com/getzep/graphiti",
+    "license": "Apache-2.0",
+    "purpose": "optional temporal graph provider",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "openhands-sdk",
+    "version": "1.51.0-main-observed",
+    "repository": "https://github.com/OpenHands/software-agent-sdk",
+    "license": "MIT",
+    "purpose": "optional coding worker",
+    "copied_code": false,
+    "modified_code": false
+  },
+  {
+    "name": "jared-visualizers",
+    "version": "current-observed",
+    "repository": "https://github.com/jaredrhod/fullstack-agent",
+    "license": "AGPL-3.0-or-later",
+    "purpose": "reference only; not included",
+    "copied_code": false,
+    "modified_code": false
+  }
+]

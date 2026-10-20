@@ -15,6 +15,7 @@ import os
 import subprocess
 import shutil
 import threading
+import time
 from typing import Callable
 
 # Configuración
@@ -35,6 +36,11 @@ class WakeWordListener:
         self.running = False
         self._thread = None
         self._whisper_model = None
+        self._wake_model = None
+        self.engine = "openwakeword"
+        self.sensitivity = float(os.getenv("GAIA_WAKEWORD_SENSITIVITY", "0.5"))
+        self.session_active = False
+        self.last_wake = 0.0
 
     def _load_whisper(self):
         if self._whisper_model is None:
@@ -42,6 +48,29 @@ class WakeWordListener:
             # Modelo tiny para detección rápida de wake word
             self._whisper_model = whisper.load_model("tiny")
         return self._whisper_model
+
+    def health(self) -> dict:
+        model_path = os.getenv("GAIA_WAKEWORD_MODEL", "").strip()
+        if not model_path:
+            if os.getenv("GAIA_WAKEWORD_WHISPER_FALLBACK", "false").lower() in {"1", "true", "yes"}:
+                return {"status":"WHISPER_FALLBACK","engine":"whisper","local":True,"warning":"Development fallback; not production wake detection."}
+            return {"status":"CUSTOM_MODEL_MISSING","engine":"openwakeword","local":True,"required":"GAIA_WAKEWORD_MODEL"}
+        if not os.path.isfile(model_path):
+            return {"status":"CUSTOM_MODEL_MISSING","engine":"openwakeword","local":True,"model":model_path}
+        try:
+            import openwakeword  # noqa: F401
+            return {"status":"GAIA_MODEL_READY","engine":"openwakeword","local":True,"model":model_path,"sensitivity":self.sensitivity}
+        except Exception as exc:
+            return {"status":"ERROR","engine":"openwakeword","local":True,"error":type(exc).__name__}
+
+    def _load_wakeword(self):
+        if self._wake_model is None:
+            from openwakeword.model import Model
+            model_path = os.getenv("GAIA_WAKEWORD_MODEL", "")
+            if not model_path or not os.path.isfile(model_path):
+                raise RuntimeError("GAIA custom wake model is missing; Jarvis is never substituted")
+            self._wake_model = Model(wakeword_models=[model_path], inference_framework="onnx")
+        return self._wake_model
 
     def _record_chunk(self, duration: float) -> np.ndarray:
         """Graba un chunk de audio."""
@@ -69,6 +98,16 @@ class WakeWordListener:
         if np.max(np.abs(audio)) < SILENCE_THRESHOLD:
             return False
 
+        if self.engine == "openwakeword":
+            try:
+                model = self._load_wakeword()
+                scores = model.predict(audio.astype(np.float32) / 32768.0)
+                return any(float(v) >= self.sensitivity for k,v in scores.items() if "gaia" in str(k).lower())
+            except ImportError:
+                if os.getenv("GAIA_WAKEWORD_WHISPER_FALLBACK", "false").lower() not in {"1","true","yes"}: return False
+                self.engine = "whisper-fallback"
+            except Exception:
+                return False
         model = self._load_whisper()
         # Guardar temporalmente
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
@@ -84,7 +123,7 @@ class WakeWordListener:
             )
             text = result["text"].lower().strip()
             # Buscar variaciones de "lumen"
-            return any(w in text for w in ["gaia", "gaya", "gaia,", "oye gaia", "hey gaia", "hey gaya"])
+            return any(w in text for w in ["gaia", "gaya", "oye gaia", "hey gaia", "hey gaya"])
         except:
             return False
         finally:
@@ -146,12 +185,14 @@ class WakeWordListener:
                 if self._detect_wake_word(audio):
                     print("  ✨ ¡Wake word detectada!")
 
-                    # Grabar mensaje completo
+                    self.session_active = True; self.last_wake = time.time()
+                    # Raw sleeping audio is never retained; only this post-wake utterance is saved.
                     audio_path = self._record_message()
 
                     # Callback
                     if self.on_wake:
                         self.on_wake(audio_path)
+                    self.session_active = False
 
             except KeyboardInterrupt:
                 break

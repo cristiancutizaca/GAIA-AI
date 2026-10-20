@@ -1,8 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:record/record.dart';
 import 'package:audioplayers/audioplayers.dart';
 import '../services/lumen_service.dart';
 import 'settings_screen.dart';
+import 'pairing_screen.dart';
 
 class ChatMessage {
   String text;
@@ -19,14 +24,15 @@ class ChatMessage {
 }
 
 class ChatScreen extends StatefulWidget {
-  const ChatScreen({super.key});
+  final LumenService? lumen;
+  const ChatScreen({super.key, this.lumen});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  final LumenService _lumen = LumenService();
+  late final LumenService _lumen;
   final TextEditingController _textController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -35,13 +41,25 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _isLoading = false;
   bool _isConnected = false;
   bool _autoVoice = true;
+  bool _isRecording = false;
+  String _recordPath = '';
+  final AudioRecorder _recorder = AudioRecorder();
   String _profile = 'auto';
   Timer? _proactiveTimer;
+  Timer? _reconnectTimer;
+  int _reconnectAttempt = 0;
 
   @override
   void initState() {
     super.initState();
-    _checkConnection();
+    _lumen = widget.lumen ?? LumenService();
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    await _lumen.loadSavedConfig();
+    if (!mounted) return;
+    await _checkConnection();
     _startProactiveCheck();
   }
 
@@ -50,20 +68,47 @@ class _ChatScreenState extends State<ChatScreen> {
     _textController.dispose();
     _scrollController.dispose();
     _audioPlayer.dispose();
+    _recorder.dispose();
     _proactiveTimer?.cancel();
+    _reconnectTimer?.cancel();
     super.dispose();
   }
 
   Future<void> _checkConnection() async {
     final connected = await _lumen.testConnection();
+    if (!mounted) return;
     setState(() => _isConnected = connected);
+    if (connected) {
+      _reconnectAttempt = 0;
+      _reconnectTimer?.cancel();
+    }
 
+    if (!connected && _lumen.secret.trim().isEmpty) {
+      _addMessage(ChatMessage(
+        text: 'El token expiró o fue revocado. Te devuelvo al pairing para conectar de nuevo sin reutilizar el secreto anterior.',
+        isUser: false,
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 250));
+      if (mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => PairingScreen(lumen: _lumen)));
+      return;
+    }
     if (!connected) {
       _addMessage(ChatMessage(
         text: 'No puedo conectar con el Core. Verifica que esté corriendo y la IP sea correcta.',
         isUser: false,
       ));
+      _scheduleReconnect();
     }
+  }
+
+  void _scheduleReconnect() {
+    if (!mounted || _reconnectAttempt >= 4 || (_reconnectTimer?.isActive ?? false)) return;
+    final attempt = _reconnectAttempt++;
+    final baseSeconds = (5 * (1 << attempt)).clamp(5, 60).toInt();
+    final jitterMs = DateTime.now().millisecond % 750;
+    _reconnectTimer = Timer(Duration(seconds: baseSeconds, milliseconds: jitterMs), () {
+      if (mounted) _checkConnection();
+    });
   }
 
   void _startProactiveCheck() {
@@ -108,6 +153,13 @@ class _ChatScreenState extends State<ChatScreen> {
     _addMessage(assistant);
     setState(() => _isLoading = true);
     final buffer = StringBuffer();
+    String? pendingActionId;
+    String? pendingActionSessionId;
+    String? pendingActionPreview;
+    Map<String, dynamic>? pendingPermissionOptions;
+    List<Map<String, dynamic>> pendingPermissionEntries = <Map<String, dynamic>>[];
+    bool pendingRequiresConfirmation = true;
+    String pendingTargetHost = 'pc-main';
 
     try {
       await for (final event in _lumen.streamMessage(text, profile: _profile)) {
@@ -117,6 +169,15 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() => assistant.text = buffer.toString());
         } else if (type == 'action') {
           final preview = event['preview'] ?? 'Acción validada pendiente de ejecución en el dispositivo correspondiente.';
+          pendingActionId = event['action_id']?.toString();
+          pendingActionSessionId = event['session_id']?.toString() ?? _lumen.sessionId;
+          pendingActionPreview = preview.toString();
+          pendingPermissionOptions = event['confirmation_options'] is Map ? Map<String, dynamic>.from(event['confirmation_options']) : null;
+          pendingPermissionEntries = event['permission_entries'] is List
+              ? (event['permission_entries'] as List).whereType<Map>().map((entry) => Map<String, dynamic>.from(entry)).toList()
+              : <Map<String, dynamic>>[];
+          pendingRequiresConfirmation = event['confirmation_required'] != false;
+          pendingTargetHost = event['target_host']?.toString() ?? 'pc-main';
           buffer.write(preview);
           setState(() => assistant.text = buffer.toString());
         } else if (type == 'error' || type == 'cancelled') {
@@ -127,6 +188,9 @@ class _ChatScreenState extends State<ChatScreen> {
       if (assistant.text.trim().isEmpty) {
         setState(() => assistant.text = 'GAIA no devolvió texto visible.');
       }
+      if (pendingActionId != null && pendingActionSessionId != null && mounted) {
+        await _handleRemoteAction(assistant, pendingActionId!, pendingActionSessionId!, pendingActionPreview ?? assistant.text, pendingPermissionOptions ?? const {}, permissionEntries: pendingPermissionEntries, requiresConfirmation: pendingRequiresConfirmation, targetHost: pendingTargetHost);
+      }
       if (_autoVoice && assistant.text.trim().isNotEmpty) {
         await _playVoice(assistant.text);
       }
@@ -134,6 +198,97 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => assistant.text = 'No pude conectar con GAIA. El Core puede seguir funcionando; revisa la red LAN y el token.');
     } finally {
       setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _handleRemoteAction(ChatMessage assistant, String actionId, String actionSessionId, String preview, Map<String, dynamic> options, {List<Map<String, dynamic>> permissionEntries = const <Map<String, dynamic>>[], required bool requiresConfirmation, required String targetHost}) async {
+    if (!requiresConfirmation) {
+      if (mounted) setState(() => assistant.text = '${assistant.text}\n\nEjecutando en $targetHost; el resultado llegará como VerifiedActionResult.');
+      return;
+    }
+    await _confirmRemoteAction(assistant, actionId, actionSessionId, preview, options, permissionEntries);
+  }
+
+  Future<void> _confirmRemoteAction(ChatMessage assistant, String actionId, String actionSessionId, String preview, Map<String, dynamic> options, List<Map<String, dynamic>> permissionEntries) async {
+    final scopeText = permissionEntries.map((entry) {
+      final description = entry['human_scope_description']?.toString() ?? 'Scope estructurado';
+      final scope = entry['resource_scope']?.toString() ?? 'no resuelto';
+      return '$description [$scope]';
+    }).join('\n');
+    final decision = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Permiso para acción remota'),
+        content: Text('$preview\n\n${scopeText.isEmpty ? 'El Core no entregó un scope persistente; solo se permite confirmación puntual.' : 'Scopes autorizados por Core:\n$scopeText'}\n\nEl PC Action Host ejecutará la capability y devolverá un resultado verificado. Android no concede comandos arbitrarios.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, 'CANCEL'), child: const Text('Cancelar')),
+          if (options['allow_always'] == true) TextButton(onPressed: () => Navigator.pop(dialogContext, 'ALWAYS_ALLOW'), child: const Text('Permitir siempre')),
+          if (options['allow_once'] != false) FilledButton(onPressed: () => Navigator.pop(dialogContext, 'ALLOW_ONCE'), child: const Text('Permitir una vez')),
+          if (options['allow_always'] != true && options['allow_once'] == false) FilledButton(onPressed: () => Navigator.pop(dialogContext, 'CONFIRM_ONCE'), child: const Text('Confirmar')),
+        ],
+      ),
+    ) ?? 'CANCEL';
+    final approved = decision != 'CANCEL';
+    try {
+      final result = approved
+          ? await _lumen.approveAction(actionId, actionSessionId, decision: decision == 'ALLOW_ONCE' || decision == 'ALWAYS_ALLOW' ? decision : null)
+          : await _lumen.rejectAction(actionId, actionSessionId);
+      if (!mounted) return;
+      setState(() => assistant.text = '${assistant.text}\n\n${approved ? 'Aprobada para el PC Action Host (${decision == 'ALWAYS_ALLOW' ? 'permitir siempre' : decision == 'ALLOW_ONCE' ? 'una vez' : 'confirmación puntual'}).' : 'Rechazada; no se ejecutará.'}');
+      if (approved && result['status'] != 'approved') {
+        setState(() => assistant.text = '${assistant.text}\nLa aprobación no quedó registrada.');
+      }
+    } catch (_) {
+      if (mounted) setState(() => assistant.text = '${assistant.text}\nNo pude registrar la decisión remota.');
+    }
+  }
+
+  Future<void> _startRecording() async {
+    if (_isLoading || _isRecording) return;
+    final permission = await Permission.microphone.request();
+    if (!permission.isGranted) {
+      if (mounted) _addMessage(ChatMessage(text: 'Necesito permiso de micrófono para el push-to-talk; no activo escucha continua.', isUser: false));
+      return;
+    }
+    final directory = await getTemporaryDirectory();
+    _recordPath = '${directory.path}/gaia_ptt_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    await _recorder.start(const RecordConfig(encoder: AudioEncoder.aacLc, numChannels: 1, sampleRate: 16000, bitRate: 64000), path: _recordPath);
+    if (mounted) setState(() => _isRecording = true);
+  }
+
+  Future<void> _stopRecording() async {
+    if (!_isRecording) return;
+    if (mounted) setState(() => _isRecording = false);
+    final path = await _recorder.stop();
+    if (path == null || path.isEmpty) return;
+    try {
+      final data = await _lumen.sendVoice(path);
+      final userText = data['user_text']?.toString() ?? '';
+      final responseText = (data['response']?.toString().trim().isNotEmpty == true) ? data['response'].toString() : (data['preview']?.toString() ?? 'GAIA no devolvió texto visible.');
+      if (userText.isNotEmpty) _addMessage(ChatMessage(text: userText, isUser: true));
+      final assistant = ChatMessage(text: responseText, isUser: false);
+      _addMessage(assistant);
+      final actionId = data['action_id']?.toString();
+      final actionSessionId = data['session_id']?.toString() ?? _lumen.sessionId;
+      if (data['kind'] == 'action' && actionId != null && actionSessionId.isNotEmpty && mounted) {
+        final options = data['confirmation_options'] is Map ? Map<String, dynamic>.from(data['confirmation_options']) : <String, dynamic>{};
+        final entries = data['permission_entries'] is List
+            ? (data['permission_entries'] as List).whereType<Map>().map((entry) => Map<String, dynamic>.from(entry)).toList()
+            : <Map<String, dynamic>>[];
+        await _handleRemoteAction(assistant, actionId, actionSessionId, data['preview']?.toString() ?? responseText, options, permissionEntries: entries, requiresConfirmation: data['confirmation_required'] != false, targetHost: data['target_host']?.toString() ?? 'pc-main');
+      }
+      final audioUrl = data['audio_url']?.toString();
+      if (_autoVoice && audioUrl != null && audioUrl.isNotEmpty) {
+        final audioPath = await _lumen.downloadAudio(audioUrl);
+        await _audioPlayer.play(DeviceFileSource(audioPath));
+      } else if (_autoVoice && responseText.isNotEmpty && data['kind'] == 'chat') {
+        await _playVoice(responseText);
+      }
+    } catch (error) {
+      if (mounted) _addMessage(ChatMessage(text: 'Voz no disponible: $error', isUser: false));
+    } finally {
+      await File(path).delete().catchError((_) {});
     }
   }
 
@@ -323,6 +478,15 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
               child: Row(
                 children: [
+                  GestureDetector(
+                    onLongPressStart: (_) => _startRecording(),
+                    onLongPressEnd: (_) => _stopRecording(),
+                    child: Container(
+                      decoration: BoxDecoration(shape: BoxShape.circle, color: _isRecording ? const Color(0xFFff6b9d) : const Color(0xFF1e1e32)),
+                      child: IconButton(icon: Icon(_isRecording ? Icons.mic : Icons.mic_none, color: Colors.white), onPressed: _isRecording ? _stopRecording : _startRecording, tooltip: 'Mantén pulsado para hablar'),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
                   Expanded(
                     child: TextField(
                       controller: _textController,

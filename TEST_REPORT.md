@@ -1,93 +1,41 @@
-# TEST REPORT — GAIA-AI v0.5.3
+# TEST REPORT — GAIA-AI v1.0-RC6
 
-## Alcance
+## Ejecución final
 
-Esta release se valida en dos superficies distintas. **WORKTREE TESTS** comprueba el código durante el desarrollo; **FINAL ZIP EXTRACTED TESTS** debe ejecutarse después de construir, extraer en una ruta limpia y cambiar el working directory a esa copia. El backend es mock y las bases son temporales; estos resultados no certifican Ollama/Qwen, GPU, audio físico, LAN o Android.
+El run final se ejecutó con `--all --install-dependencies --confirm-install --recreate-venv` y un directorio de evidencia externo. El flujo fue package gate, preflight inicial, instalación privada, pip-freeze, reejecución real en el venv, preflight posterior, documentación, file audit, security audit, compile, suite, benchmark, ledger físico, extracción limpia y repetición de los gates sobre el archive.
 
-## Baseline v0.5.2 desde ZIP
-
-La extracción independiente de `GAIA-AI-v0.5.2-final.zip` confirmó que `.env.example` y `.gitignore` no estaban presentes. `fresh_install_test.py` falló con `FileNotFoundError` al intentar copiar `.env.example`. `v04_test.py` pasó en la reproducción disponible; no se afirma que el fallo WAL/SHM haya sido reproducido por ese comando. El baseline completo está en `BASELINE_V052.txt`.
-
-## WORKTREE TESTS
-
-| Suite | Resultado | Cobertura |
-|---|---:|---|
-| `tests/release_package_test.py` | PASS | Dotfiles, docs, estructura, higiene y git safety |
-| `tests/brain_backup_wal_test.py` | PASS | DB activa WAL preservada; sidecars excluidos |
-| `tests/brain_backup_portability_test.py` | PASS | Conexión abierta, WAL real y 12 round-trips create→restore |
-| `compileall` | PASS | Sintaxis Core, PC, tests y tools |
-| Regresiones históricas v0.3–v0.5.2 | PASS | Contratos y seguridad heredados |
-
-Los tres tests nuevos pasaron en el árbol de trabajo y volvieron a pasar desde la extracción final. La corrida completa también pasó después de estabilizar la DB activa durante restore.
-
-## Brain Backup portable
-
-`create_brain_backup()` usa `BRAIN_BACKUP_FILES` explícito: `memory.db`, `memory_export.json`, `profile.json`, `preferences.json`, `state.json`, `personality.py` y `config.json`. El manifest se calcula solo después de confirmar existencia y cerrar las operaciones temporales; el ZIP se reabre antes de devolver éxito. `memory.db-wal`, `memory.db-shm` y `memory.db-journal` no están permitidos.
-
-`brain_backup_portability_test.py` fuerza `PRAGMA journal_mode=WAL`, mantiene otra conexión abierta, crea actividad, realiza 12 iteraciones de backup y restore en una DB temporal y verifica que el estado A se recupere después de introducir el estado B. `brain_backup_wal_test.py` confirma que la DB activa continúa en WAL después del backup. Restore sigue rechazando tampering, missing, extra, traversal, duplicate, hash mismatch, schema desconocido y SQLite corrupta mediante las regresiones existentes.
-
-## FINAL ZIP EXTRACTED TESTS
-
-La tabla siguiente corresponde a una extracción limpia de `GAIA-AI-v0.5.3-final.zip`; la suite se ejecutó con el working directory dentro de esa copia. No se sustituyó por `unzip -tq` solamente.
-
-| Control | Resultado | Evidencia |
-|---|---:|---|
-| Estructura final y dotfiles | PASS | `release_package_test.py` desde extracción |
-| Fresh install desde extracción | PASS | `fresh_install_test.py` desde extracción |
-| Brain Backup WAL round-trip | PASS | WAL test y 12 round-trips desde extracción |
-| Suite histórica completa | PASS | listado reproducible abajo |
-| Doctor read-only | PASS | JSON desde extracción; `read_only` presente |
-| Package hygiene/path safety | PASS | build allowlist, ZIP test y package test |
-
-## Comandos reproducibles desde una raíz extraída
-
-```bash
-python3 tests/release_package_test.py
-python3 tests/brain_backup_wal_test.py
-python3 tests/brain_backup_portability_test.py
-python3 -m compileall -q lumen-core lumen-pc tests tools
-python3 tests/gui_import_test.py
-python3 tests/smoke_test.py
-python3 tests/v03_test.py
-python3 tests/v04_test.py
-python3 tests/v041_test.py
-python3 tests/v05_test.py
-python3 tests/v051_test.py
-python3 tests/action_plan_llm_test.py
-python3 tests/device_permissions_test.py
-python3 tests/device_touch_test.py
-python3 tests/brain_backup_scheduler_test.py
-python3 tests/startup_test.py
-python3 tests/db_upgrade_test.py
-python3 tests/backup_integrity_test.py
-python3 tests/process_safety_test.py
-python3 tests/security_regression_test.py
-python3 tests/llm_health_test.py
-python3 tests/fresh_install_test.py
-python3 tests/vault_missing_test.py
-python3 tests/gui_import_test.py
-python3 tests/gui_action_contract_test.py
-python3 tests/terminal_plan_test.py
-python3 tests/voice_permissions_test.py
-python3 tests/request_ownership_test.py
-python3 tests/permission_level_test.py
-python3 tests/plan_post_action_test.py
-python3 tools/gaia_doctor.py --json
-```
-
-## Límites
-
-| Área | Estado |
+| Gate | Resultado |
 |---|---|
-| Python | 3.11 es objetivo recomendado; 3.12 es el entorno validado; 3.13 no fue probado |
-| Ollama/Qwen | Health gate, errores y mock; servicio, modelo, contexto y rendimiento reales pendientes |
-| GPU | No se afirma reparto CPU/GPU ni velocidad sin drivers y hardware |
-| Micrófono/Whisper/TTS | Orquestación y errores mock; captura, Edge TTS y altavoces pendientes |
-| GUI visual/ventana activa | Importación y callbacks mock; revisión por sistema pendiente |
-| Android | Dart/pubspec y secure storage estáticos; SDK no instalado, sin APK |
-| LAN/TLS | Opt-in implementado; TLS, firewall y red confiable pendientes |
-| Proactividad | Reglas implementadas, automática apagada por defecto |
+| Package gate | PASS |
+| Preflight inicial/posterior | PASS / PASS |
+| Instalación y transición | PASS; venv externo y `pip-freeze` |
+| Documentation contract | PASS |
+| File audit | PASS; 0 archivos prohibidos |
+| Security audit | PASS; 0 hallazgos |
+| Compile worktree | 202/202 PASS |
+| Suite worktree | 126/126 PASS; 0 FAIL, 0 TIMEOUT |
+| Benchmark worktree | PASS; 200 elementos/30 iteraciones |
+| Ledger físico worktree | PENDING; 12 PENDING |
+| ZIP integrity/paths | PASS; 325 miembros |
+| Package/manifest/audit/security limpio | PASS |
+| Compile extracción limpia | 202/202 PASS |
+| Suite extracción limpia | 126/126 PASS; 0 FAIL, 0 TIMEOUT |
+| Benchmark extracción limpia | PASS |
+| Ledger físico limpio | PENDING; 12 PENDING |
+| Paridad documental | PASS; 79/79, missing=0, extra=0, content_mismatch=0 |
 
-## Validación manual recomendada
+La suite se descubre dinámicamente; el valor 126 corresponde a esta ejecución concreta y no se usa como sustituto de descubrimiento dinámico. La evidencia detallada y sus logs redacted están fuera del proyecto en `RC6-final-install-validation`.
 
-En el equipo objetivo, extrae el ZIP final, crea `.env` desde `.env.example`, instala Python 3.11 y dependencias, configura un secreto fuerte, instala manualmente `qwen3.5:9b` si corresponde, inicia Ollama y ejecuta Doctor. Prueba conversación, diagnóstico, memoria, voz, cancelación, confirmación, plan de dos pasos y Brain Backup. No marques proyectos como `trusted` sin revisar cada comando.
+## Seguridad y side effects
+
+El runner usa subprocessos en lista, `shell=False`, timeouts y redacción. No instala globalmente, no descarga modelos, no inicia Ollama, no muta hardware y no deja servicios persistentes. El escáner ejecutable externo cubrió 84 archivos con cero hallazgos; el runner cubrió 87 archivos en worktree y 88 en extracción limpia con cero hallazgos.
+
+## Rendimiento
+
+RC5 y RC6 se compararon en el mismo entorno con fixtures idénticos. Las cifras y la candidata WAL `INCONCLUSIVE/REVERTED` están en `PERFORMANCE_RC6_REPORT.md` y `PERFORMANCE_COMPARISON_RC5_RC6.md`. No se aceptó una optimización que empeoró retrieval o ResourceGovernor.
+
+## Estado físico
+
+Los doce controles físicos permanecen PENDING. Linux, mocks, imports, APIs locales y existencia de archivos no demuestran Windows 11, Android, audio, GPU/VRAM, batería, térmica, LAN/TLS, signing, Ollama/Qwen ni sesiones prolongadas.
+
+La decisión automatizada permitida es **RC6 FROZEN / AUTOMATED PASS / PHYSICAL VALIDATION PENDING**. No se declara una promoción fuera de RC6.

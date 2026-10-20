@@ -31,7 +31,15 @@ class ProjectRegistry:
         self.base_dir = base_dir.expanduser().resolve()
 
     def list_projects(self) -> list[RegisteredProject]:
-        return list(self._load().values())
+        projects: list[RegisteredProject] = []
+        seen: set[str] = set()
+        for project in self._load().values():
+            canonical = project.name.casefold()
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            projects.append(project)
+        return projects
 
     def resolve(self, name: str) -> RegisteredProject:
         key = " ".join(str(name or "default").strip().lower().split())
