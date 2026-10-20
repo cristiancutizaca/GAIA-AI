@@ -1,0 +1,207 @@
+{
+  "archive_version": 1,
+  "source_commit": "a021d91298c9fefed5e03645b616859c508987e0",
+  "created_date": "2026-10-19",
+  "intent": "Preservación de documentación histórica; sin modificaciones de contenido",
+  "moved_count": 33,
+  "files": [
+    {
+      "from": "BASELINE_V1_2_REPORT.md",
+      "to": "archive/history/v1.2/BASELINE_V1_2_REPORT.md",
+      "sha": "63367e2721cd348b272ded48146e3d72d14a3e4a",
+      "size": 473
+    },
+    {
+      "from": "CHECKPOINT_00_RC6_REPAIRED_STABLE.md",
+      "to": "archive/history/baselines/CHECKPOINT_00_RC6_REPAIRED_STABLE.md",
+      "sha": "fa0aed8e045d75342ed1a612da50b65c4e601262",
+      "size": 390
+    },
+    {
+      "from": "CHECKPOINT_00_V1_1_EVOLUTION_FOUNDATION.md",
+      "to": "archive/history/baselines/CHECKPOINT_00_V1_1_EVOLUTION_FOUNDATION.md",
+      "sha": "1221852854599b269334e8b812f7929e3a643846",
+      "size": 433
+    },
+    {
+      "from": "EXTERNAL_DESKTOP_RESEARCH_V17.md",
+      "to": "archive/history/v1.7/EXTERNAL_DESKTOP_RESEARCH_V17.md",
+      "sha": "297cea37eca1082f40873e58cae7569d5767d294",
+      "size": 1371
+    },
+    {
+      "from": "FINAL_BASELINE_V1_7.md",
+      "to": "archive/history/v1.7/FINAL_BASELINE_V1_7.md",
+      "sha": "1292f93f3b135edbd43978812a3b24a451fa0e51",
+      "size": 1024
+    },
+    {
+      "from": "FINAL_RUN_BASELINE.md",
+      "to": "archive/history/baselines/FINAL_RUN_BASELINE.md",
+      "sha": "10f5b33963b87379fbab0130fa0ddfc5064d7def",
+      "size": 355
+    },
+    {
+      "from": "GAIA_BEFORE_FINAL_FIXES.md",
+      "to": "archive/history/baselines/GAIA_BEFORE_FINAL_FIXES.md",
+      "sha": "d87bb8d80f431d36215523e179268427ff62ed4b",
+      "size": 382
+    },
+    {
+      "from": "GAIA_FINAL_BASELINE_BEFORE_FIXES.md",
+      "to": "archive/history/baselines/GAIA_FINAL_BASELINE_BEFORE_FIXES.md",
+      "sha": "2ab52e568a3e59458b99f1a7227bca98892385db",
+      "size": 439
+    },
+    {
+      "from": "GAIA_FINAL_REALITY_REPORT.md",
+      "to": "archive/history/v1.7/GAIA_FINAL_REALITY_REPORT.md",
+      "sha": "007e7100f6351d47c0bbf01eb1cb36a0932cea10",
+      "size": 4367
+    },
+    {
+      "from": "GAIA_MASTER_COMPLETION_REPORT_V18.md",
+      "to": "archive/history/v1.8/GAIA_MASTER_COMPLETION_REPORT_V18.md",
+      "sha": "241fafb24508a940f494d811193a68a49df524f9",
+      "size": 2235
+    },
+    {
+      "from": "GAIA_V17_DESKTOP_RELEASE_NOTES.md",
+      "to": "archive/history/v1.7/GAIA_V17_DESKTOP_RELEASE_NOTES.md",
+      "sha": "346b556e05810496f8ddbe7d05ddd74201514de8",
+      "size": 1647
+    },
+    {
+      "from": "GAIA_V1_1_ARCHITECTURE.md",
+      "to": "archive/history/v1.1/GAIA_V1_1_ARCHITECTURE.md",
+      "sha": "2c725bc4d94901f49bf800aad06a2247850ffeef",
+      "size": 494
+    },
+    {
+      "from": "GAIA_V1_2_ARCHITECTURE.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_ARCHITECTURE.md",
+      "sha": "bc433981067e2fa84d42a1beea1a61644d36fc1f",
+      "size": 555
+    },
+    {
+      "from": "GAIA_V1_2_IMPLEMENTATION_REPORT.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_IMPLEMENTATION_REPORT.md",
+      "sha": "906ca6123b119a342383841ab9edca91814f1914",
+      "size": 3403
+    },
+    {
+      "from": "GAIA_V1_2_KNOWN_ISSUES.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_KNOWN_ISSUES.md",
+      "sha": "7477abfe9d877852254ef05310aab7320accfec6",
+      "size": 817
+    },
+    {
+      "from": "GAIA_V1_2_LICENSE_REPORT.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_LICENSE_REPORT.md",
+      "sha": "4e7c292ad66b5e0ce1761c4658e4a3b19579b8af",
+      "size": 364
+    },
+    {
+      "from": "GAIA_V1_2_MIGRATION.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_MIGRATION.md",
+      "sha": "e37ea72df89f49bbad2307f0c741b921c7c10361",
+      "size": 479
+    },
+    {
+      "from": "GAIA_V1_2_PERFORMANCE_REPORT.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_PERFORMANCE_REPORT.md",
+      "sha": "d1c42015866de05c921dde51abe3ef5723406df4",
+      "size": 494
+    },
+    {
+      "from": "GAIA_V1_2_PHYSICAL_VALIDATION.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_PHYSICAL_VALIDATION.md",
+      "sha": "2c1cdf336b07e2422944aa634f080c110aed69af",
+      "size": 412
+    },
+    {
+      "from": "GAIA_V1_2_SECURITY_REPORT.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_SECURITY_REPORT.md",
+      "sha": "3ed0ca30cecf0eddd117c674d8f956c818f56793",
+      "size": 728
+    },
+    {
+      "from": "GAIA_V1_2_TEST_REPORT.md",
+      "to": "archive/history/v1.2/GAIA_V1_2_TEST_REPORT.md",
+      "sha": "31b5ebac2391d2b0e2706307ebda4e1a56bf3c35",
+      "size": 570
+    },
+    {
+      "from": "GAIA_V1_3_ARCHITECTURE.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_ARCHITECTURE.md",
+      "sha": "a85578593787bc8419d3c112ac412e431098966b",
+      "size": 437
+    },
+    {
+      "from": "GAIA_V1_3_E2E_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_E2E_REPORT.md",
+      "sha": "c2c8f7ea0714ef52f183f33f702d7bcae9bc13e1",
+      "size": 568
+    },
+    {
+      "from": "GAIA_V1_3_FINAL_IMPLEMENTATION_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_FINAL_IMPLEMENTATION_REPORT.md",
+      "sha": "70234088781835ce5b3bfb8679b6c3c5e73775f5",
+      "size": 3266
+    },
+    {
+      "from": "GAIA_V1_3_KNOWN_ISSUES.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_KNOWN_ISSUES.md",
+      "sha": "772a982941fbcf6e8783b46df33b3989f0820eaf",
+      "size": 642
+    },
+    {
+      "from": "GAIA_V1_3_LICENSE_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_LICENSE_REPORT.md",
+      "sha": "3090ee810d550894d292b5db7f160fba00c8b6d1",
+      "size": 411
+    },
+    {
+      "from": "GAIA_V1_3_MIGRATION_FROM_V1_2.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_MIGRATION_FROM_V1_2.md",
+      "sha": "acf610095aa0065cbcb5ef631da8fa06279a46f6",
+      "size": 526
+    },
+    {
+      "from": "GAIA_V1_3_PERFORMANCE_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_PERFORMANCE_REPORT.md",
+      "sha": "62ad9fe0fd975161fd1fb2f0f90b05ae5d9a5215",
+      "size": 327
+    },
+    {
+      "from": "GAIA_V1_3_PHYSICAL_VALIDATION.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_PHYSICAL_VALIDATION.md",
+      "sha": "c65c3a66961c098ad8a456c3eed1e2318f0ac48e",
+      "size": 278
+    },
+    {
+      "from": "GAIA_V1_3_RECOMMENDATIONS.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_RECOMMENDATIONS.md",
+      "sha": "728f90b7fa4e31524fcc2faab794f92615d82753",
+      "size": 529
+    },
+    {
+      "from": "GAIA_V1_3_SECURITY_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_SECURITY_REPORT.md",
+      "sha": "069c16fa8a80ea30065624fb2fc949da3cab3c8a",
+      "size": 582
+    },
+    {
+      "from": "GAIA_V1_3_TEST_REPORT.md",
+      "to": "archive/history/v1.3/GAIA_V1_3_TEST_REPORT.md",
+      "sha": "86bf374653911bd87aaa2170e06d5c30e16bf30b",
+      "size": 428
+    },
+    {
+      "from": "GAIA_V1_4_OPTIONAL_IDEAS.md",
+      "to": "archive/history/v1.4/GAIA_V1_4_OPTIONAL_IDEAS.md",
+      "sha": "6bf3e69371e48f10fa0c66c9eb0e724ce601ed79",
+      "size": 343
+    }
+  ]
+}

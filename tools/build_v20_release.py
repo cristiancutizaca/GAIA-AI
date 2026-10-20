@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, hashlib, json, zipfile
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]; PACKAGE='GAIA-AI-v2.0-RESIDENT-DESKTOP-ASSISTANT'
-EXCLUDE_DIRS={'.git','.venv','venv','node_modules','__pycache__','data','logs','backups','diagnostics','physical-validation','tmp','secrets','tokens','coding-workspaces','.pytest_cache','release'}
+EXCLUDE_DIRS={'.git','.venv','venv','node_modules','__pycache__','data','logs','backups','diagnostics','physical-validation','tmp','secrets','tokens','coding-workspaces','.pytest_cache','release','archive'}
 EXCLUDE_SUFFIX={'.pyc','.pyo','.db','.sqlite','.sqlite3','.log','.wav','.mp3','.mp4','.zip','.bin','.pt','.onnx','.pem','.key','.token'}
 def selected():
  out=[]
