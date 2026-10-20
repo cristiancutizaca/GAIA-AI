@@ -333,11 +333,19 @@ class DesktopShell:
             if self.signals is not None:
                 self.signals.response.emit(data)
             answer = str(data.get("response") or data.get("message") or "").strip()
-            if answer and os.getenv("GAIA_SPEAK_RESPONSES", "true").lower() in {"true", "1", "yes"}:
+            if os.getenv("GAIA_SPEAK_RESPONSES", "true").lower() in {"true", "1", "yes"}:
                 from desktop_api import play_audio
-                if self.signals is not None:
-                    self.signals.state.emit("SPEAKING")
-                play_audio(self.api.request_tts(answer[:1500]))
+                audio_url = str(data.get("audio_url") or "").strip()
+                if audio_url or answer:
+                    if self.signals is not None:
+                        self.signals.state.emit("SPEAKING")
+                    try:
+                        path_to_play = (self.api.download_audio(audio_url) if audio_url
+                                        else self.api.request_tts(answer[:1500]))
+                        play_audio(path_to_play)
+                    except Exception:
+                        # A speaker/network failure must not discard a successful chat response.
+                        pass
             if self.signals is not None:
                 self.signals.state.emit("IDLE")
         except Exception as exc:
@@ -464,7 +472,9 @@ class DesktopShell:
             message += "\nAcción pendiente: revisa y aprueba el permiso correspondiente."
         if self.quick_result_label is not None:
             self.quick_result_label.setText(message[:3000])
-        if self.tray is not None and not self.quick_command_window:
+        if self.tray is not None and (
+            self.quick_command_window is None or not self.quick_command_window.isVisible()
+        ):
             self.tray.showMessage("GAIA", message[:180])
 
     def _show_permission(self,request): self.permission_dialog=PermissionDialog(request,self._submit_permission); self.permission_dialog.show()
