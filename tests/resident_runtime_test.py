@@ -162,6 +162,8 @@ def test_confirmation_ui_wiring():
     assert 'self.decide(self.request, "DENY")' in shell_code
     assert 'self.api.kill_switch()' in shell_code
     assert 'self._request_lock.acquire(blocking=False)' in shell_code
+    assert 'class ShellBridge(QObject)' in shell_code
+    assert 'Qt.QueuedConnection' in shell_code
     wake_code = (ROOT / "lumen-pc" / "wake_word.py").read_text(encoding="utf-8")
     assert "if not self.running:" in wake_code
 

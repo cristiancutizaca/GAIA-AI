@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 try:
-    from PySide6.QtCore import QObject, Qt, QTimer, Signal, QAbstractNativeEventFilter
+    from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot, QAbstractNativeEventFilter
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
     from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget
     PYSIDE_AVAILABLE = True
@@ -244,6 +244,32 @@ class ShellSignals(QObject if PYSIDE_AVAILABLE else object):
         state = Signal(str)
         response = Signal(object)
 
+
+if PYSIDE_AVAILABLE:
+    class ShellBridge(QObject):
+        """QObject receiver makes every worker->UI connection queued on Qt's main thread."""
+        def __init__(self, shell):
+            super().__init__()
+            self.shell = shell
+
+        @Slot(object)
+        def receive_event(self, event):
+            self.shell._render_core_event(event)
+
+        @Slot(str)
+        def receive_voice(self, audio_path):
+            self.shell._handle_voice(audio_path)
+
+        @Slot(str)
+        def receive_state(self, state):
+            self.shell._set_state(state)
+
+        @Slot(object)
+        def receive_response(self, payload):
+            self.shell._show_response(payload)
+else:
+    ShellBridge = None
+
 class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
     """Shows the exact Core action, scope and risk, without approving on close."""
     def __init__(self, request: dict, decide: Callable[[dict, str], Any]):
@@ -298,7 +324,7 @@ class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
 
 class DesktopShell:
     def __init__(self, config: ShellConfig|None=None, api=None):
-        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self._permission_ids=set(); self._request_lock=threading.Lock(); self._capture_session=0; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
+        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self._permission_ids=set(); self._request_lock=threading.Lock(); self._capture_session=0; self.bridge=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
         self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._on_core_event)
         self.hotkey=GlobalHotkey(self._ptt_down,self._ptt_up,self.config.hotkey)
         self.capture=AudioCapture(self._on_captured_audio)
@@ -331,10 +357,11 @@ class DesktopShell:
         if not PYSIDE_AVAILABLE: raise RuntimeError("PySide6 is required for resident shell; install requirements-desktop.txt")
         self.app=QApplication.instance() or QApplication(sys.argv); self.app.setQuitOnLastWindowClosed(False); self.qt=True; shell=self
         self.signals=ShellSignals()
-        self.signals.event.connect(self._render_core_event)
-        self.signals.voice_captured.connect(self._handle_voice)
-        self.signals.state.connect(self._set_state)
-        self.signals.response.connect(self._show_response)
+        self.bridge=ShellBridge(self)
+        self.signals.event.connect(self.bridge.receive_event, Qt.QueuedConnection)
+        self.signals.voice_captured.connect(self.bridge.receive_voice, Qt.QueuedConnection)
+        self.signals.state.connect(self.bridge.receive_state, Qt.QueuedConnection)
+        self.signals.response.connect(self.bridge.receive_response, Qt.QueuedConnection)
         class Orb(QWidget):
             def __init__(inner): super().__init__(); inner.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus); inner.setAttribute(Qt.WA_TranslucentBackground); inner.resize(shell.config.orb_size,shell.config.orb_size); inner.state="SLEEPING"
             def set_state(inner,state): inner.state=state; inner.update()
