@@ -379,9 +379,9 @@ class LumenDesktopAPI:
 
     def action_result(self, action_id: str, session_id: str) -> dict | None:
         """Read Core's persisted *verified* outcome. Never infer success from approval."""
-        if not re.fullmatch(r"[\\w-]{8,80}", str(action_id or "")):
+        if not re.fullmatch(r"[\w-]{8,80}", str(action_id or "")):
             raise LumenAPIError("action_id invalido.")
-        if not re.fullmatch(r"[\\w-]{1,64}", str(session_id or "")):
+        if not re.fullmatch(r"[\w-]{1,64}", str(session_id or "")):
             raise LumenAPIError("session_id invalido.")
         rows = self._request(
             "GET", "/api/actions/history",
