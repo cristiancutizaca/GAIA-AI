@@ -114,6 +114,37 @@ estén listos.
 Las pruebas automatizadas **no** sustituyen comprobar confirmaciones, bloqueo
 de acciones, micrófono y control de aplicaciones en el PC real.
 
+## Una sola ejecución por acción (v2.0)
+
+El modo residente usa `GAIA_REMOTE_HOST_ENABLED=true` (valor por defecto).
+En este modo la interfaz **nunca** ejecuta acciones en paralelo con el host:
+envía solicitudes al Core, solicita aprobación cuando corresponda y el
+PC Action Host autentica, reclama y ejecuta el contrato estructurado.
+
+Si se muestra «Solicitud enviada al ejecutor», todavía **no** significa
+«acción realizada». Verifica el estado en la bandeja, el historial del Core
+y el registro del host. Si el host está desconectado, la solicitud puede
+permanecer sin ejecutar.
+
+La ruta antigua sin host solo se conserva con
+`GAIA_REMOTE_HOST_ENABLED=false` configurado explícitamente. **No combines
+dos instancias de GAIA con modos distintos sobre el mismo Core.**
+
+La cancelación de una acción pendiente utiliza `/api/actions/reject`;
+`/api/actions/complete` rechaza resultados de acciones que no fueron
+aprobadas. Las operaciones ejecutadas anteriormente no pueden deshacerse
+mediante una cancelación.
+
+### Pruebas de seguridad ejecutables localmente
+
+```powershell
+.\.venv\Scripts\python.exe tests\action_single_executor_contract_test.py
+.\.venv\Scripts\python.exe tests\remote_action_host_test.py
+```
+
+La primera comprobación es autónoma, solo necesita Python 3.11. La segunda
+requiere las dependencias del Core y crea una base de datos temporal.
+
 ## Pruebas pendientes sobre hardware real
 
 - Instalación de PySide6/Whisper en el PC de destino.

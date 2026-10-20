@@ -39,6 +39,13 @@ with tempfile.TemporaryDirectory(prefix="gaia_remote_host_") as tmp:
         session_id = proposed.json()["session_id"]
 
         assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
+        # No actor may submit a completed result before the owner has approved.
+        preapproval_completion = client.post("/api/actions/complete", headers=host, json={
+            "action_id": action_id, "session_id": session_id, "device": "pc-main",
+            "success": True, "message": "No debió ejecutarse.",
+            "data": {"execution_verified": True},
+        })
+        assert preapproval_completion.status_code == 409, preapproval_completion.text
         assert client.post("/api/actions/approve", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 200
         pending = client.get("/api/actions/pending", headers=host)
         assert pending.status_code == 200 and pending.json()["actions"] and pending.json()["actions"][0]["action_id"] == action_id

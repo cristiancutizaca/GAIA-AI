@@ -38,6 +38,9 @@ DEVICE = os.getenv("GAIA_PC_DEVICE_ID", "pc-main").strip() or "pc-main"
 POLL_SECONDS = max(5, int(os.getenv("LUMEN_PROACTIVE_POLL_SECONDS", "15")))
 LLM_CLIENT_TIMEOUT = max(30.0, float(os.getenv("LUMEN_LLM_TIMEOUT_SECONDS", "600")))
 ACTION_CONFIRM_POLICY = os.getenv("GAIA_ACTION_CONFIRM_POLICY", "CONFIRM_EXECUTION").upper()
+# One execution owner: resident PC Action Host by default. Legacy local action
+# execution is an explicit opt-out, never concurrent with the resident host.
+REMOTE_HOST_ENABLED = os.getenv("GAIA_REMOTE_HOST_ENABLED", "true").strip().lower() in {"true", "1", "yes"}
 
 def _positive_float_env(name: str, default: float) -> float:
     raw = os.getenv(name)
@@ -224,6 +227,9 @@ class LumenDesktopAPI:
         self.session_id = data.get("session_id", self.session_id)
         parsed = parse_action_response(data)
         if parsed:
+            if REMOTE_HOST_ENABLED:
+                response = response_for_display(parsed) if parsed.confirmation_required else "Solicitud enviada al ejecutor de Windows; aún no está verificada."
+                return {**data, "response": response, "confirmation_required": bool(parsed.confirmation_required), "execution_verified": False}
             if parsed.confirmation_required and ACTION_CONFIRM_POLICY == "CONFIRM_EXECUTION":
                 return {**data, "response": response_for_display(parsed), "confirmation_required": True}
             return self.confirm_action(data)
@@ -274,6 +280,9 @@ class LumenDesktopAPI:
             parsed = parse_action_response(action_data)
             if not parsed:
                 raise LumenAPIError("El Core devolvió una respuesta de acción inválida.")
+            if REMOTE_HOST_ENABLED:
+                description = response_for_display(parsed) if parsed.confirmation_required else "Solicitud enviada al ejecutor de Windows; aún no está verificada."
+                return {**action_data, "response": description, "confirmation_required": bool(parsed.confirmation_required), "execution_verified": False, "tts_streamed": bool(speak)}
             if parsed.confirmation_required and ACTION_CONFIRM_POLICY == "CONFIRM_EXECUTION":
                 return {**action_data, "response": response_for_display(parsed), "confirmation_required": True, "tts_streamed": bool(speak)}
             result = self.confirm_action(action_data, engine=engine)
@@ -288,14 +297,10 @@ class LumenDesktopAPI:
         parsed = parse_action_response(action_data)
         if not parsed:
             raise LumenAPIError("Respuesta de acción inválida o incompleta.")
-        total = len(parsed.steps)
-        result = {"success": False, "action": parsed.kind, "message": "Ejecución cancelada antes de comenzar.", "data": {"actions": [], "completed": 0, "total": total, "cancelled": True, "plan_id": parsed.action_id if parsed.is_plan else None}, "cancelled": True}
-        completed = self._request("POST", "/api/actions/complete", json={
-            "action_id": action_data["action_id"], "session_id": action_data["session_id"], "device": DEVICE,
-            "success": False, "message": result["message"], "data": result["data"],
-        }, timeout=ACTION_COMPLETION_TIMEOUT).json()
-        completed.update({"kind": "chat", "response": result["message"], "local_result": result, "plan": parsed.plan})
-        return completed
+        # Cancelling means REJECT, not reporting an action as "completed".
+        # This also preserves Core's explicit authorization state machine.
+        result = self.confirm_permission(action_data["action_id"], "DENY", session_id=action_data["session_id"])
+        return {**result, "kind": "chat", "response": "Solicitud rechazada antes de ejecutarse.", "cancelled": True, "execution_verified": False}
 
     def download_capture(self, capture_id: str) -> Path:
         candidate = str(capture_id or "").strip()
@@ -377,6 +382,13 @@ class LumenDesktopAPI:
         parsed = parse_action_response(action_data)
         if not parsed:
             raise LumenAPIError("Respuesta de acción inválida o incompleta.")
+        if REMOTE_HOST_ENABLED:
+            # Never call ActionHost.execute here: the resident host owns the
+            # claim/execute/complete lifecycle for this pending action.
+            if parsed.confirmation_required:
+                approval = self.confirm_permission(action_data["action_id"], permission_decision or "CONFIRM_ONCE", session_id=action_data["session_id"])
+                return {**approval, "kind": "chat", "response": "Autorización registrada; esperando ejecución y verificación del PC Action Host.", "execution_verified": False}
+            return {**action_data, "kind": "chat", "response": "Solicitud en cola del PC Action Host; todavía no se ha verificado su ejecución.", "execution_verified": False}
         permission_ids: list[int] = []
         if permission_decision:
             entries = action_data.get("permission_entries")
@@ -394,6 +406,10 @@ class LumenDesktopAPI:
                 grant = self.grant_permission(capability, scope, permission_decision, int(entry.get("risk_level", 0)), DEVICE)
                 if grant.get("permission_id") is not None:
                     permission_ids.append(int(grant["permission_id"]))
+        if parsed.confirmation_required and not action_data.get("approved"):
+            # The legacy single-process mode must also authorize in Core before
+            # performing effects or submitting a completion.
+            self.confirm_permission(action_data["action_id"], "CONFIRM_ONCE", session_id=action_data["session_id"])
         host = ActionHost(PROJECT_DIR, policy=ACTION_CONFIRM_POLICY)
         if engine is not None:
             host.engine = engine

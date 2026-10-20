@@ -29,5 +29,7 @@ jobs:
         run: python -m pip install python-dotenv httpx
       - name: Compile changed Python modules
         run: python -m py_compile lumen-pc/desktop_shell.py lumen-pc/gaia_desktop_launcher.py tools/gaia_resident_doctor.py tests/resident_runtime_test.py
+      - name: Check one-owner action execution and approval gates
+        run: python tests/action_single_executor_contract_test.py
       - name: Run resident runtime contracts
         run: python tests/resident_runtime_test.py

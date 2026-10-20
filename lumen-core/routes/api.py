@@ -1738,9 +1738,14 @@ async def complete_action(req: ActionCompleteRequest, principal: Annotated[Princ
         raise HTTPException(status_code=409, detail="La acción ya fue completada.")
     if pending.get("session_id") != req.session_id:
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
+    if pending.get("cancelled") or not pending.get("approved"):
+        raise HTTPException(status_code=409, detail="La acción fue rechazada o todavía no está autorizada; no se puede completar.")
+    claimed_by = str(pending.get("claimed_by") or "")
+    if claimed_by and claimed_by != str(principal.device_id or "") and not principal.is_master:
+        raise HTTPException(status_code=409, detail="Un host diferente ya reclamó esta acción.")
     if not principal.is_master:
         same_device = pending.get("principal_type") == "device" and pending.get("device_id") == principal.device_id and pending.get("token_id") == principal.token_id
-        claimed_host = pending.get("claimed_by") == principal.device_id and principal.allows(CAP_ACTION_HOST)
+        claimed_host = claimed_by == principal.device_id and principal.allows(CAP_ACTION_HOST)
         if not same_device and not claimed_host:
             raise HTTPException(status_code=403, detail="La acción pertenece a otro Principal y no fue reclamada por este host.")
     pending_intent = pending.get("intent", {}) if isinstance(pending.get("intent"), dict) else {}
