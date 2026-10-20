@@ -146,6 +146,8 @@ class WakeWordListener:
         max_frames = int(RECORD_DURATION / 0.5)  # Máximo de chunks
 
         for _ in range(max_frames):
+            if not self.running:
+                return ""
             chunk = sd.rec(
                 int(0.5 * SAMPLE_RATE),
                 samplerate=SAMPLE_RATE,
@@ -153,6 +155,8 @@ class WakeWordListener:
                 dtype='int16'
             )
             sd.wait()
+            if not self.running:
+                return ""
             chunk_flat = chunk.flatten()
             all_audio.append(chunk_flat)
 
@@ -189,9 +193,14 @@ class WakeWordListener:
                     # Raw sleeping audio is never retained; only this post-wake utterance is saved.
                     audio_path = self._record_message()
 
-                    # Callback
-                    if self.on_wake:
+                    # Callback. Microphone OFF must not enqueue a late command.
+                    if audio_path and self.running and self.on_wake:
                         self.on_wake(audio_path)
+                    elif audio_path:
+                        try:
+                            os.unlink(audio_path)
+                        except OSError:
+                            pass
                     self.session_active = False
 
             except KeyboardInterrupt:
@@ -205,6 +214,12 @@ class WakeWordListener:
         """Iniciar escucha en thread separado."""
         if self.running:
             return
+        if self._thread is not None and self._thread.is_alive():
+            # The previous microphone thread has not released its device yet.
+            raise RuntimeError("Wake word anterior sigue cerrándose.")
+        health = self.health()
+        if health.get("status") not in {"GAIA_MODEL_READY", "WHISPER_FALLBACK"}:
+            raise RuntimeError("Wake word no preparado: " + str(health.get("status")))
         self.running = True
         self._thread = threading.Thread(target=self._listen_loop, daemon=True)
         self._thread.start()
@@ -214,7 +229,8 @@ class WakeWordListener:
         self.running = False
         if self._thread:
             self._thread.join(timeout=5)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
 
 
 # === Para usar desde el cliente PC ===

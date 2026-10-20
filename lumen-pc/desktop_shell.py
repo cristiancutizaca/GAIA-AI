@@ -7,7 +7,7 @@ from typing import Any, Callable
 try:
     from PySide6.QtCore import QObject, Qt, QTimer, Signal, QAbstractNativeEventFilter
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-    from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget
+    from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False
@@ -15,7 +15,7 @@ except ImportError:
     class QAbstractNativeEventFilter: pass
     class Signal:
         def __init__(self,*a,**k): pass
-    QAction=QColor=QIcon=QPainter=QPixmap=QApplication=QDialog=QFormLayout=QLabel=QLineEdit=QMenu=QPushButton=QSystemTrayIcon=QVBoxLayout=QWidget=None
+    QAction=QColor=QIcon=QPainter=QPixmap=QApplication=QDialog=QFormLayout=QLabel=QLineEdit=QMenu=QMessageBox=QPushButton=QSystemTrayIcon=QVBoxLayout=QWidget=None
 try:
     import httpx
 except ImportError:
@@ -245,19 +245,60 @@ class ShellSignals(QObject if PYSIDE_AVAILABLE else object):
         response = Signal(object)
 
 class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
-    def __init__(self, request: dict, decide: Callable[[str,str],Any]):
-        if not PYSIDE_AVAILABLE: raise RuntimeError("PySide6 required for permission dialog")
-        super().__init__(); self.request=request; self.decide=decide; self.setWindowTitle("GAIA permission request")
-        layout=QVBoxLayout(self); form=QFormLayout();
-        for key in ("action","risk","capability","target","scope","originating_task"):
-            form.addRow(key, QLabel(str(request.get(key,""))))
+    """Shows the exact Core action, scope and risk, without approving on close."""
+    def __init__(self, request: dict, decide: Callable[[dict, str], Any]):
+        if not PYSIDE_AVAILABLE:
+            raise RuntimeError("PySide6 required for permission dialog")
+        super().__init__()
+        self.request, self.decide = request, decide
+        self._answered = False
+        self.setWindowTitle("GAIA | Autorizar acción")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("GAIA solicita autorización para una acción en tu PC."))
+        form = QFormLayout()
+        raw = request.get("plan") or request.get("action") or {}
+        items = raw.get("actions", []) if isinstance(raw, dict) and "actions" in raw else [raw]
+        risk = max((int(x.get("risk_level", 0)) for x in items if isinstance(x, dict)), default=0)
+        options = request.get("confirmation_options") or {}
+        details = ", ".join(str(x.get("name") or x.get("action") or "desconocida")
+                            for x in items if isinstance(x, dict))[:300]
+        entries = request.get("permission_entries") or []
+        scopes = ", ".join(str(x.get("human_scope_description") or x.get("resource_scope") or "")
+                           for x in entries if isinstance(x, dict))[:400]
+        form.addRow("Acción:", QLabel(details or "Revisar la solicitud"))
+        form.addRow("Riesgo:", QLabel(str(risk)))
+        form.addRow("Alcance:", QLabel(scopes or "Sin alcance descriptivo: autorización puntual"))
+        form.addRow("ID:", QLabel(str(request.get("action_id") or "")[:50]))
         layout.addLayout(form)
-        for label,decision in (("ALLOW ONCE","ALLOW_ONCE"),("ALLOW SESSION/SCOPE","ALWAYS_ALLOW"),("DENY","DENY")):
-            b=QPushButton(label); b.clicked.connect(lambda _=False,d=decision:self._finish(d)); layout.addWidget(b)
-    def _finish(self, decision): self.decide(str(self.request.get("request_id","")),decision); self.accept()
+        once = QPushButton("Autorizar esta ejecución")
+        once.clicked.connect(lambda: self._finish("CONFIRM_ONCE"))
+        layout.addWidget(once)
+        if options.get("allow_always", False) and risk <= 2 and entries:
+            persistent = QPushButton("Guardar permiso para este alcance")
+            persistent.clicked.connect(lambda: self._finish("ALWAYS_ALLOW"))
+            layout.addWidget(persistent)
+        deny = QPushButton("Rechazar")
+        deny.clicked.connect(lambda: self._finish("DENY"))
+        layout.addWidget(deny)
+
+    def _finish(self, decision):
+        if self._answered:
+            return
+        self._answered = True
+        self.decide(self.request, decision)
+        self.accept()
+
+    def reject(self):
+        if not self._answered:
+            self._answered = True
+            self.decide(self.request, "DENY")
+        super().reject()
+
+
 class DesktopShell:
     def __init__(self, config: ShellConfig|None=None, api=None):
-        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
+        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self._permission_ids=set(); self._request_lock=threading.Lock(); self._capture_session=0; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
         self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._on_core_event)
         self.hotkey=GlobalHotkey(self._ptt_down,self._ptt_up,self.config.hotkey)
         self.capture=AudioCapture(self._on_captured_audio)
@@ -279,7 +320,10 @@ class DesktopShell:
     def _render_core_event(self,event):
         state=str(event.get("state") or event.get("event_type") or "IDLE").upper().replace(".","_")
         mapping={"USING_TOOL":"EXECUTING","SEARCHING_MEMORY":"THINKING","CORE_READY":"IDLE","CONNECTED":"IDLE"}; self._set_state(mapping.get(state,state if state in {"IDLE","LISTENING","TRANSCRIBING","THINKING","PLANNING","BROWSING","CODING","EXECUTING","SPEAKING","WAITING_PERMISSION","INTERRUPTED","SAFE_MODE","ERROR","OFFLINE"} else "IDLE"))
-        if state=="WAITING_PERMISSION" and PYSIDE_AVAILABLE: self._show_permission(event.get("metadata") or event)
+        if state=="WAITING_PERMISSION" and PYSIDE_AVAILABLE:
+            request = event.get("metadata") or event
+            if isinstance(request, dict) and request.get("action_id") and request.get("session_id"):
+                self._show_permission(request)
         if state=="IDLE" and self.config.orb_mode=="wake_only": self._hide_orb()
     def _icon(self):
         pix=QPixmap(32,32); pix.fill(QColor("#101828")); p=QPainter(pix); p.setBrush(QColor("#45d9ff")); p.setPen(QColor("#a98bff")); p.drawEllipse(5,5,22,22); p.end(); return QIcon(pix)
@@ -297,7 +341,7 @@ class DesktopShell:
             def paintEvent(inner,_):
                 p=QPainter(inner); p.setRenderHint(QPainter.Antialiasing); colors={"ERROR":"#ff526b","WAITING_PERMISSION":"#ffcc66","SAFE_MODE":"#aa8cff","LISTENING":"#55e6ff","THINKING":"#8f7cff","SPEAKING":"#65a8ff","OFFLINE":"#77808f","INTERRUPTED":"#ff8b5c"}; p.setBrush(QColor(colors.get(inner.state,"#277dff"))); p.setPen(Qt.NoPen); p.drawEllipse(8,8,inner.width()-16,inner.height()-16)
         self.orb=Orb(); self._position_orb(); self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu();
-        for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Grabar / finalizar voz",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
+        for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Grabar / finalizar voz",self.push_to_talk),("Estado Core / Acción",self.show_status),("PARAR ACCIONES",self.emergency_stop),("Reactivar acciones",self.resume_actions),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
         self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.hotkey.register(self.app);
         if self.config.wake_word and self._microphone_on: self._start_wake_word()
         if not hidden: self.show_quick()
@@ -326,7 +370,10 @@ class DesktopShell:
         threading.Thread(target=self._send_voice, args=(Path(audio_path),), daemon=True).start()
 
     def _send_voice(self, path):
+        acquired = self._request_lock.acquire(blocking=False)
         try:
+            if not acquired:
+                raise RuntimeError("GAIA ya procesa otra solicitud. Inténtalo al terminar.")
             if not self.api:
                 raise RuntimeError("Core unavailable")
             data = self.api.send_voice(path)
@@ -353,14 +400,27 @@ class DesktopShell:
                 self.signals.response.emit({"response": f"Error de voz: {type(exc).__name__}"})
                 self.signals.state.emit("ERROR")
         finally:
+            if acquired:
+                self._request_lock.release()
             path.unlink(missing_ok=True)
 
     def _start_wake_word(self):
         from wake_word import WakeWordListener
-        if self.wake is None:
-            self.wake = WakeWordListener(on_wake=self._on_wake_detected)
-        if not self.wake.running:
-            self.wake.start()
+        listener = self.wake or WakeWordListener(on_wake=self._on_wake_detected)
+        readiness = listener.health()
+        if readiness.get("status") not in {"GAIA_MODEL_READY", "WHISPER_FALLBACK"}:
+            self.config.wake_word = False
+            if self.tray is not None:
+                self.tray.showMessage("GAIA | Voz", "Falta el modelo de activación 'GAIA'. Usa Ctrl+Espacio para grabar.")
+            return
+        try:
+            if not listener.running:
+                listener.start()
+            self.wake = listener
+        except Exception as exc:
+            self.config.wake_word = False
+            if self.tray is not None:
+                self.tray.showMessage("GAIA | Voz", str(exc)[:200])
 
     def _stop_wake_word(self):
         if self.wake is not None:
@@ -390,9 +450,13 @@ class DesktopShell:
         self._show_orb()
         try:
             result = self.capture.start()
+            self._capture_session += 1
+            capture_session = self._capture_session
             self._set_state("LISTENING")
             if self.qt and self.app:
-                QTimer.singleShot(20000, lambda: (self.hotkey.dispatch('up') if self.hotkey._pressed else self._ptt_up()) if self.capture.recording else None)
+                QTimer.singleShot(20000, lambda: (
+                    self.hotkey.dispatch("up") if self.hotkey._pressed else self._ptt_up()
+                ) if self.capture.recording and capture_session == self._capture_session else None)
         except Exception as exc:
             self._set_state("ERROR")
             if self.config.wake_word and self._microphone_on:
@@ -431,6 +495,7 @@ class DesktopShell:
         layout.addWidget(inp)
         label = QLabel("")
         label.setWordWrap(True)
+        label.setTextFormat(Qt.PlainText)
         layout.addWidget(label)
         self.quick_result_label = label
 
@@ -444,7 +509,10 @@ class DesktopShell:
             self._set_state("THINKING")
 
             def worker():
+                acquired = self._request_lock.acquire(blocking=False)
                 try:
+                    if not acquired:
+                        raise RuntimeError("GAIA está procesando otra solicitud.")
                     if self.api is None:
                         raise RuntimeError("Core no disponible")
                     answer = self.api.send_assistant(message)
@@ -455,6 +523,9 @@ class DesktopShell:
                     if self.signals is not None:
                         self.signals.response.emit({"response": f"Error: {type(exc).__name__}: {exc}"})
                         self.signals.state.emit("ERROR")
+                finally:
+                    if acquired:
+                        self._request_lock.release()
             threading.Thread(target=worker, daemon=True).start()
 
         inp.returnPressed.connect(send)
@@ -469,7 +540,14 @@ class DesktopShell:
             return
         message = str(data.get("response") or data.get("message") or data.get("detail") or "Sin respuesta.")
         if data.get("confirmation_required"):
-            message += "\nAcción pendiente: revisa y aprueba el permiso correspondiente."
+            message += "\nAcción pendiente. Debes autorizarla o rechazarla."
+            if data.get("action_id") and data.get("session_id"):
+                self._show_permission(data)
+            else:
+                message += "\nFaltan los identificadores de autorización del Core."
+        elif data.get("status") in {"approved", "rejected"}:
+            message = ("Acción autorizada. El ejecutor de PC procesará la solicitud."
+                       if data.get("status") == "approved" else "Acción rechazada.")
         if self.quick_result_label is not None:
             self.quick_result_label.setText(message[:3000])
         if self.tray is not None and (
@@ -477,13 +555,114 @@ class DesktopShell:
         ):
             self.tray.showMessage("GAIA", message[:180])
 
-    def _show_permission(self,request): self.permission_dialog=PermissionDialog(request,self._submit_permission); self.permission_dialog.show()
-    def _submit_permission(self,request_id,decision):
-        if not self.api: return
-        try: self.api.confirm_permission(request_id,decision)
-        except Exception: self._set_state("ERROR")
-    def open_dashboard(self): webbrowser.open(self.config.core_url+"/api/visualizer")
-    def show_status(self): self.tray.showMessage("GAIA",f"State: {self.state}\nEvents: {self.events.connected}") if self.tray else None
+    def _show_permission(self, request):
+        if not isinstance(request, dict):
+            return
+        action_id = str(request.get("action_id") or "")
+        session_id = str(request.get("session_id") or "")
+        if not action_id or not session_id or action_id in self._permission_ids:
+            return
+        # A notification without the actual action plan is not enough to
+        # request informed consent; wait for the Core's complete response.
+        if not isinstance(request.get("action") or request.get("plan"), dict):
+            return
+        self._permission_ids.add(action_id)
+        dlg = PermissionDialog(request, self._submit_permission)
+        self.permission_dialog = dlg
+        dlg.finished.connect(lambda _, aid=action_id: self._permission_ids.discard(aid))
+        dlg.show()
+        dlg.raise_()
+
+    def _submit_permission(self, request, decision):
+        if not self.api:
+            return
+        action_id = str(request.get("action_id") or "")
+        session_id = str(request.get("session_id") or "")
+        if not action_id or not session_id:
+            return
+        self._set_state("EXECUTING" if decision != "DENY" else "IDLE")
+
+        def worker():
+            try:
+                result = self.api.confirm_permission(action_id, decision, session_id=session_id)
+                if self.signals is not None:
+                    self.signals.response.emit(result)
+                    self.signals.state.emit("IDLE")
+            except Exception as exc:
+                if self.signals is not None:
+                    self.signals.response.emit({"response": f"No se pudo registrar la autorización: {exc}"})
+                    self.signals.state.emit("ERROR")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_dashboard(self):
+        webbrowser.open(self.config.core_url + "/api/visualizer")
+
+    def show_status(self):
+        if not self.api:
+            self._show_response({"response": "Core no disponible"})
+            return
+
+        def worker():
+            try:
+                host = self.api.remote_action_host_status()
+                actions = self.api.actions_control_status()
+                message = (
+                    f"Core: conectado. Action Host: {'conectado' if host.get('online') else 'DESCONECTADO'}. "
+                    f"Acciones: {'ACTIVAS' if actions.get('enabled') else 'DESACTIVADAS'}. "
+                    f"Voz: {'activada' if self._microphone_on else 'desactivada'}."
+                )
+                if self.signals is not None:
+                    self.signals.response.emit({"response": message})
+            except Exception as exc:
+                if self.signals is not None:
+                    self.signals.response.emit({"response": f"Estado de GAIA no disponible: {exc}"})
+        threading.Thread(target=worker, daemon=True).start()
+
+    def emergency_stop(self):
+        if not self.api:
+            return
+        answer = QMessageBox.question(
+            None, "GAIA | Detener acciones",
+            "¿Desactivar las acciones y cancelar las solicitudes pendientes? "
+            "No detiene acciones que ya estén ejecutándose.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        def worker():
+            try:
+                result = self.api.kill_switch()
+                if self.signals is not None:
+                    self.signals.response.emit({"response": f"Acciones bloqueadas. Solicitudes canceladas: {result.get('pending_cancelled', 0)}."})
+                    self.signals.state.emit("SAFE_MODE")
+            except Exception as exc:
+                if self.signals is not None:
+                    self.signals.response.emit({"response": f"Error al detener acciones: {exc}"})
+        threading.Thread(target=worker, daemon=True).start()
+
+    def resume_actions(self):
+        if not self.api:
+            return
+        answer = QMessageBox.question(
+            None, "GAIA | Reactivar acciones",
+            "¿Permitir nuevamente que GAIA ejecute acciones autorizadas?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        def worker():
+            try:
+                result = self.api.enable_actions()
+                if self.signals is not None:
+                    self.signals.response.emit({"response": "Acciones reactivadas." if result.get("enabled") else "El Core mantiene las acciones desactivadas."})
+                    self.signals.state.emit("IDLE")
+            except Exception as exc:
+                if self.signals is not None:
+                    self.signals.response.emit({"response": f"No se pudieron reactivar las acciones: {exc}"})
+        threading.Thread(target=worker, daemon=True).start()
+
     def restart(self):
         self._exit_code = 75
         self.stop()

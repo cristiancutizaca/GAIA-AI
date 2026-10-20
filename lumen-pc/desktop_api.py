@@ -346,11 +346,31 @@ class LumenDesktopAPI:
         return self._request("DELETE", "/api/permissions", params={"capability": capability, "resource_scope": resource_scope, "device_id": device_id}, timeout=10.0).json()
 
     def confirm_permission(self, request_id: str, decision: str, *, session_id: str = "") -> dict:
-        """Submit a Core-owned approval; the shell never sets confirmed locally."""
-        return self._request("POST", "/api/actions/approve", json={
-            "action_id": str(request_id), "session_id": session_id or self.session_id,
-            "decision": str(decision).upper(),
+        """Send a Core-owned allow/reject request; DENY must never approve."""
+        action_id = str(request_id or "").strip()
+        target_session = str(session_id or self.session_id or "").strip()
+        normalized = str(decision or "").strip().upper()
+        if not action_id or not target_session:
+            raise LumenAPIError("Se requiere action_id y session_id de la solicitud original.")
+        if normalized in {"DENY", "REJECT", "CANCEL", "ALWAYS_DENY"}:
+            path, normalized = "/api/actions/reject", "DENY"
+        elif normalized in {"CONFIRM_ONCE", "ALLOW_ONCE", "ALWAYS_ALLOW"}:
+            path = "/api/actions/approve"
+            if normalized == "CONFIRM_ONCE":
+                normalized = ""  # Core treats the absence of a grant as one-time confirmation.
+        else:
+            raise LumenAPIError("Decisión de permiso no reconocida.")
+        return self._request("POST", path, json={
+            "action_id": action_id, "session_id": target_session,
+            "decision": normalized,
         }, timeout=10.0).json()
+
+    def remote_action_host_status(self) -> dict:
+        """Authenticated heartbeat state, not just local capability discovery."""
+        return self._request("GET", "/api/action-host/status", timeout=8.0).json()
+
+    def actions_control_status(self) -> dict:
+        return self._request("GET", "/api/actions/control", timeout=8.0).json()
 
     def confirm_action(self, action_data: dict, engine: ActionEngine | None = None, permission_decision: str | None = None) -> dict:
         """Execute a previously previewed action/plan through the separated PC Action Host."""

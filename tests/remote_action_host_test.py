@@ -61,6 +61,19 @@ with tempfile.TemporaryDirectory(prefix="gaia_remote_host_") as tmp:
         assert unapproved.status_code == 200
         denied_claim = client.post("/api/actions/claim", headers=host, json={"action_id": unapproved.json()["action_id"], "session_id": unapproved.json()["session_id"]})
         assert denied_claim.status_code == 409
+        # Important regression: approving with a negative decision must NEVER
+        # make the pending action executable by the remote host.
+        bogus_approval = client.post("/api/actions/approve", headers=android, json={
+            "action_id": unapproved.json()["action_id"],
+            "session_id": unapproved.json()["session_id"],
+            "decision": "DENY",
+        })
+        assert bogus_approval.status_code == 422, bogus_approval.text
+        assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
+        assert client.post("/api/actions/claim", headers=host, json={
+            "action_id": unapproved.json()["action_id"],
+            "session_id": unapproved.json()["session_id"],
+        }).status_code == 409
         assert client.post("/api/actions/reject", headers=android, json={"action_id": unapproved.json()["action_id"], "session_id": unapproved.json()["session_id"]}).status_code == 200
 
 print("REMOTE ACTION HOST TEST OK: separate Android owner, heartbeat, explicit approval, PC claim, verified completion and unapproved claim rejection.")

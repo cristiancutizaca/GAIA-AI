@@ -79,6 +79,41 @@ mientras la sesión de usuario esté activa; puede seguir escuchando órdenes
 de texto con el sistema desbloqueado. No sortea bloqueo de pantalla/UAC ni
 ventanas seguras de Windows.
 
+## Confirmaciones y botón de emergencia
+
+Cuando una orden solicita una acción que no fue autorizada automáticamente,
+GAIA muestra una ventana con **acción, riesgo y alcance**. Las opciones son
+**autorizar esta ejecución**, **rechazar**, y, solo cuando el Core lo permite,
+**guardar el permiso para ese alcance**. Cerrar la ventana equivale a rechazar.
+El Shell no puede concederse permisos de administrador ni elevar privilegios.
+
+Desde la bandeja del sistema:
+- **Estado Core / Acción** comprueba que Core esté disponible, que PC Action
+  Host publique heartbeat y que las acciones estén habilitadas.
+- **PARAR ACCIONES** llama al Kill Switch del Core. Desactiva nuevas acciones
+  y cancela solicitudes pendientes, pero **no puede deshacer una acción ya
+  ejecutada ni detener de forma instantánea una acción en progreso**.
+- **Reactivar acciones** requiere confirmación explícita del usuario.
+
+Antes de usar comandos sobre archivos reales ejecuta una prueba no destructiva,
+como abrir una aplicación conocida. Si ves «Action Host DESCONECTADO», no
+consideres completada la instalación.
+
+El diagnóstico muestra por separado
+`ready_for_desktop`, `ready_for_chat` y `ready_for_pc_actions`. Una
+interfaz funcional **no** significa que Ollama o el ejecutor de Windows
+estén listos.
+
+### Comprobación de regresión local
+
+```powershell
+.\.venv\Scripts\python.exe tests\resident_runtime_test.py
+.\.venv\Scripts\python.exe tools\gaia_resident_doctor.py --json
+```
+
+Las pruebas automatizadas **no** sustituyen comprobar confirmaciones, bloqueo
+de acciones, micrófono y control de aplicaciones en el PC real.
+
 ## Pruebas pendientes sobre hardware real
 
 - Instalación de PySide6/Whisper en el PC de destino.

@@ -1630,6 +1630,8 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
         valid_decisions = {"ALLOW_ONCE", "ALWAYS_ALLOW", "ASK", "ALWAYS_ASK", "DENY", "ALWAYS_DENY"}
         if decision and decision not in valid_decisions:
             raise HTTPException(status_code=422, detail="Decisión de permiso inválida.")
+        if decision in {"DENY", "ALWAYS_DENY", "ASK", "ALWAYS_ASK"}:
+            raise HTTPException(status_code=422, detail="No se puede aprobar una acción con una decisión de rechazo o consulta. Usa /actions/reject.")
         pending_intent = pending.get("intent") if isinstance(pending.get("intent"), dict) else {}
         intents = pending_intent.get("actions", []) if pending_intent.get("type") == "plan" else [pending_intent]
         permission_ids: list[int] = []

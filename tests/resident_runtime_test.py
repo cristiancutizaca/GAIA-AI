@@ -92,8 +92,84 @@ def test_wiring():
     assert "lumen-pc\\gui.py" not in starter
 
 
+
+def test_permission_endpoint_routing():
+    """Exercise the real API method without loading audio/Windows dependencies."""
+    import ast
+    source = (ROOT / "lumen-pc" / "desktop_api.py").read_text(encoding="utf-8")
+    module_ast = ast.parse(source)
+    api_class = next(n for n in module_ast.body if isinstance(n, ast.ClassDef) and n.name == "LumenDesktopAPI")
+    method = next(n for n in api_class.body if isinstance(n, ast.FunctionDef) and n.name == "confirm_permission")
+    method.decorator_list = []
+    method.returns = None
+    for arg in method.args.args + method.args.kwonlyargs:
+        arg.annotation = None
+    namespace = {"LumenAPIError": type("LumenAPIError", (RuntimeError,), {})}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[])),
+                 "<confirm_permission>", "exec"), namespace)
+    calls = []
+
+    class Fake:
+        session_id = "session-123"
+        def _request(self, method, path, **kwargs):
+            calls.append((method, path, kwargs["json"]))
+            class Response:
+                def json(self): return {"status": "ok"}
+            return Response()
+
+    fake = Fake()
+    confirm = namespace["confirm_permission"]
+    confirm(fake, "act1", "CONFIRM_ONCE", session_id="session-456")
+    assert calls[-1] == ("POST", "/api/actions/approve",
+                         {"action_id": "act1", "session_id": "session-456", "decision": ""})
+    confirm(fake, "act1", "DENY", session_id="session-456")
+    assert calls[-1][1] == "/api/actions/reject", "DENY must not approve actions"
+    confirm(fake, "act1", "ALWAYS_ALLOW", session_id="session-456")
+    assert calls[-1][2]["decision"] == "ALWAYS_ALLOW"
+    total = len(calls)
+    for action_id, decision in [("", "CONFIRM_ONCE"), ("act2", "ANYTHING")]:
+        try:
+            confirm(fake, action_id, decision, session_id="session-456")
+        except namespace["LumenAPIError"]:
+            pass
+        else:
+            raise AssertionError("Malformed approval request was accepted")
+    assert len(calls) == total
+
+
+def test_microphone_off():
+    from desktop_shell import DesktopShell, ShellConfig
+    shell = DesktopShell(ShellConfig(microphone=True, wake_word=False), api=object())
+    stops = []
+    class Capture:
+        def stop(self, *, deliver=True):
+            stops.append(("capture", deliver))
+    class Wake:
+        def stop(self):
+            stops.append(("wake", False))
+    shell.capture = Capture()
+    shell.wake = Wake()
+    shell.toggle_mic()
+    assert shell.health()["microphone"] is False
+    assert stops == [("capture", False), ("wake", False)]
+    assert shell.wake is None
+
+
+def test_confirmation_ui_wiring():
+    shell_code = (ROOT / "lumen-pc" / "desktop_shell.py").read_text(encoding="utf-8")
+    assert 'self._show_permission(data)' in shell_code
+    assert 'session_id=session_id' in shell_code
+    assert 'self.decide(self.request, "DENY")' in shell_code
+    assert 'self.api.kill_switch()' in shell_code
+    assert 'self._request_lock.acquire(blocking=False)' in shell_code
+    wake_code = (ROOT / "lumen-pc" / "wake_word.py").read_text(encoding="utf-8")
+    assert "if not self.running:" in wake_code
+
 if __name__ == "__main__":
     test_capture()
     test_hotkey()
     test_wiring()
+    test_permission_endpoint_routing()
+    test_microphone_off()
+    test_confirmation_ui_wiring()
     print("RESIDENT RUNTIME CONTRACT PASS")
