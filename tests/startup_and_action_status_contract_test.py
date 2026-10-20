@@ -82,7 +82,12 @@ def test_verified_action_result():
     ]
     result = action_result(client, "action-001", "session-001")
     assert result["success"] is True and result["execution_verified"] is True
+    assert result["outcome_verified"] is True
     assert result["response"] == "Calculadora abierta"
+    client.rows = [{"action_id": "action-001", "status": "SUCCESS", "success": 1,
+                    "result": {"natural_response": "Diagnóstico completado", "observation_completed": True}}]
+    observation = action_result(client, "action-001", "session-001")
+    assert observation["execution_verified"] is False and observation["outcome_verified"] is True
     client.rows = [{"action_id": "action-001", "status": "FAILED", "success": 0,
                     "result": {"message": "App no encontrada", "execution_verified": False}}]
     result = action_result(client, "action-001", "session-001")

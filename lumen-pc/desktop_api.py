@@ -401,6 +401,10 @@ class LumenDesktopAPI:
                 "success": bool(row.get("success")),
                 "response": str(result.get("natural_response") or result.get("message") or ""),
                 "execution_verified": bool(result.get("execution_verified")),
+                "outcome_verified": bool(
+                    result.get("execution_verified") or result.get("effect_verified")
+                    or result.get("observation_completed")
+                ),
             }
         return None
 

@@ -607,7 +607,7 @@ class DesktopShell:
                         result = self.api.action_result(action_id, session_id)
                         errors = 0
                         if result is not None:
-                            if result.get("execution_verified") and result.get("success"):
+                            if result.get("outcome_verified") and result.get("success"):
                                 output = "Acción verificada: " + (result.get("response") or "completada correctamente.")
                             else:
                                 output = "Acción terminada sin éxito verificado: " + (
