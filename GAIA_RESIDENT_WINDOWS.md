@@ -16,8 +16,8 @@ físicas del micrófono o la GPU.
 
    El instalador conserva tu `.env` y los datos. Si el secreto existente es
    fuerte no lo reemplaza. No compartas ese archivo ni el token del Action Host.
-   DeepSeek Harness se instala como componente opcional heredado. El backend
-   predeterminado es Ollama: no requiere instalar DeepSeek para responder.
+   DeepSeek Harness **no** se instala salvo que agregues \`-InstallHarness\`.
+   El backend predeterminado es Ollama y no requiere Harness para responder.
 3. Instala Ollama por separado, inicia su servidor y descarga el modelo que
    hayas configurado en `LUMEN_LLM_MODEL`. Consulta modelos instalados con
    `ollama list`. No se garantiza aceleración AMD hasta ver `ollama ps`.

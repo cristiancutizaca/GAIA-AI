@@ -2,6 +2,7 @@
 param(
     [switch]$GenerateSecret,
     [switch]$SkipPipUpgrade,
+    [switch]$InstallHarness,
     [switch]$NoDoctor,
     [switch]$PlanMigration,
     [switch]$CreateMigrationSnapshot,
@@ -137,7 +138,9 @@ try {
     foreach ($optionalFile in $profileFiles[$Profile]) {
         Invoke-Checked -FilePath $VenvPython -Arguments @('-m','pip','install','--no-build-isolation','-r',(Join-Path $Root $optionalFile)) -Description "Instalar perfil opcional $optionalFile"
     }
-    Invoke-Checked -FilePath 'powershell.exe' -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'install-deepseek-harness.ps1')) -Description 'Instalar DeepSeek-Harness fijado para GAIA'
+    if ($InstallHarness) {
+        Invoke-Checked -FilePath 'powershell.exe' -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'install-deepseek-harness.ps1')) -Description 'Instalar DeepSeek-Harness opcional para GAIA'
+    }
 
     if (-not $ApplyMigration) { Ensure-EnvFile }
 
