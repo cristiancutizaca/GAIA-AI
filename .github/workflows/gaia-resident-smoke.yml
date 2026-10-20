@@ -1,0 +1,33 @@
+name: GAIA resident smoke
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lumen-pc/desktop_shell.py"
+      - "lumen-pc/gaia_desktop_launcher.py"
+      - "tests/resident_runtime_test.py"
+      - "tools/gaia_resident_doctor.py"
+      - "start-gaia.bat"
+      - "install-gaia.ps1"
+      - "requirements-desktop.txt"
+      - ".github/workflows/gaia-resident-smoke.yml"
+  workflow_dispatch:
+
+jobs:
+  resident-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal test dependencies
+        run: python -m pip install python-dotenv httpx
+      - name: Compile changed Python modules
+        run: python -m py_compile lumen-pc/desktop_shell.py lumen-pc/gaia_desktop_launcher.py tools/gaia_resident_doctor.py tests/resident_runtime_test.py
+      - name: Run resident runtime contracts
+        run: python tests/resident_runtime_test.py

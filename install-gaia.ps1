@@ -129,6 +129,7 @@ try {
     Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '--no-build-isolation', '-r', (Join-Path $Root 'lumen-core\requirements.txt')) -Description 'Instalar dependencias del Core'
     Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '--no-build-isolation', '-r', (Join-Path $Root 'lumen-pc\requirements.txt')) -Description 'Instalar dependencias PC'
     Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '--no-build-isolation', '-r', (Join-Path $Root 'lumen-pc\requirements-windows.txt')) -Description 'Instalar dependencias Windows, audio y adapters'
+    Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '-r', (Join-Path $Root 'requirements-desktop.txt')) -Description 'Instalar interfaz residente PySide6'
     $profileFiles = @{
         voice=@('requirements-voice.txt'); browser=@('requirements-browser.txt'); coding=@('requirements-coding.txt'); computer=@('requirements-computer.txt'); memory=@('requirements-memory.txt')
         standard=@(); minimal=@(); full=@('requirements-voice.txt','requirements-browser.txt','requirements-coding.txt','requirements-memory.txt'); all=@('requirements-voice.txt','requirements-browser.txt','requirements-coding.txt','requirements-computer.txt','requirements-memory.txt')
@@ -169,7 +170,7 @@ try {
 
     $importCheck = @(
         'fastapi', 'httpx', 'dotenv', 'sounddevice', 'numpy', 'PIL', 'psutil',
-        'edge_tts', 'whisper', 'comtypes', 'pycaw'
+        'edge_tts', 'whisper', 'comtypes', 'pycaw', 'PySide6'
     ) -join ','
     $importProbe = "import importlib.util,sys; names='$importCheck'.split(','); missing=[n for n in names if importlib.util.find_spec(n) is None]; print('Faltan imports: '+', '.join(missing)) if missing else print('Import check OK'); sys.exit(1 if missing else 0)"
     Invoke-Checked -FilePath $VenvPython -Arguments @('-c', $importProbe) -Description 'Verificar imports Core/PC/Windows'

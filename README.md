@@ -55,3 +55,10 @@ La siguiente tabla es el índice cruzado que valida el package gate:
 | Requisitos y operación | `RC6_REQUIREMENTS.md`, `PERFORMANCE_RC6_REPORT.md`, `PERFORMANCE_COMPARISON_RC5_RC6.md`, `PHYSICAL_VALIDATION_RC6.md`, `WINDOWS_RC6_VALIDATION_CHECKLIST.md`, `MIGRATION_MATRIX_RC5_RC6.md`, `RELEASE_DECISION_RC6.md`, `UPDATE_ROLLBACK_GUIDE.md`, `DOCUMENT_CLASSIFICATION_RC6.md` |
 | Entrypoints | `install-gaia.ps1`, `validate-gaia-rc6.ps1`, `setup-windows.bat`, `tools/validate_rc6.py`, `tools/build_release.py`, `tools/build_docs.py`, `tools/gaia_migrate.py`, `tools/gaia_benchmark.py`, `tools/physical_validation.py` |
 | Contratos | `tests/release_package_test.py`, `tests/rc6_identity_documentation_test.py`, `tests/rc6_document_parity_test.py`, `tests/rc6_validation_runner_test.py`, `tests/rc6_validation_runner_contract_test.py`, `tests/rc6_physical_validation_test.py`, `tests/rc6_migrator_cli_contract_test.py`, `tests/rc6_powershell_wrapper_contract_test.py`, `tests/rc6_benchmark_contract_test.py`, `tests/rc6_builder_contract_test.py` |
+
+
+## GAIA 2.0 - Asistente residente para Windows
+
+La instalación, el inicio con Windows, el micrófono y el control local de PC
+se documentan en [GAIA_RESIDENT_WINDOWS.md](GAIA_RESIDENT_WINDOWS.md).
+Los capítulos anteriores son documentación histórica del contrato RC6.

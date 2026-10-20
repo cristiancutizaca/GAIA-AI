@@ -1,17 +1,18 @@
 """GAIA resident Desktop Shell. UI is never an authority boundary."""
 from __future__ import annotations
-import ctypes, json, os, platform, queue, sys, tempfile, threading, time, uuid, webbrowser
+import ctypes, json, os, platform, sys, tempfile, threading, time, wave, webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 try:
-    from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+    from PySide6.QtCore import QObject, Qt, QTimer, Signal, QAbstractNativeEventFilter
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
     from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False
     class QObject: pass
+    class QAbstractNativeEventFilter: pass
     class Signal:
         def __init__(self,*a,**k): pass
     QAction=QColor=QIcon=QPainter=QPixmap=QApplication=QDialog=QFormLayout=QLabel=QLineEdit=QMenu=QPushButton=QSystemTrayIcon=QVBoxLayout=QWidget=None
@@ -23,6 +24,8 @@ try:
     import sounddevice as sd
 except ImportError:
     sd = None
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / '.env', override=False)
 CORE_DEFAULT = os.getenv("LUMEN_CORE_URL", "http://127.0.0.1:8090").rstrip("/")
 @dataclass
 class ShellConfig:
@@ -65,34 +68,182 @@ class DesktopEventClient:
         if self.thread and self.thread is not threading.current_thread(): self.thread.join(timeout=2)
         self.thread=None; self.connected=False
 class GlobalHotkey:
-    """Testable registration boundary; Win32 RegisterHotKey in production."""
-    def __init__(self, on_down: Callable[[],None], on_up: Callable[[],None], key: str="Ctrl+Space"):
-        self.on_down=on_down; self.on_up=on_up; self.key=key; self.registered=False; self._pressed=False
-    def register(self):
-        if platform.system()=="Windows":
-            self.registered=True; return {"status":"REGISTERED","backend":"RegisterHotKey","key":self.key}
-        self.registered=False; return {"status":"PHYSICAL_WINDOWS_VALIDATION_PENDING","backend":"win32","key":self.key}
+    """Real Win32 global hotkey; press once to record, again to send.
+
+    This is deliberately a *toggle*, not fake key-up notifications. The
+    Windows RegisterHotKey API only delivers WM_HOTKEY, not key-release.
+    """
+    MODIFIERS = {"CTRL": 0x2, "CONTROL": 0x2, "ALT": 0x1, "SHIFT": 0x4, "WIN": 0x8}
+
+    def __init__(self, on_down: Callable[[], None], on_up: Callable[[], None], key: str = "Ctrl+Space"):
+        self.on_down, self.on_up, self.key = on_down, on_up, key
+        self.registered = False
+        self._pressed = False
+        self._filter = None
+        self._app = None
+        self._id = 0x4741
+
+    @classmethod
+    def _parse(cls, key: str) -> tuple[int, int]:
+        parts = [x.strip().upper() for x in key.split("+") if x.strip()]
+        if len(parts) < 2:
+            raise ValueError("Se requiere al menos un modificador y una tecla")
+        mods = 0
+        for p in parts[:-1]:
+            if p not in cls.MODIFIERS:
+                raise ValueError("Modificador no compatible: " + p)
+            mods |= cls.MODIFIERS[p]
+        last = parts[-1]
+        if last == "SPACE":
+            vk = 0x20
+        elif len(last) == 1 and last.isascii() and last.isalnum():
+            vk = ord(last)
+        elif last.startswith("F") and last[1:].isdigit() and 1 <= int(last[1:]) <= 12:
+            vk = 0x70 + int(last[1:]) - 1
+        else:
+            raise ValueError("Tecla no compatible: " + last)
+        return mods | 0x4000, vk  # MOD_NOREPEAT
+
+    def register(self, app=None):
+        if platform.system() != "Windows" or not PYSIDE_AVAILABLE or app is None:
+            return {"status": "UNAVAILABLE", "reason": "requires Windows and Qt"}
+        mods, vk = self._parse(self.key)
+        user32 = ctypes.windll.user32
+        if not user32.RegisterHotKey(None, self._id, mods, vk):
+            return {"status": "UNAVAILABLE", "reason": "shortcut in use"}
+        owner = self
+
+        class NativeFilter(QAbstractNativeEventFilter):
+            def nativeEventFilter(self, event_type, message):
+                if bytes(event_type) == b"windows_generic_MSG":
+                    from ctypes import wintypes
+
+                    class POINT(ctypes.Structure):
+                        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+                    class MSG(ctypes.Structure):
+                        _fields_ = [
+                            ("hwnd", wintypes.HWND), ("message", wintypes.UINT),
+                            ("wParam", wintypes.WPARAM), ("lParam", wintypes.LPARAM),
+                            ("time", wintypes.DWORD), ("pt", POINT),
+                        ]
+                    msg = MSG.from_address(int(message))
+                    if msg.message == 0x0312 and msg.wParam == owner._id:
+                        owner.dispatch("up" if owner._pressed else "down")
+                        return True, 0
+                return False, 0
+
+        try:
+            self._filter = NativeFilter()
+            self._app = app
+            app.installNativeEventFilter(self._filter)
+            self.registered = True
+            return {"status": "REGISTERED", "backend": "RegisterHotKey", "key": self.key}
+        except Exception:
+            user32.UnregisterHotKey(None, self._id)
+            self._filter = None
+            raise
+
     def dispatch(self, event: str):
-        if not self.registered: return False
-        if event=="down" and not self._pressed: self._pressed=True; self.on_down(); return True
-        if event=="up" and self._pressed: self._pressed=False; self.on_up(); return True
+        if not self.registered:
+            return False
+        if event == "down" and not self._pressed:
+            self._pressed = True
+            self.on_down()
+            return True
+        if event == "up" and self._pressed:
+            self._pressed = False
+            self.on_up()
+            return True
         return False
-    def unregister(self): self.registered=False; self._pressed=False
+
+    def unregister(self):
+        if self.registered and platform.system() == "Windows":
+            ctypes.windll.user32.UnregisterHotKey(None, self._id)
+        if self._filter is not None and self._app is not None:
+            self._app.removeNativeEventFilter(self._filter)
+        self._filter = None
+        self._app = None
+        self.registered = False
+        self._pressed = False
+
+
 class AudioCapture:
-    def __init__(self, on_audio: Callable[[Path],Any]): self.on_audio=on_audio; self.recording=False; self._audio=None
+    """Record 16 kHz mono PCM and hand a finalized WAV to the voice API."""
+    def __init__(self, on_audio: Callable[[Path], Any]):
+        self.on_audio = on_audio
+        self.recording = False
+        self._stream = None
+        self._chunks: list[bytes] = []
+        self._frames = 0
+        self._lock = threading.Lock()
+
     def start(self):
-        if sd is None: raise RuntimeError("sounddevice unavailable")
-        self.recording=True; self._audio=[]
-        def worker():
-            try:
-                self._audio.append(sd.rec(int(8*16000),samplerate=16000,channels=1,dtype="int16")); sd.wait()
-            except Exception: self.recording=False
-        threading.Thread(target=worker,daemon=True).start(); return {"status":"CAPTURING"}
-    def stop(self):
-        if sd is None: return {"status":"UNAVAILABLE"}
-        try: sd.stop()
-        finally: self.recording=False
-        return {"status":"FINALIZED"}
+        if sd is None:
+            raise RuntimeError("sounddevice unavailable")
+        if self.recording:
+            return {"status": "ALREADY_CAPTURING"}
+        with self._lock:
+            self._chunks.clear()
+            self._frames = 0
+
+        def callback(indata, frames, _time, status):
+            with self._lock:
+                if self.recording and self._frames < 16000 * 20:
+                    self._chunks.append(indata.tobytes())
+                    self._frames += frames
+
+        stream = sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                                blocksize=1600, callback=callback)
+        self.recording = True
+        try:
+            stream.start()
+        except Exception:
+            self.recording = False
+            stream.close()
+            raise
+        self._stream = stream
+        return {"status": "CAPTURING"}
+
+    def stop(self, *, deliver: bool = True):
+        if not self.recording and self._stream is None:
+            return {"status": "IDLE"}
+        self.recording = False
+        stream, self._stream = self._stream, None
+        try:
+            if stream is not None:
+                stream.stop()
+                stream.close()
+        finally:
+            with self._lock:
+                pcm = b"".join(self._chunks)
+                self._chunks.clear()
+                self._frames = 0
+        if not deliver or len(pcm) < 16000 // 4 * 2:
+            return {"status": "DISCARDED"}
+        handle = tempfile.NamedTemporaryFile(prefix="gaia_voice_", suffix=".wav", delete=False)
+        path = Path(handle.name)
+        handle.close()
+        try:
+            with wave.open(str(path), "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(16000)
+                out.writeframes(pcm)
+            self.on_audio(path)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return {"status": "FINALIZED", "path": str(path)}
+
+
+class ShellSignals(QObject if PYSIDE_AVAILABLE else object):
+    if PYSIDE_AVAILABLE:
+        event = Signal(object)
+        voice_captured = Signal(str)
+        state = Signal(str)
+        response = Signal(object)
+
 class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
     def __init__(self, request: dict, decide: Callable[[str,str],Any]):
         if not PYSIDE_AVAILABLE: raise RuntimeError("PySide6 required for permission dialog")
@@ -106,7 +257,10 @@ class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
     def _finish(self, decision): self.decide(str(self.request.get("request_id","")),decision); self.accept()
 class DesktopShell:
     def __init__(self, config: ShellConfig|None=None, api=None):
-        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._on_core_event); self.hotkey=GlobalHotkey(self._ptt_down,self._ptt_up,self.config.hotkey); self.capture=AudioCapture(self._on_captured_audio)
+        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
+        self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._on_core_event)
+        self.hotkey=GlobalHotkey(self._ptt_down,self._ptt_up,self.config.hotkey)
+        self.capture=AudioCapture(self._on_captured_audio)
         if self.api is None:
             try:
                 from desktop_api import LumenDesktopAPI; self.api=LumenDesktopAPI(base_url=self.config.core_url,secret=self.config.secret or os.getenv("LUMEN_SECRET","lumen-dev-key"))
@@ -117,6 +271,12 @@ class DesktopShell:
         if self.orb is not None: self.orb.set_state(self.state)
         if self.tray is not None: self.tray.setToolTip(f"GAIA — {self.state}")
     def _on_core_event(self,event):
+        if self.signals is not None:
+            self.signals.event.emit(event)
+            return
+        self._render_core_event(event)
+
+    def _render_core_event(self,event):
         state=str(event.get("state") or event.get("event_type") or "IDLE").upper().replace(".","_")
         mapping={"USING_TOOL":"EXECUTING","SEARCHING_MEMORY":"THINKING","CORE_READY":"IDLE","CONNECTED":"IDLE"}; self._set_state(mapping.get(state,state if state in {"IDLE","LISTENING","TRANSCRIBING","THINKING","PLANNING","BROWSING","CODING","EXECUTING","SPEAKING","WAITING_PERMISSION","INTERRUPTED","SAFE_MODE","ERROR","OFFLINE"} else "IDLE"))
         if state=="WAITING_PERMISSION" and PYSIDE_AVAILABLE: self._show_permission(event.get("metadata") or event)
@@ -126,14 +286,19 @@ class DesktopShell:
     def start(self,hidden=True):
         if not PYSIDE_AVAILABLE: raise RuntimeError("PySide6 is required for resident shell; install requirements-desktop.txt")
         self.app=QApplication.instance() or QApplication(sys.argv); self.app.setQuitOnLastWindowClosed(False); self.qt=True; shell=self
+        self.signals=ShellSignals()
+        self.signals.event.connect(self._render_core_event)
+        self.signals.voice_captured.connect(self._handle_voice)
+        self.signals.state.connect(self._set_state)
+        self.signals.response.connect(self._show_response)
         class Orb(QWidget):
             def __init__(inner): super().__init__(); inner.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus); inner.setAttribute(Qt.WA_TranslucentBackground); inner.resize(shell.config.orb_size,shell.config.orb_size); inner.state="SLEEPING"
             def set_state(inner,state): inner.state=state; inner.update()
             def paintEvent(inner,_):
                 p=QPainter(inner); p.setRenderHint(QPainter.Antialiasing); colors={"ERROR":"#ff526b","WAITING_PERMISSION":"#ffcc66","SAFE_MODE":"#aa8cff","LISTENING":"#55e6ff","THINKING":"#8f7cff","SPEAKING":"#65a8ff","OFFLINE":"#77808f","INTERRUPTED":"#ff8b5c"}; p.setBrush(QColor(colors.get(inner.state,"#277dff"))); p.setPen(Qt.NoPen); p.drawEllipse(8,8,inner.width()-16,inner.height()-16)
         self.orb=Orb(); self._position_orb(); self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu();
-        for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Push-to-talk",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
-        self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.hotkey.register();
+        for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Grabar / finalizar voz",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
+        self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.hotkey.register(self.app);
         if self.config.wake_word and self._microphone_on: self._start_wake_word()
         if not hidden: self.show_quick()
         return self
@@ -145,34 +310,163 @@ class DesktopShell:
         if self.orb and self.config.orb_mode!="hidden": self.orb.show(); self.orb.raise_()
     def _hide_orb(self):
         if self.orb and self.config.orb_mode!="always_visible": self.orb.hide()
-    def _on_wake_detected(self,audio_path): self._show_orb(); self._set_state("LISTENING"); threading.Thread(target=self._send_voice,args=(Path(audio_path),),daemon=True).start()
-    def _send_voice(self,path):
+    def _on_wake_detected(self, audio_path):
+        if not self._microphone_on or self._shutdown.is_set():
+            Path(audio_path).unlink(missing_ok=True)
+            return
+        if self.signals is not None:
+            self.signals.voice_captured.emit(str(audio_path))
+
+    def _handle_voice(self, audio_path):
+        if not self._microphone_on or self._shutdown.is_set():
+            Path(audio_path).unlink(missing_ok=True)
+            return
+        self._show_orb()
+        self._set_state("TRANSCRIBING")
+        threading.Thread(target=self._send_voice, args=(Path(audio_path),), daemon=True).start()
+
+    def _send_voice(self, path):
         try:
-            data=self.api.send_voice(path) if self.api else None
-            if data: self._set_state("SPEAKING" if data.get("audio_url") else "THINKING")
-        except Exception: self._set_state("ERROR")
-        finally: path.unlink(missing_ok=True)
+            if not self.api:
+                raise RuntimeError("Core unavailable")
+            data = self.api.send_voice(path)
+            if self.signals is not None:
+                self.signals.response.emit(data)
+            answer = str(data.get("response") or data.get("message") or "").strip()
+            if answer and os.getenv("GAIA_SPEAK_RESPONSES", "true").lower() in {"true", "1", "yes"}:
+                from desktop_api import play_audio
+                if self.signals is not None:
+                    self.signals.state.emit("SPEAKING")
+                play_audio(self.api.request_tts(answer[:1500]))
+            if self.signals is not None:
+                self.signals.state.emit("IDLE")
+        except Exception as exc:
+            if self.signals is not None:
+                self.signals.response.emit({"response": f"Error de voz: {type(exc).__name__}"})
+                self.signals.state.emit("ERROR")
+        finally:
+            path.unlink(missing_ok=True)
+
     def _start_wake_word(self):
         from wake_word import WakeWordListener
-        if self.wake is None: self.wake=WakeWordListener(on_wake=self._on_wake_detected); self.wake.start()
-    def toggle_wake(self): self.config.wake_word=not self.config.wake_word; self._start_wake_word() if self.config.wake_word and self._microphone_on else (self.wake.stop() if self.wake else None)
-    def toggle_mic(self): self._microphone_on=not self._microphone_on; self._set_state("SLEEPING" if not self._microphone_on else "IDLE");
-    def _ptt_down(self): self._show_orb(); self._set_state("LISTENING"); self.capture.start()
-    def _ptt_up(self): self.capture.stop()
-    def push_to_talk(self): self._ptt_down()
-    def _on_captured_audio(self,path): self._on_wake_detected(path)
+        if self.wake is None:
+            self.wake = WakeWordListener(on_wake=self._on_wake_detected)
+        if not self.wake.running:
+            self.wake.start()
+
+    def _stop_wake_word(self):
+        if self.wake is not None:
+            self.wake.stop()
+            self.wake = None
+
+    def toggle_wake(self):
+        self.config.wake_word = not self.config.wake_word
+        if self.config.wake_word and self._microphone_on:
+            self._start_wake_word()
+        else:
+            self._stop_wake_word()
+
+    def toggle_mic(self):
+        self._microphone_on = not self._microphone_on
+        if not self._microphone_on:
+            self.capture.stop(deliver=False)
+            self._stop_wake_word()
+        elif self.config.wake_word and self.qt:
+            self._start_wake_word()
+        self._set_state("SLEEPING" if not self._microphone_on else "IDLE")
+
+    def _ptt_down(self):
+        if not self._microphone_on:
+            return
+        self._stop_wake_word()  # Avoid simultaneous ownership of the microphone.
+        self._show_orb()
+        try:
+            result = self.capture.start()
+            self._set_state("LISTENING")
+            if self.qt and self.app:
+                QTimer.singleShot(20000, lambda: (self.hotkey.dispatch('up') if self.hotkey._pressed else self._ptt_up()) if self.capture.recording else None)
+        except Exception as exc:
+            self._set_state("ERROR")
+            if self.config.wake_word and self._microphone_on:
+                self._start_wake_word()
+            if self.tray:
+                self.tray.showMessage("GAIA", str(exc))
+
+    def _ptt_up(self):
+        if self.capture.recording:
+            self.capture.stop()
+        if self.config.wake_word and self._microphone_on:
+            self._start_wake_word()
+
+    def push_to_talk(self):
+        if self.capture.recording:
+            self._ptt_up()
+        else:
+            self._ptt_down()
+
+    def _on_captured_audio(self,path):
+        self._on_wake_detected(path)
+
     def show_quick(self):
-        if not self.qt: return
-        if self.quick_command_window: self.quick_command_window.show(); return
-        w=QWidget(); w.setWindowTitle("GAIA Quick Command"); layout=QVBoxLayout(w); layout.addWidget(QLabel("GAIA")); inp=QLineEdit(); inp.setPlaceholderText("What do you need?"); layout.addWidget(inp)
+        if not self.qt:
+            return
+        if self.quick_command_window:
+            self.quick_command_window.show()
+            self.quick_command_window.raise_()
+            return
+        w = QWidget()
+        w.setWindowTitle("GAIA - Comandos")
+        layout = QVBoxLayout(w)
+        layout.addWidget(QLabel("GAIA | Asistente personal"))
+        inp = QLineEdit()
+        inp.setPlaceholderText("¿Qué necesitas que haga?")
+        layout.addWidget(inp)
+        label = QLabel("")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.quick_result_label = label
+
         def send():
-            text=inp.text().strip()
-            if not text:return
-            self._show_orb(); self._set_state("THINKING")
-            try: self.api.send_message(text) if self.api else (_ for _ in ()).throw(RuntimeError("Core unavailable")); self._set_state("IDLE")
-            except Exception as exc: self._set_state("ERROR"); self.tray.showMessage("GAIA",str(exc)) if self.tray else None
-            w.hide()
-        inp.returnPressed.connect(send); w.resize(420,110); self.quick_command_window=w; w.destroyed.connect(lambda:self.__setattr__("quick_command_window",None)); w.show(); inp.setFocus()
+            message = inp.text().strip()
+            if not message:
+                return
+            inp.clear()
+            label.setText("Procesando...")
+            self._show_orb()
+            self._set_state("THINKING")
+
+            def worker():
+                try:
+                    if self.api is None:
+                        raise RuntimeError("Core no disponible")
+                    answer = self.api.send_assistant(message)
+                    if self.signals is not None:
+                        self.signals.response.emit(answer)
+                        self.signals.state.emit("IDLE")
+                except Exception as exc:
+                    if self.signals is not None:
+                        self.signals.response.emit({"response": f"Error: {type(exc).__name__}: {exc}"})
+                        self.signals.state.emit("ERROR")
+            threading.Thread(target=worker, daemon=True).start()
+
+        inp.returnPressed.connect(send)
+        w.resize(510, 180)
+        self.quick_command_window = w
+        w.destroyed.connect(lambda: self.__setattr__("quick_command_window", None))
+        w.show()
+        inp.setFocus()
+
+    def _show_response(self, data):
+        if not isinstance(data, dict):
+            return
+        message = str(data.get("response") or data.get("message") or data.get("detail") or "Sin respuesta.")
+        if data.get("confirmation_required"):
+            message += "\nAcción pendiente: revisa y aprueba el permiso correspondiente."
+        if self.quick_result_label is not None:
+            self.quick_result_label.setText(message[:3000])
+        if self.tray is not None and not self.quick_command_window:
+            self.tray.showMessage("GAIA", message[:180])
+
     def _show_permission(self,request): self.permission_dialog=PermissionDialog(request,self._submit_permission); self.permission_dialog.show()
     def _submit_permission(self,request_id,decision):
         if not self.api: return
@@ -181,14 +475,16 @@ class DesktopShell:
     def open_dashboard(self): webbrowser.open(self.config.core_url+"/api/visualizer")
     def show_status(self): self.tray.showMessage("GAIA",f"State: {self.state}\nEvents: {self.events.connected}") if self.tray else None
     def restart(self):
-        self.stop(); os.environ["GAIA_LAUNCHER_RESTART"]="1"; return 0
+        self._exit_code = 75
+        self.stop()
+        return self._exit_code
     def stop(self):
-        if self.wake: self.wake.stop(); self.wake=None
-        self.hotkey.unregister(); self.events.stop(); self.capture.stop();
+        self._stop_wake_word()
+        self.hotkey.unregister(); self.events.stop(); self.capture.stop(deliver=False);
         if self.quick_command_window: self.quick_command_window.close(); self.quick_command_window=None
         if self.tray: self.tray.hide()
         if self.orb: self.orb.close()
-        self.running=False; self._shutdown.set(); self.app.quit() if self.qt and self.app else None
+        self.running=False; self._shutdown.set(); self.app.exit(self._exit_code) if self.qt and self.app else None
     def exec(self):
         if not self.running:self.start(hidden=True)
         return self.app.exec() if self.app else 1
