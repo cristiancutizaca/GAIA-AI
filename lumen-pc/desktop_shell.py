@@ -324,7 +324,7 @@ class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
 
 class DesktopShell:
     def __init__(self, config: ShellConfig|None=None, api=None):
-        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self._permission_ids=set(); self._request_lock=threading.Lock(); self._capture_session=0; self.bridge=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
+        self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None; self.quick_command_window=None; self.quick_result_label=None; self.permission_dialog=None; self._permission_ids=set(); self._request_lock=threading.Lock(); self._watch_lock=threading.Lock(); self._watched_actions=set(); self._capture_session=0; self.bridge=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.signals=None; self._exit_code=0
         self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._on_core_event)
         self.hotkey=GlobalHotkey(self._ptt_down,self._ptt_up,self.config.hotkey)
         self.capture=AudioCapture(self._on_captured_audio)
@@ -573,14 +573,63 @@ class DesktopShell:
             else:
                 message += "\nFaltan los identificadores de autorización del Core."
         elif data.get("status") in {"approved", "rejected"}:
-            message = ("Acción autorizada. El ejecutor de PC procesará la solicitud."
-                       if data.get("status") == "approved" else "Acción rechazada.")
+            message = ("Autorización registrada. Esperando el resultado VERIFICADO del PC Action Host."
+                       if data.get("status") == "approved" else "Acción rechazada; no se ejecutará.")
+        if (data.get("action_id") and data.get("session_id") and not data.get("confirmation_required")
+                and not data.get("execution_verified")
+                and (data.get("status") == "approved"
+                     or (data.get("kind") in {"action", "plan"} and data.get("approved"))):
+            self._watch_action(str(data["action_id"]), str(data["session_id"]))
         if self.quick_result_label is not None:
             self.quick_result_label.setText(message[:3000])
         if self.tray is not None and (
             self.quick_command_window is None or not self.quick_command_window.isVisible()
         ):
             self.tray.showMessage("GAIA", message[:180])
+
+    def _watch_action(self, action_id: str, session_id: str):
+        """Follow the actual Core action_history result, not approval optimism."""
+        if not self.api or not hasattr(self.api, "action_result") or self._shutdown.is_set():
+            return
+        key = (action_id, session_id)
+        with self._watch_lock:
+            if key in self._watched_actions:
+                return
+            self._watched_actions.add(key)
+
+        def worker():
+            errors = 0
+            try:
+                for _ in range(48):  # Two minutes of bounded polling.
+                    if self._shutdown.is_set():
+                        return
+                    try:
+                        result = self.api.action_result(action_id, session_id)
+                        errors = 0
+                        if result is not None:
+                            if result.get("execution_verified") and result.get("success"):
+                                output = "Acción verificada: " + (result.get("response") or "completada correctamente.")
+                            else:
+                                output = "Acción terminada sin éxito verificado: " + (
+                                    result.get("response") or result.get("status") or "No hay evidencia de éxito."
+                                )
+                            if self.signals is not None:
+                                self.signals.response.emit({"response": output})
+                            return
+                    except Exception:
+                        errors += 1
+                        if errors >= 3:
+                            if self.signals is not None:
+                                self.signals.response.emit({"response": "No se pudo verificar la acción con el Core. Consulta el historial; no se confirma su ejecución."})
+                            return
+                    self._shutdown.wait(2.5)
+                if not self._shutdown.is_set() and self.signals is not None:
+                    self.signals.response.emit({"response": "La acción sigue pendiente o no pudo verificarse en 2 minutos. Consulta Estado Core / Acción."})
+            finally:
+                with self._watch_lock:
+                    self._watched_actions.discard(key)
+
+        threading.Thread(target=worker, name="gaia-action-result", daemon=True).start()
 
     def _show_permission(self, request):
         if not isinstance(request, dict):

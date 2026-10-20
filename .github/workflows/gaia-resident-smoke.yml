@@ -10,7 +10,9 @@ on:
       - "lumen-core/routes/api.py"
       - "tests/resident_runtime_test.py"
       - "tests/action_single_executor_contract_test.py"
+      - "tests/startup_and_action_status_contract_test.py"
       - "tests/remote_action_host_test.py"
+      - "tools/gaia_startup.py"
       - "tools/gaia_resident_doctor.py"
       - "start-gaia.bat"
       - "install-gaia.ps1"
@@ -33,7 +35,9 @@ jobs:
       - name: Install minimal test dependencies
         run: python -m pip install python-dotenv httpx
       - name: Compile changed Python modules
-        run: python -m py_compile lumen-pc/desktop_shell.py lumen-pc/gaia_desktop_launcher.py tools/gaia_resident_doctor.py tests/resident_runtime_test.py
+        run: python -m py_compile lumen-pc/desktop_shell.py lumen-pc/desktop_api.py lumen-pc/gaia_desktop_launcher.py lumen-core/routes/api.py tools/gaia_startup.py tools/gaia_resident_doctor.py tests/resident_runtime_test.py tests/startup_and_action_status_contract_test.py
+      - name: Verify autostart and verified action reporting
+        run: python tests/startup_and_action_status_contract_test.py
       - name: Check one-owner action execution and approval gates
         run: python tests/action_single_executor_contract_test.py
       - name: Run resident runtime contracts

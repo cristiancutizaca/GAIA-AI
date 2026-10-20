@@ -377,6 +377,33 @@ class LumenDesktopAPI:
     def actions_control_status(self) -> dict:
         return self._request("GET", "/api/actions/control", timeout=8.0).json()
 
+    def action_result(self, action_id: str, session_id: str) -> dict | None:
+        """Read Core's persisted *verified* outcome. Never infer success from approval."""
+        if not re.fullmatch(r"[\\w-]{8,80}", str(action_id or "")):
+            raise LumenAPIError("action_id invalido.")
+        if not re.fullmatch(r"[\\w-]{1,64}", str(session_id or "")):
+            raise LumenAPIError("session_id invalido.")
+        rows = self._request(
+            "GET", "/api/actions/history",
+            params={"session_id": session_id, "limit": 100}, timeout=12.0,
+        ).json()
+        if not isinstance(rows, list):
+            raise LumenAPIError("Historial de acciones invalido.")
+        for row in rows:
+            if not isinstance(row, dict) or row.get("action_id") != action_id:
+                continue
+            # Plan step rows carry action_id:step; only aggregate action matches.
+            result = row.get("result") if isinstance(row.get("result"), dict) else {}
+            return {
+                "action_id": action_id,
+                "session_id": session_id,
+                "status": str(row.get("status") or result.get("status") or "unknown").upper(),
+                "success": bool(row.get("success")),
+                "response": str(result.get("natural_response") or result.get("message") or ""),
+                "execution_verified": bool(result.get("execution_verified")),
+            }
+        return None
+
     def confirm_action(self, action_data: dict, engine: ActionEngine | None = None, permission_decision: str | None = None) -> dict:
         """Execute a previously previewed action/plan through the separated PC Action Host."""
         parsed = parse_action_response(action_data)

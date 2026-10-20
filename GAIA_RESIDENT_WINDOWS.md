@@ -145,6 +145,42 @@ mediante una cancelación.
 La primera comprobación es autónoma, solo necesita Python 3.11. La segunda
 requiere las dependencias del Core y crea una base de datos temporal.
 
+## Inicio automático: instalador ligado al entorno virtual
+
+La configuración `gaia_startup.py enable` registra el Python del entorno
+`.venv` de **este** proyecto. En Windows utiliza `pythonw.exe` cuando está
+disponible para no abrir una consola. Verifica primero que exista el entorno
+virtual; evita registrar accidentalmente el Python global.
+
+`gaia_startup.py status` puede devolver `BROKEN` cuando el proyecto se ha
+movido o el ejecutable desapareció. En ese caso vuelve a instalar GAIA y
+ejecuta `enable` para actualizar la ruta.
+
+El supervisor escribe `%USERPROFILE%\.gaia\logs\supervisor.log`:
+los reinicios del núcleo y los cierres inesperados de la interfaz quedan
+registrados allí. La interfaz puede reiniciarse con espera progresiva en
+caso de fallos repetidos, sin finalizar innecesariamente el núcleo.
+
+## Resultados reales de acciones (no confundir con aprobación)
+
+Cuando el Core confirma la autorización de una operación, la interfaz
+consulta el historial del Core para ese `action_id` y `session_id`.
+Solo anuncia «Acción verificada» si existe un resultado persistido con
+éxito y `execution_verified=true`. Si no aparece dentro de dos minutos,
+muestra que **no se ha podido verificar**, en lugar de fingir éxito.
+
+Una acción **ya reclamada** no vuelve a ofrecerse ni siquiera a otro
+proceso que reutilice el mismo token de `pc-main`. Si el PC se reinicia
+en mitad de una operación y esta queda reclamada sin finalizar, GAIA
+**no la repite automáticamente**, porque podría duplicar una operación
+sobre tus archivos. Comprueba el estado real y solicita una nueva acción
+si hace falta.
+
+Pruebas autónomas:
+```powershell
+.\.venv\Scripts\python.exe tests\startup_and_action_status_contract_test.py
+```
+
 ## Pruebas pendientes sobre hardware real
 
 - Instalación de PySide6/Whisper en el PC de destino.

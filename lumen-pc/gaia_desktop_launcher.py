@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from datetime import datetime
 import subprocess
 import sys
 import time
@@ -75,9 +76,23 @@ def _env() -> dict[str, str]:
     return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
 
 
+def _note(message: str) -> None:
+    """Durable, bounded diagnostics even when autostart uses pythonw.exe."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log = LOG_DIR / "supervisor.log"
+    if log.exists() and log.stat().st_size > 2_000_000:
+        old = log.with_suffix(".previous.log")
+        os.replace(log, old)
+    with log.open("a", encoding="utf-8") as out:
+        out.write(datetime.now().isoformat(timespec="seconds") + " " + message + "\n")
+
+
 def _spawn(name: str, args: list[str], *, cwd: Path = ROOT, env: dict | None = None):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log = (LOG_DIR / f"{name}.log").open("a", encoding="utf-8", buffering=1)
+    logfile = LOG_DIR / f"{name}.log"
+    if logfile.exists() and logfile.stat().st_size > 5_000_000:
+        os.replace(logfile, LOG_DIR / f"{name}.previous.log")
+    log = logfile.open("a", encoding="utf-8", buffering=1)
     try:
         process = subprocess.Popen(
             args, cwd=cwd, env=env or _env(),
@@ -125,12 +140,24 @@ def launch(*, shell: bool = True, host: bool = True, wait: int = 45, once: bool 
         host_proc = None
         host_enabled = host and os.getenv("GAIA_REMOTE_HOST_ENABLED", "true").lower() in {"1", "true", "yes"}
         try:
-            if not healthy():
-                core_proc = _core_process()
-            if not _wait_for_core(wait):
-                raise RuntimeError("GAIA Core failed readiness; check ~/.gaia/logs/core.log")
             if once:
+                if not healthy():
+                    core_proc = _core_process()
+                if not _wait_for_core(wait):
+                    raise RuntimeError("GAIA Core failed readiness; see ~/.gaia/logs/core.log")
                 return 0
+            # Windows can start before networking, permissions, or user apps
+            # settle. Keep retrying without spawning duplicate child processes.
+            while not healthy():
+                if core_proc is None or core_proc.poll() is not None:
+                    core_proc = _core_process()
+                    _note("Starting Core (resident readiness).")
+                if _wait_for_core(wait):
+                    break
+                _note("Core was not ready; restarting owned process after cooldown.")
+                _stop(core_proc)
+                core_proc = None
+                time.sleep(5)
             if host_enabled:
                 host_proc = _spawn("action-host", [sys.executable, str(HOST)])
             if not shell:
@@ -155,9 +182,13 @@ def launch(*, shell: bool = True, host: bool = True, wait: int = 45, once: bool 
                     now = time.monotonic()
                     failures = [t for t in failures if now - t < 60]
                     failures.append(now)
-                    if len(failures) > 3:
-                        raise RuntimeError("GAIA Desktop repeatedly crashed; see ~/.gaia/logs/desktop.log")
-                    time.sleep(0.5 if exit_code == RESTART_EXIT_CODE else 2.0)
+                    if exit_code == RESTART_EXIT_CODE:
+                        delay = 0.5
+                        failures.clear()
+                    else:
+                        delay = min(60.0, 2.0 ** min(len(failures), 6))
+                        _note(f"Desktop exited code={exit_code}; restart in {delay:.0f}s.")
+                    time.sleep(delay)
                     shell_proc = _spawn("desktop", [sys.executable, str(SHELL)],
                                         env={**_env(), "GAIA_LAUNCHER_ACTIVE": "1"})
                 if host_enabled and host_proc is not None and host_proc.poll() is not None:
@@ -168,11 +199,16 @@ def launch(*, shell: bool = True, host: bool = True, wait: int = 45, once: bool 
                 if now - last_health >= 8:
                     last_health = now
                     if not healthy():
-                        if core_proc is not None and core_proc.poll() is not None:
-                            core_proc = _core_process()
-                        # If an external Core is offline, do not kill or replace it blindly.
+                        # Stop only a process started by *this* supervisor.
+                        # Never terminate an external Core on the same port.
+                        if core_proc is not None:
+                            _stop(core_proc)
+                        core_proc = _core_process()
+                        _note("Core not responsive; restarting owned Core.")
                         if not _wait_for_core(wait):
-                            raise RuntimeError("GAIA Core is unavailable; see ~/.gaia/logs/core.log")
+                            _note("Core still unavailable; will retry on next health check.")
+                            _stop(core_proc)
+                            core_proc = None
                 time.sleep(0.5)
         except KeyboardInterrupt:
             return 0

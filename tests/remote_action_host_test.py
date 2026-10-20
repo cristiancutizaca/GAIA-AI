@@ -52,6 +52,12 @@ with tempfile.TemporaryDirectory(prefix="gaia_remote_host_") as tmp:
         assert pending.json()["actions"][0]["requesting_device"] == "android-owner" and pending.json()["actions"][0]["target_host"] == "pc-main"
         assert pending.json()["host_status"]["online"] is True
         assert client.post("/api/actions/claim", headers=host, json={"action_id": action_id, "session_id": session_id}).status_code == 200
+        # Two Action Host processes may share the same pc-main device token.
+        # A second claim is always rejected, even by those same credentials.
+        assert client.post("/api/actions/claim", headers=host, json={"action_id": action_id, "session_id": session_id}).status_code == 409
+        assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
+        assert client.post("/api/actions/reject", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 409
+        assert client.post("/api/actions/approve", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 409
 
         completed = client.post("/api/actions/complete", headers=host, json={
             "action_id": action_id,
