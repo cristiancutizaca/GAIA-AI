@@ -1,0 +1,3 @@
+# Optional legacy voice fallbacks. Not installed by the normal Full profile.
+edge-tts==6.1.12
+openai-whisper==20231117

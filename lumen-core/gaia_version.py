@@ -1,7 +1,7 @@
 """Canonical GAIA product identity. Protocol/schema remain independently compatible."""
 PRODUCT = "GAIA-AI"
 PRODUCT_VERSION = "2.0.0"
-RELEASE = "2.0-RESIDENT-DESKTOP-ASSISTANT"
+RELEASE = "2.0-WINDOWS-COMPLETE-RC3"
 PROTOCOL_VERSION = "1.0-RC6"  # wire compatibility; not the product release
 SCHEMA_MIN = 8
 SCHEMA_MAX = 9

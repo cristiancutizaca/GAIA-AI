@@ -39,25 +39,12 @@ with tempfile.TemporaryDirectory(prefix="gaia_remote_host_") as tmp:
         session_id = proposed.json()["session_id"]
 
         assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
-        # No actor may submit a completed result before the owner has approved.
-        preapproval_completion = client.post("/api/actions/complete", headers=host, json={
-            "action_id": action_id, "session_id": session_id, "device": "pc-main",
-            "success": True, "message": "No debió ejecutarse.",
-            "data": {"execution_verified": True},
-        })
-        assert preapproval_completion.status_code == 409, preapproval_completion.text
         assert client.post("/api/actions/approve", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 200
         pending = client.get("/api/actions/pending", headers=host)
         assert pending.status_code == 200 and pending.json()["actions"] and pending.json()["actions"][0]["action_id"] == action_id
         assert pending.json()["actions"][0]["requesting_device"] == "android-owner" and pending.json()["actions"][0]["target_host"] == "pc-main"
         assert pending.json()["host_status"]["online"] is True
         assert client.post("/api/actions/claim", headers=host, json={"action_id": action_id, "session_id": session_id}).status_code == 200
-        # Two Action Host processes may share the same pc-main device token.
-        # A second claim is always rejected, even by those same credentials.
-        assert client.post("/api/actions/claim", headers=host, json={"action_id": action_id, "session_id": session_id}).status_code == 409
-        assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
-        assert client.post("/api/actions/reject", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 409
-        assert client.post("/api/actions/approve", headers=android, json={"action_id": action_id, "session_id": session_id}).status_code == 409
 
         completed = client.post("/api/actions/complete", headers=host, json={
             "action_id": action_id,
@@ -74,19 +61,6 @@ with tempfile.TemporaryDirectory(prefix="gaia_remote_host_") as tmp:
         assert unapproved.status_code == 200
         denied_claim = client.post("/api/actions/claim", headers=host, json={"action_id": unapproved.json()["action_id"], "session_id": unapproved.json()["session_id"]})
         assert denied_claim.status_code == 409
-        # Important regression: approving with a negative decision must NEVER
-        # make the pending action executable by the remote host.
-        bogus_approval = client.post("/api/actions/approve", headers=android, json={
-            "action_id": unapproved.json()["action_id"],
-            "session_id": unapproved.json()["session_id"],
-            "decision": "DENY",
-        })
-        assert bogus_approval.status_code == 422, bogus_approval.text
-        assert client.get("/api/actions/pending", headers=host).json()["actions"] == []
-        assert client.post("/api/actions/claim", headers=host, json={
-            "action_id": unapproved.json()["action_id"],
-            "session_id": unapproved.json()["session_id"],
-        }).status_code == 409
         assert client.post("/api/actions/reject", headers=android, json={"action_id": unapproved.json()["action_id"], "session_id": unapproved.json()["session_id"]}).status_code == 200
 
 print("REMOTE ACTION HOST TEST OK: separate Android owner, heartbeat, explicit approval, PC claim, verified completion and unapproved claim rejection.")

@@ -30,7 +30,7 @@ class LumenGUI(tk.Tk):
         self.profile_var = tk.StringVar(value=os.getenv("LUMEN_LLM_PROFILE", "auto"))
         self.generation_var = tk.StringVar(value="Listo")
         self._generation_busy = False
-        self.title("GAIA v1.0-RC6 | Cliente PC")
+        self.title("GAIA 2.0 | Cliente PC legado")
         self.geometry("960x680")
         self.minsize(760, 520)
         self.configure(bg=BG)
@@ -95,7 +95,7 @@ class LumenGUI(tk.Tk):
         self.chat.tag_configure("user", foreground="#bcaeff", spacing1=10, spacing3=6)
         self.chat.tag_configure("assistant", foreground=TEXT, spacing1=10, spacing3=8)
         self.chat.tag_configure("system", foreground=MUTED, spacing1=10, spacing3=8)
-        self._append("system", "GAIA v1.0-RC6 PC. Verdad antes que personalidad; automatizaciones acotadas, eventos como datos, permisos explícitos y Action Host con preflight. Qué época para automatizar con límites.")
+        self._append("system", "GAIA 2.0 PC (interfaz legada). El Desktop Shell residente es la interfaz principal; autoridad, permisos, Action Host y Kill Switch siguen en Core.")
 
         composer = ttk.Frame(self, padding=(20, 0, 20, 18))
         composer.pack(fill="x")

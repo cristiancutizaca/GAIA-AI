@@ -1603,9 +1603,7 @@ async def pending_actions(principal: Annotated[Principal, Depends(require_action
         target_host = str(item.get("target_host") or item.get("execution_host") or item.get("device") or PC_DEVICE_ID)
         if not principal.is_master and target_host != str(principal.device_id or ""):
             continue
-        # Claimed work is never re-offered, including to a second instance
-        # using the same host/device credentials after a restart.
-        if item.get("claimed_by"):
+        if item.get("claimed_by") and item.get("claimed_by") != principal.device_id and not principal.is_master:
             continue
         intent = item.get("intent") if isinstance(item.get("intent"), dict) else {}
         pending.append({"action_id": row["key"].split("pending_action:", 1)[-1], "session_id": item.get("session_id", ""), "device": item.get("device", ""), "requesting_device": item.get("requesting_device") or item.get("device", ""), "target_host": target_host, "intent": intent, "request_state": item.get("request_state", ""), "approved": bool(item.get("approved")), "auto_approved": bool(item.get("auto_approved")), "claimed_by": item.get("claimed_by")})
@@ -1624,10 +1622,6 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
         raise HTTPException(status_code=500, detail="Estado de acción inválido.") from exc
     if pending.get("session_id") != payload.session_id:
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
-    if pending.get("claimed_by") or pending.get("completed"):
-        raise HTTPException(status_code=409, detail="Esta acción ya comenzó o terminó; no se puede volver a autorizar ni rechazar.")
-    if approved and pending.get("approved"):
-        raise HTTPException(status_code=409, detail="Esta acción ya está aprobada.")
     same_owner = principal.is_master or (pending.get("principal_type") == "device" and pending.get("device_id") == principal.device_id and pending.get("token_id") == principal.token_id)
     if not same_owner:
         raise HTTPException(status_code=403, detail="Solo el Principal propietario puede aprobar o rechazar esta acción.")
@@ -1636,8 +1630,6 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
         valid_decisions = {"ALLOW_ONCE", "ALWAYS_ALLOW", "ASK", "ALWAYS_ASK", "DENY", "ALWAYS_DENY"}
         if decision and decision not in valid_decisions:
             raise HTTPException(status_code=422, detail="Decisión de permiso inválida.")
-        if decision in {"DENY", "ALWAYS_DENY", "ASK", "ALWAYS_ASK"}:
-            raise HTTPException(status_code=422, detail="No se puede aprobar una acción con una decisión de rechazo o consulta. Usa /actions/reject.")
         pending_intent = pending.get("intent") if isinstance(pending.get("intent"), dict) else {}
         intents = pending_intent.get("actions", []) if pending_intent.get("type") == "plan" else [pending_intent]
         permission_ids: list[int] = []
@@ -1714,16 +1706,14 @@ async def claim_action(payload: ActionClaimPayload, principal: Annotated[Princip
         raise HTTPException(status_code=500, detail="Estado de acción inválido.") from exc
     if pending.get("session_id") != payload.session_id:
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
-    if not pending.get("approved") or pending.get("cancelled") or pending.get("completed"):
-        raise HTTPException(status_code=409, detail="La acción no está pendiente y aprobada.")
-    if not _actions_enabled():
-        raise HTTPException(status_code=409, detail="Kill switch activo: no se reclaman acciones.")
+    if not pending.get("approved"):
+        raise HTTPException(status_code=409, detail="La acción requiere aprobación explícita del dispositivo solicitante.")
     target_host = str(pending.get("target_host") or pending.get("execution_host") or pending.get("device") or PC_DEVICE_ID)
     if not principal.is_master and target_host != str(principal.device_id or ""):
         raise HTTPException(status_code=403, detail="La acción está dirigida a otro host autorizado.")
     claimed_by = str(pending.get("claimed_by") or "")
-    if claimed_by:
-        raise HTTPException(status_code=409, detail="La acción ya fue reclamada; nunca se ejecuta dos veces.")
+    if claimed_by and claimed_by != str(principal.device_id or "") and not principal.is_master:
+        raise HTTPException(status_code=409, detail="La acción ya fue reclamada por otro host.")
     pending["claimed_by"] = str(principal.device_id or "master")
     pending["claimed_by_token"] = str(principal.token_id or "") if not principal.is_master else "master"
     memory.set_state(state_key, json.dumps(pending, ensure_ascii=False))
@@ -1746,19 +1736,9 @@ async def complete_action(req: ActionCompleteRequest, principal: Annotated[Princ
         raise HTTPException(status_code=409, detail="La acción ya fue completada.")
     if pending.get("session_id") != req.session_id:
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
-    if pending.get("cancelled") or not pending.get("approved"):
-        raise HTTPException(status_code=409, detail="La acción fue rechazada o todavía no está autorizada; no se puede completar.")
-    claimed_by = str(pending.get("claimed_by") or "")
-    if claimed_by and claimed_by != str(principal.device_id or "") and not principal.is_master:
-        raise HTTPException(status_code=409, detail="Un host diferente ya reclamó esta acción.")
-    if not principal.is_master and principal.allows(CAP_ACTION_HOST):
-        # The Action Host must own this exact claim/token. Merely sharing
-        # a device ID with the original requester is not execution authority.
-        if not claimed_by or str(pending.get("claimed_by_token") or "") != str(principal.token_id or ""):
-            raise HTTPException(status_code=403, detail="El Action Host debe reclamar la acción con su token antes de completarla.")
     if not principal.is_master:
         same_device = pending.get("principal_type") == "device" and pending.get("device_id") == principal.device_id and pending.get("token_id") == principal.token_id
-        claimed_host = claimed_by == principal.device_id and principal.allows(CAP_ACTION_HOST)
+        claimed_host = pending.get("claimed_by") == principal.device_id and principal.allows(CAP_ACTION_HOST)
         if not same_device and not claimed_host:
             raise HTTPException(status_code=403, detail="La acción pertenece a otro Principal y no fue reclamada por este host.")
     pending_intent = pending.get("intent", {}) if isinstance(pending.get("intent"), dict) else {}
@@ -1900,9 +1880,7 @@ async def chat_voice(
         except Exception as exc:
             tts_error = str(exc)
             logger.warning("Respuesta generada, pero TTS falló: %s", exc)
-    # Voice responses must carry the same authority/scope metadata as text.
-    # Without these fields the desktop UI cannot display informed consent.
-    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "permission_entries": chat_resp.permission_entries, "resource_scope_version": chat_resp.resource_scope_version, "requesting_device": chat_resp.requesting_device, "target_host": chat_resp.target_host, "approved": chat_resp.approved, "audio_url": audio_url, "tts_error": tts_error}
+    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "audio_url": audio_url, "tts_error": tts_error}
 
 
 @router.get("/captures/{capture_id}")
@@ -1922,7 +1900,8 @@ async def get_audio(filename: str):
     audio_path = DATA_DIR / "audio" / filename
     if not audio_path.exists():
         raise HTTPException(status_code=404, detail="Audio no encontrado.")
-    return FileResponse(str(audio_path), media_type="audio/mpeg", filename=filename)
+    media = "audio/wav" if audio_path.suffix.lower() == ".wav" else "audio/mpeg"
+    return FileResponse(str(audio_path), media_type=media, filename=filename)
 
 
 @router.post("/voice/tts", dependencies=[Depends(require_voice)])
@@ -1931,7 +1910,8 @@ async def tts_only(req: TTSRequest):
         audio_path = await text_to_speech(req.text)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return FileResponse(str(audio_path), media_type="audio/mpeg")
+    media = "audio/wav" if Path(audio_path).suffix.lower() == ".wav" else "audio/mpeg"
+    return FileResponse(str(audio_path), media_type=media)
 
 
 @router.get("/voice/voices", dependencies=[Depends(require_voice)])

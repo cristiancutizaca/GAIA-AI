@@ -44,8 +44,8 @@ class OpenHandsCodingWorker:
     async def execute(self,*args:Any,**kwargs:Any): raise PermissionError("Coding effects require approved isolated workspace and Action Host")
 
 class ComputerUseAdapter:
-    name="computer-use"; feature="computer_use"; dependency="UI-TARS/Agent-S"
+    name="computer-use"; feature="computer_use"; dependency="pywinauto/pyautogui"
     def health(self):
-        from gaia_platform.real_backends import UITARSComputerUseBackend
-        return _health(UITARSComputerUseBackend())
+        from gaia_platform.real_backends import WindowsComputerUseRouter
+        return _health(WindowsComputerUseRouter())
     async def execute(self,*args:Any,**kwargs:Any): raise PermissionError("Computer Use requires PlatformRuntime authority and physical GUI")

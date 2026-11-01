@@ -1,3 +1,4 @@
-# Optional GAIA Computer Use group
-# UI-TARS 0.5.1 is available as an optional provider; a physical GUI and its model/runtime are required.
-ui-tars==0.5.1
+# GAIA deterministic Windows Computer Use. Visual agents are optional extras, not authority.
+pyautogui>=0.9.54,<0.10
+pywinauto>=0.6.9,<0.7; platform_system == "Windows"
+# Optional visual providers (Agent-S/UI-TARS Desktop) are intentionally not installed by default.

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.0-WINDOWS-COMPLETE-RC3
+
+- Browser Use isolated into `.venv-browser` to prevent exact runtime pins from mutating Core/Voice dependencies.
+- Browser execution now crosses a JSON-lines sidecar boundary while GAIA Core retains authority, URL validation and content-trust policy.
+- `requirements-computer.txt` no longer overrides Pillow owned by the main PC stack.
+- Chromium/Playwright installation runs with the browser sidecar interpreter.
+
+- Rebuilt clean-install profiles around a canonical dependency manifest; `full` now includes Desktop/Voice/Browser/Memory/Coding and `full-computer` adds Windows UIA/PyAutoGUI.
+- Repaired resident Desktop: real Win32 hotkeys, PTT audio finalization, SSE→Qt signal bridge, non-blocking Quick Command, real response playback, supervised Core restart and Windows named mutex.
+- Modernized local voice to faster-whisper + Piper, streaming Silero endpointing/barge-in, multi-turn wake session and truthful custom Gaia wake-model handling.
+- Removed fake Pipecat placeholder stages; adapter now reports configuration required unless real processors/transports are supplied.
+- Added deterministic Windows UI Automation before PyAutoGUI coordinate fallback; UI-TARS/Agent-S remain optional rather than falsely integrated.
+- Removed Browser Use Linux-only Chromium hardcode.
+- Hardened Mem0 ownership mutation checks and preserved Graphiti isolation.
+- Repaired normal pytest collection/execution and added runtime behavioral closure tests.
+- Replaced active RC6 physical validator with GAIA 2.0 operator-confirmed validation.
+
 ## v1.0-RC6 + DeepSeek-Harness
 
 Integra DeepSeek-Harness `0.1.5-rc.1` como motor de razonamiento sobre Ollama local. Conserva memoria, voz, automatizaciones, clientes y permisos de GAIA. El perfil seguro desactiva el shell directo del Harness y deja toda acción del equipo bajo el flujo de autorización existente de GAIA. Incluye SDK Python oficial integrado, instaladores para Windows/Linux, diagnóstico y retorno inmediato al backend Ollama anterior.

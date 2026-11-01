@@ -1,0 +1,19 @@
+# Template for the official openWakeWord custom-model trainer.
+model_name: "gaia"
+target_phrase:
+  - "gaia"
+custom_negative_phrases:
+  - "jarvis"
+  - "gaya"
+  - "maya"
+n_samples: 50000
+n_samples_val: 5000
+tts_batch_size: 25
+augmentation_batch_size: 16
+augmentation_rounds: 1
+model_type: "dnn"
+layer_size: 32
+steps: 50000
+max_negative_weight: 1500
+target_false_positives_per_hour: 0.2
+# Training data paths must be filled according to the current official openWakeWord training workflow.

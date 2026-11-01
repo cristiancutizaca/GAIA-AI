@@ -4,11 +4,13 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'lumen-core')); sys.path.insert(0,str(ROOT/'lumen-pc')); sys.path.insert(0,str(ROOT/'tools'))
 
-def test_browser_use_contract_uses_actor_page_api():
-    from gaia_platform.browser_real import BrowserUseBackend
+def test_browser_use_contract_is_isolated_sidecar():
+    from gaia_platform.browser_real import BrowserUseBackend, _BrowserSidecarClient
     b=BrowserUseBackend()
-    assert b.health()["backend"] == "browser-use"
-    assert hasattr(b, "_element") and hasattr(b, "query")
+    _, py, worker = _BrowserSidecarClient.paths()
+    assert '.venv-browser' in str(py)
+    assert worker.name == 'browser_sidecar.py'
+    assert hasattr(b, 'query') and hasattr(b, 'click')
 
 def test_http_fallback_is_fail_closed_for_effects():
     from gaia_platform.browser_real import HttpBrowserBackend

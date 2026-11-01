@@ -141,8 +141,8 @@ REMOTE_HOST_POLL_SECONDS = max(1.0, float(os.getenv("GAIA_REMOTE_HOST_POLL_SECON
 REMOTE_HOST_HEARTBEAT_SECONDS = max(5.0, float(os.getenv("GAIA_REMOTE_HOST_HEARTBEAT_SECONDS", "15.0")))
 
 TTS_ENABLED = _bool("LUMEN_TTS_ENABLED", True)
-TTS_ENGINE = os.getenv("LUMEN_TTS_ENGINE", "edge").lower().strip()
-TTS_VOICE = os.getenv("LUMEN_TTS_VOICE", "es-MX-DaliaNeural").strip()
+TTS_ENGINE = os.getenv("LUMEN_TTS_ENGINE", "piper").lower().strip()
+TTS_VOICE = os.getenv("LUMEN_TTS_VOICE", "es_MX-claude-high").strip()
 STT_ENABLED = _bool("LUMEN_STT_ENABLED", True)
 WHISPER_MODEL = os.getenv("LUMEN_WHISPER_MODEL", "base").strip()
 MAX_AUDIO_UPLOAD_MB = max(1, int(os.getenv("LUMEN_MAX_AUDIO_UPLOAD_MB", "20")))

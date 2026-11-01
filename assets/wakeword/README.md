@@ -1,9 +1,9 @@
 # Gaia wake-word model
 
-GAIA never substitutes another assistant's acoustic model. Production requires an OpenWakeWord-compatible ONNX model trained for **Gaia**, installed with:
+GAIA never substitutes another assistant's acoustic model. The runtime requires a real OpenWakeWord-compatible model trained for **Gaia**.
 
-```bash
-python tools/setup_gaia_wakeword.py /path/to/gaia.onnx --sha256 <trusted-sha256>
-```
+- `gaia_training.yml` is a reproducible starting configuration for the current official OpenWakeWord custom-model workflow.
+- `python tools/prepare_gaia_wakeword.py status` reports whether the model is installed.
+- Install a trained model with `python tools/setup_gaia_wakeword.py /path/to/gaia.onnx --sha256 <trusted-sha256>`.
 
-Then set `GAIA_WAKEWORD_MODEL` to the installed file and enable `GAIA_WAKEWORD_ENABLED=true`. The Sandbox has no microphone, so acoustic false-positive/false-negative validation remains a physical Windows task. `GAIA_WAKEWORD_WHISPER_FALLBACK=true` is development-only and is reported as such by health checks.
+The release intentionally does **not** bundle an unverified third-party “Gaia” model. Current public OpenWakeWord tooling supports custom training, but the final acoustic model must be trained/evaluated and then physically calibrated on the target microphone. Whisper fallback remains development-only.

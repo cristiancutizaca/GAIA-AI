@@ -1,0 +1,2 @@
+# Optional isolated Graphiti environment. Requires Neo4j and explicit LLM/embedder config.
+graphiti-core==0.30.2

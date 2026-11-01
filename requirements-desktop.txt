@@ -1,6 +1,8 @@
-# Resident Qt shell. Keep the versions compatible with Windows Core/PC pins.
+# GAIA resident desktop shell (Windows-first, CPU-safe)
 PySide6>=6.7,<7
-sounddevice>=0.4.7,<1
-numpy>=1.26,<2
+sounddevice>=0.5,<0.6
+soundfile>=0.12,<0.14
+numpy>=1.26,<3
+openwakeword>=0.6
+keyring>=25,<27
 pywin32>=306,<310; platform_system == "Windows"
-# The optional custom wake-word ONNX model requires requirements-wakeword.txt.

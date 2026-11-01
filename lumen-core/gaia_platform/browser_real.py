@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, base64, ipaddress, re, urllib.parse, urllib.request
+import asyncio, base64, ipaddress, os, platform, re, shutil, urllib.parse, urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -71,71 +71,121 @@ class HttpBrowserBackend:
     async def stop(self): return await self.close()
     async def close(self): self.content=""; self.tabs=[]; return {"status":"closed"}
 
+def _discover_browser_executable() -> str | None:
+    """Return an explicit local browser only when one is clearly available.
+
+    Browser Use is allowed to manage its own browser when this returns None. The
+    environment override always wins.
+    """
+    override=os.getenv("GAIA_BROWSER_EXECUTABLE","").strip()
+    if override:
+        path=Path(override).expanduser()
+        if not path.is_file(): raise FileNotFoundError(f"GAIA_BROWSER_EXECUTABLE not found: {path}")
+        return str(path.resolve())
+    names=["chromium","chromium-browser","google-chrome","google-chrome-stable","chrome","msedge"]
+    for name in names:
+        found=shutil.which(name)
+        if found:return found
+    if platform.system()=="Windows":
+        roots=[os.getenv("PROGRAMFILES", ""),os.getenv("PROGRAMFILES(X86)", ""),os.getenv("LOCALAPPDATA", "")]
+        rels=[Path("Google/Chrome/Application/chrome.exe"),Path("Microsoft/Edge/Application/msedge.exe"),Path("Chromium/Application/chrome.exe")]
+        for root in roots:
+            if not root:continue
+            for rel in rels:
+                candidate=Path(root)/rel
+                if candidate.is_file():return str(candidate)
+    return None
+
+class _BrowserSidecarClient:
+    def __init__(self): self.proc=None; self._seq=0; self._lock=asyncio.Lock()
+    @staticmethod
+    def paths():
+        root=Path(__file__).resolve().parents[2]
+        py=root/'.venv-browser'/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
+        worker=root/'tools'/'browser_sidecar.py'
+        return root,py,worker
+    async def start(self):
+        if self.proc and self.proc.returncode is None:return
+        root,py,worker=self.paths()
+        if not py.is_file(): raise RuntimeError(f'Browser sidecar missing: {py}')
+        if not worker.is_file(): raise RuntimeError(f'Browser sidecar worker missing: {worker}')
+        self.proc=await asyncio.create_subprocess_exec(str(py),str(worker),cwd=str(root),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+    async def call(self,method:str,params:dict[str,Any]|None=None,timeout:float=60.0):
+        await self.start()
+        async with self._lock:
+            self._seq+=1; rid=self._seq
+            payload=(__import__('json').dumps({'id':rid,'method':method,'params':params or {}},ensure_ascii=False)+'\n').encode()
+            assert self.proc and self.proc.stdin and self.proc.stdout
+            self.proc.stdin.write(payload); await self.proc.stdin.drain()
+            line=await asyncio.wait_for(self.proc.stdout.readline(),timeout=timeout)
+            if not line: raise RuntimeError('Browser sidecar exited without response')
+            data=__import__('json').loads(line.decode('utf-8','replace'))
+            if data.get('id')!=rid: raise RuntimeError('Browser sidecar protocol desynchronized')
+            if not data.get('ok'): raise RuntimeError(str(data.get('error','browser sidecar failed')))
+            return data.get('result')
+    async def close(self):
+        if self.proc and self.proc.returncode is None:
+            try: await self.call('stop',{},timeout=20)
+            except Exception: self.proc.terminate()
+            try: await asyncio.wait_for(self.proc.wait(),timeout=5)
+            except Exception:
+                self.proc.kill(); await self.proc.wait()
+        self.proc=None
+
 class BrowserUseBackend(HttpBrowserBackend):
-    """Browser Use actor API adapter (BrowserSession + actor.Page/Element), not Playwright API."""
-    def __init__(self,profile=None): super().__init__(profile); self.session=None; self.page=None; self.backend_name="browser-use"; self._pages={}
+    """Browser Use provider executed in the isolated ``.venv-browser`` sidecar.
+
+    GAIA Core keeps URL validation, authority and content trust handling. Only the
+    dependency-heavy Browser Use runtime crosses the JSON-lines worker boundary.
+    """
+    def __init__(self,profile=None):
+        super().__init__(profile); self.backend_name='browser-use-sidecar'; self._client=_BrowserSidecarClient(); self.session=None; self.page=None
     def health(self):
+        root,py,worker=self._client.paths()
+        if not py.is_file(): return {'status':'DEPENDENCY_MISSING','dependency':'browser-use','sidecar':str(py)}
         try:
-            import browser_use
-            return {"status":"AVAILABLE","backend":"browser-use","version":getattr(browser_use,"__version__","unknown"),"api":"BrowserSession/actor.Page"}
-        except Exception as exc:return {"status":"DEPENDENCY_MISSING","dependency":"browser-use","error":type(exc).__name__}
+            import subprocess
+            code="import browser_use,playwright; print(getattr(browser_use,'__version__','unknown'))"
+            r=subprocess.run([str(py),'-c',code],capture_output=True,text=True,timeout=15)
+            if r.returncode==0:return {'status':'AVAILABLE','backend':'browser-use-sidecar','version':r.stdout.strip() or 'unknown','api':'isolated JSON worker'}
+            return {'status':'DEPENDENCY_MISSING','dependency':'browser-use','error':(r.stderr or r.stdout).strip()[-500:]}
+        except Exception as exc:return {'status':'DEPENDENCY_MISSING','dependency':'browser-use','error':type(exc).__name__}
     async def launch(self):
         try:
-            from browser_use import BrowserSession
-            kwargs={"headless":True,"keep_alive":False,"is_local":True,"cloud_browser":False,"use_cloud":False,"executable_path":"/usr/bin/chromium","allowed_domains":sorted(self.profile.allowed_domains) or None,"enable_default_extensions":False}
-            if self.profile.persistent and self.profile.user_data_dir: kwargs["user_data_dir"]=str(Path(self.profile.user_data_dir).resolve())
-            self.session=BrowserSession(**kwargs); await asyncio.wait_for(self.session.start(),timeout=self.profile.launch_timeout); self.page=await self.session.get_current_page()
-            if self.page is None: self.page=await self.session.new_page()
-            self._pages[str(getattr(self.page,"_target_id",id(self.page)))]=self.page
-            return {"status":"ready","backend":"browser-use","profile":self.profile.name,"tabs":await self.list_tabs()}
+            result=await self._client.call('launch',{'headless':True,'allowed_domains':sorted(self.profile.allowed_domains),'persistent':self.profile.persistent,'user_data_dir':self.profile.user_data_dir,'launch_timeout':self.profile.launch_timeout,'executable_path':_discover_browser_executable()},timeout=self.profile.launch_timeout+15)
+            self.session=True; self.page=True; return {'status':'ready','backend':'browser-use-sidecar','profile':self.profile.name,'tabs':result.get('tabs',[])}
         except asyncio.TimeoutError as exc:
-            await self.close(); raise TimeoutError(f"Browser Use launch exceeded {self.profile.launch_timeout}s; install Chromium and retry") from exc
+            await self.close(); raise TimeoutError(f'Browser Use launch exceeded {self.profile.launch_timeout}s') from exc
         except Exception as exc:
-            await self.close(); raise RuntimeError(f"Browser Use launch failed: {type(exc).__name__}: {exc}") from exc
+            await self.close(); raise RuntimeError(f'Browser Use sidecar launch failed: {type(exc).__name__}: {exc}') from exc
     def _require(self):
-        if not self.session or not self.page: raise RuntimeError("Browser Use session is not launched")
-    async def navigate(self,url): self.security.check_url(url); self._require(); await self.page.goto(url); self.current=await self.page.get_url(); return {"url":self.current,"content":await self.read_page(),"backend":"browser-use"}
+        if not self.session: raise RuntimeError('Browser Use sidecar is not launched')
+    async def navigate(self,url):
+        self.security.check_url(url); self._require(); raw=await self._client.call('navigate',{'url':url}); self.current=str(raw.get('url',url)); self.content=str(raw.get('html',''))
+        data=self.security.content(str(raw.get('text',''))); data['dom']=self.content[:200000]
+        return {'url':self.current,'content':data,'backend':'browser-use-sidecar'}
     async def read_page(self):
-        self._require(); text=await self.page.evaluate("() => document.body ? document.body.innerText : ''"); html=await self.page.evaluate("() => document.documentElement ? document.documentElement.outerHTML : ''"); self.content=html; data=self.security.content(str(text)); data["dom"]=str(html)[:200000]; return data
-    async def extract(self,query): self._require(); text=await self.page.evaluate("() => document.body ? document.body.innerText : ''"); return {"query":query,"text":str(text)[:20000],"trusted":False,"trust":"EXTERNAL_UNTRUSTED"}
-    async def query(self,selector): self._require(); els=await self.page.get_elements_by_css_selector(selector); return {"selector":selector,"count":len(els),"elements":[await e.get_basic_info() for e in els]}
-    async def _element(self, selector):
-        els = await self.page.get_elements_by_css_selector(selector)
-        if not els: raise LookupError(f"Browser Use selector matched no element: {selector}")
-        return els[0]
-    async def click(self,selector,**kwargs):
-        self._require(); await (await self._element(selector)).click(**kwargs)
-        return {"status":"clicked","selector":selector}
-    async def type(self,selector,text,**kwargs):
-        self._require(); await (await self._element(selector)).fill(str(text), clear=kwargs.pop("clear",True))
-        return {"status":"typed","selector":selector}
-    async def select(self,selector,value):
-        self._require(); await (await self._element(selector)).select_option(value)
-        return {"status":"selected","selector":selector,"value":value}
-    async def scroll(self,amount=600): self._require(); await self.page.evaluate("(y) => window.scrollBy(0, y)",amount); return {"status":"scrolled","amount":amount}
-    async def upload(self,selector,path):
-        self._require(); raise RuntimeError("Browser Use actor upload requires an upstream file-input API not exposed by this installed version")
-    async def download(self,*args,**kwargs): self._require(); return {"status":"use-browser-downloads","files":[str(x) for x in getattr(self.session,"downloaded_files",[]) or []]}
-    async def submit(self,selector): self._require(); return await self.click(selector)
-    async def back(self): self._require(); await self.page.go_back(); return {"url":await self.page.get_url()}
-    async def forward(self): self._require(); await self.page.go_forward(); return {"url":await self.page.get_url()}
-    async def refresh(self): self._require(); await self.page.reload(); return {"url":await self.page.get_url()}
-    async def new_tab(self,url="about:blank"):
-        self._require(); page=await self.session.new_page(url); self.page=page; self._pages[str(getattr(page,"_target_id",id(page)))]=page; return {"url":await page.get_url()}
-    async def close_tab(self,index=None):
-        self._require(); tabs=await self.session.get_tabs(); target=tabs[index if index is not None else len(tabs)-1]; await self.session.close_page(target.target_id); self.page=await self.session.get_current_page(); return {"tabs":await self.list_tabs()}
-    async def switch_tab(self,index):
-        self._require(); pages=await self.session.get_pages(); self.page=pages[int(index)]; return {"index":int(index),"url":await self.page.get_url()}
-    async def list_tabs(self):
-        if not self.session:return []
-        tabs=await self.session.get_tabs(); return [{"index":i,"target_id":str(t.target_id),"url":str(t.url),"title":str(t.title)} for i,t in enumerate(tabs)]
-    async def screenshot(self,path=None):
-        self._require(); target=path or str(Path.cwd()/"gaia-browser-screenshot.png"); data=await self.session.take_screenshot(path=target); return {"status":"saved","path":target,"bytes":len(data)}
-    async def wait(self,seconds=1): await asyncio.sleep(min(float(seconds),30)); return {"status":"waited","seconds":float(seconds)}
+        self._require(); raw=await self._client.call('read_page',{}); self.current=str(raw.get('url',self.current)); self.content=str(raw.get('html','')); data=self.security.content(str(raw.get('text',''))); data['dom']=self.content[:200000]; return data
+    async def extract(self,query): self._require(); raw=await self._client.call('extract',{'query':query}); return {'query':query,'text':str(raw.get('text',''))[:20000],'trusted':False,'trust':'EXTERNAL_UNTRUSTED'}
+    async def query(self,selector): self._require(); return await self._client.call('query',{'selector':selector})
+    async def click(self,selector,**kwargs): self._require(); return await self._client.call('click',{'selector':selector,'kwargs':kwargs})
+    async def type(self,selector,text,**kwargs): self._require(); return await self._client.call('type',{'selector':selector,'text':str(text),'kwargs':kwargs})
+    async def select(self,selector,value): self._require(); return await self._client.call('select',{'selector':selector,'value':value})
+    async def scroll(self,amount=600): self._require(); return await self._client.call('scroll',{'amount':amount})
+    async def upload(self,selector,path): self._require(); return await self._client.call('upload',{'selector':selector,'path':str(path)})
+    async def download(self,*args,**kwargs): self._require(); return await self._client.call('download',{})
+    async def submit(self,selector): self._require(); return await self._client.call('submit',{'selector':selector})
+    async def back(self): self._require(); return await self._client.call('back',{})
+    async def forward(self): self._require(); return await self._client.call('forward',{})
+    async def refresh(self): self._require(); return await self._client.call('refresh',{})
+    async def new_tab(self,url='about:blank'): self._require(); return await self._client.call('new_tab',{'url':url})
+    async def close_tab(self,index=None): self._require(); return await self._client.call('close_tab',{'index':index})
+    async def switch_tab(self,index): self._require(); return await self._client.call('switch_tab',{'index':int(index)})
+    async def list_tabs(self): return [] if not self.session else await self._client.call('list_tabs',{})
+    async def screenshot(self,path=None): self._require(); return await self._client.call('screenshot',{'path':path})
+    async def wait(self,seconds=1): self._require(); return await self._client.call('wait',{'seconds':seconds})
     async def stop(self):
-        if self.session:
-            try: await self.session.stop()
-            finally: self.session=None; self.page=None; self._pages.clear()
-        return {"status":"stopped","backend":"browser-use"}
+        await self._client.close(); self.session=None; self.page=None; return {'status':'stopped','backend':'browser-use-sidecar'}
     async def close(self): return await self.stop()
     async def cancel(self): return await self.stop()
+

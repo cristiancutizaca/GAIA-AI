@@ -1,0 +1,6 @@
+# Convenience composition for clean Windows development installs.
+-r requirements-desktop.txt
+-r requirements-voice.txt
+-r requirements-browser.txt
+-r requirements-memory.txt
+-r requirements-coding.txt

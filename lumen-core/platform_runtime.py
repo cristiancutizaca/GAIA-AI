@@ -15,7 +15,7 @@ from authority import authorize, READ_ONLY, LOW_RISK
 from gaia_platform.planner import Planner
 from gaia_platform.skills2 import SkillRegistryV2
 from gaia_platform.services import ProjectRegistry, JobStore, FilesystemSandbox, DiagnosticsExporter, CircuitBreaker
-from gaia_platform.real_backends import Mem0MemoryProvider, GraphitiMemoryProvider, PipecatVoiceBackend, SileroVADBackend, OpenHandsCodingWorker, UITARSComputerUseBackend
+from gaia_platform.real_backends import Mem0MemoryProvider, GraphitiMemoryProvider, PipecatVoiceBackend, SileroVADBackend, OpenHandsCodingWorker, PyAutoGUIComputerUseBackend, WindowsComputerUseRouter
 from gaia_platform.visualizer_http import VisualizerStream
 
 @dataclass(frozen=True)
@@ -64,7 +64,7 @@ class PlatformRuntime:
         self.mem0 = Mem0MemoryProvider()
         self.graphiti = GraphitiMemoryProvider()
         self.coding_worker = OpenHandsCodingWorker(self.data / "coding-workspaces")
-        self.computer_use = UITARSComputerUseBackend()
+        self.computer_use = WindowsComputerUseRouter()
         self.planner = Planner()
         self.skills = SkillRegistryV2()
         for skill_id in ("research", "browser_research", "coding", "debugging", "code_review", "project_analysis", "file_management", "system_diagnostics", "documentation", "memory_management", "data_analysis"):

@@ -1,0 +1,155 @@
+schema = 2
+python = "3.11"
+
+[profiles.minimal]
+requirements = []
+sidecars = []
+
+[profiles.desktop]
+requirements = ["requirements-desktop.txt"]
+sidecars = []
+
+[profiles.standard]
+requirements = ["requirements-desktop.txt"]
+sidecars = []
+
+[profiles.voice]
+requirements = ["requirements-desktop.txt", "requirements-voice.txt"]
+sidecars = []
+
+[profiles.browser]
+requirements = []
+sidecars = ["browser"]
+
+[profiles.memory]
+requirements = []
+sidecars = ["memory"]
+
+[profiles.coding]
+requirements = []
+sidecars = ["coding"]
+
+[profiles.computer]
+requirements = ["requirements-desktop.txt", "requirements-computer.txt"]
+sidecars = []
+
+[profiles.full]
+requirements = ["requirements-desktop.txt", "requirements-voice.txt"]
+sidecars = ["browser", "memory", "coding"]
+
+[profiles.full_computer]
+requirements = ["requirements-desktop.txt", "requirements-voice.txt", "requirements-computer.txt"]
+sidecars = ["browser", "memory", "coding"]
+
+[profiles.development]
+requirements = ["requirements-desktop.txt", "requirements-voice.txt", "requirements-computer.txt"]
+sidecars = ["browser", "memory", "coding"]
+
+[profiles.all]
+requirements = ["requirements-desktop.txt", "requirements-voice.txt", "requirements-computer.txt"]
+sidecars = ["browser", "memory", "coding"]
+
+
+[sidecars.browser]
+python = "3.11"
+venv = ".venv-browser"
+requirements = "requirements-browser.txt"
+import_name = "browser_use"
+distribution = "browser-use"
+
+[sidecars.memory]
+python = "3.11"
+venv = ".venv-memory"
+requirements = "requirements-memory.txt"
+import_name = "mem0"
+distribution = "mem0ai"
+
+[sidecars.coding]
+python = "3.12"
+venv = ".venv-coding"
+requirements = "requirements-coding.txt"
+import_name = "openhands.sdk"
+distribution = "openhands-sdk"
+
+[components.desktop]
+distribution = "PySide6"
+import_name = "PySide6"
+profile = "desktop"
+
+[components.hotkeys]
+distribution = "pywin32"
+import_name = "win32api"
+profile = "desktop"
+platform = "Windows"
+
+[components.audio]
+distribution = "sounddevice"
+import_name = "sounddevice"
+profile = "desktop"
+
+[components.audio_decode]
+distribution = "soundfile"
+import_name = "soundfile"
+profile = "desktop"
+
+[components.wake]
+distribution = "openwakeword"
+import_name = "openwakeword"
+profile = "desktop"
+model_env = "GAIA_WAKEWORD_MODEL"
+
+[components.vad]
+distribution = "silero-vad"
+import_name = "silero_vad"
+profile = "voice"
+
+[components.stt]
+distribution = "faster-whisper"
+import_name = "faster_whisper"
+profile = "voice"
+
+[components.tts]
+distribution = "piper-tts"
+import_name = "piper"
+profile = "voice"
+
+[components.browser]
+distribution = "browser-use"
+import_name = "browser_use"
+profile = "sidecar:browser"
+sidecar = "browser"
+external = "Chromium runtime"
+
+[components.mem0]
+distribution = "mem0ai"
+import_name = "mem0"
+profile = "sidecar:memory"
+sidecar = "memory"
+
+[components.graphiti]
+distribution = "graphiti-core"
+import_name = "graphiti_core"
+profile = "isolated"
+external = "Neo4j"
+
+[components.openhands]
+distribution = "openhands-sdk"
+import_name = "openhands.sdk"
+profile = "sidecar:coding"
+sidecar = "coding"
+
+[components.computer]
+distribution = "pyautogui"
+import_name = "pyautogui"
+profile = "full_computer"
+
+[components.uia]
+distribution = "pywinauto"
+import_name = "pywinauto"
+profile = "full_computer"
+platform = "Windows"
+
+[components.keyring]
+distribution = "keyring"
+import_name = "keyring"
+profile = "desktop"

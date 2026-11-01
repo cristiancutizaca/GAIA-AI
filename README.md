@@ -1,64 +1,131 @@
-# GAIA-AI v1.0-RC6 + DeepSeek-Harness
+# GAIA-AI 2.0 — Windows Complete RC1
 
-Esta edición usa DeepSeek-Harness como motor de razonamiento con Ollama local. Consulta `DEEPSEEK_HARNESS.md` para instalarlo y configurarlo.
+GAIA is a local-first resident personal assistant. This release focuses on a reproducible Windows installation, a resident Core + Desktop lifecycle, local voice, browser/coding providers, memory isolation and deterministic Windows automation while preserving GAIA's central authority model.
 
-RC6 consolida el trabajo funcional de RC5, corrige la inconsistencia documental reproducida y añade optimización controlada únicamente cuando existe medición comparable. La prioridad es preservar verdad, seguridad, datos, compatibilidad y reproducibilidad antes que perseguir una cifra de benchmark.
+**Product version:** `2.0.0`  
+**Release:** `2.0-WINDOWS-COMPLETE-RC3`  
+**Wire protocol:** `1.0-RC6` (compatibility identifier, not the product release)
 
-## Estado de la release
+RC1 is intentional. The software has been hardened, but a genuine custom **Gaia** wake-word model and physical Windows validation are still required before calling the package FINAL.
 
-RC5 se conserva como baseline histórico y está clasificada como **RC5 NOT FROZEN / ARTIFACT CONSISTENCY FAILURE** porque su ZIP documental contenía cuatro documentos que no existían en el ZIP principal y omitía tres archivos de requisitos del proyecto. RC6 adopta una política única: el ZIP documental se genera automáticamente como proyección exacta de todos los miembros Markdown/TXT del ZIP de proyecto. No se copia documentación desde una carpeta paralela.
+## Fastest clean Windows setup
 
-La decisión RC6 solo podrá ser **RC6 FROZEN / AUTOMATED PASS / PHYSICAL VALIDATION PENDING** después de que pasen todos los gates y la auditoría externa. Ninguna ejecución Linux convierte los controles físicos en PASS y ningún documento autoriza una promoción fuera de la condición RC6.
+On Windows 11 x64 with Python 3.11 available, extract the release and run from PowerShell:
 
-## Identidad activa
-
-| Superficie | Identidad RC6 |
-|---|---|
-| Release | `1.0-RC6` |
-| Core/PC | `1.0.0-rc6-pc` |
-| Protocolo | `1.0-RC6` |
-| Flutter/Android | `1.0.0-rc6+1` |
-| Android `versionName` | `1.0-RC6` |
-| Migración target | `1.0.0-rc6` |
-| Snapshot | `gaia-rc6-snapshot-1` |
-| Package root | `GAIA-AI-v1.0-RC6` |
-| Runner | `gaia_rc6_validator` |
-| Wrapper | `validate-gaia-rc6.ps1` |
-
-## Superficie activa
-
-Los contratos, herramientas y documentos operativos RC6 incluidos en el paquete son `tools/validate_rc6.py`, `tools/build_release.py`, `tools/build_docs.py`, `tools/gaia_migrate.py`, `tools/gaia_benchmark.py`, `tools/physical_validation.py`, `validate-gaia-rc6.ps1`, `install-gaia.ps1`, `setup-windows.bat`, `release_manifest.json`, `RC6_REQUIREMENTS.md`, `PERFORMANCE_RC6_REPORT.md`, `PERFORMANCE_COMPARISON_RC5_RC6.md`, `PHYSICAL_VALIDATION_RC6.md`, `WINDOWS_RC6_VALIDATION_CHECKLIST.md`, `MIGRATION_MATRIX_RC5_RC6.md`, `RELEASE_DECISION_RC6.md`, `UPDATE_ROLLBACK_GUIDE.md`, `DOCUMENT_CLASSIFICATION_RC6.md`, `TEST_REPORT.md`, `FINAL_VALIDATION.txt`, `AUDIT.md`, `SECURITY_MODEL.md`, `THREAT_MODEL.md`, `KNOWN_LIMITATIONS.md`, `MODIFIED_FILES.md`, `tests/rc6_identity_documentation_test.py`, `tests/rc6_document_parity_test.py`, `tests/rc6_validation_runner_test.py`, `tests/rc6_physical_validation_test.py`, `tests/rc6_migrator_cli_contract_test.py`, `tests/rc6_benchmark_contract_test.py`, `tests/rc6_builder_contract_test.py`, `tests/rc6_validation_runner_contract_test.py`, `tests/release_package_test.py` y los contratos heredados actualizados.
-
-## Validación reproducible
-
-El orden de validación es package gate, identidad, preflight inicial, instalación explícitamente autorizada si es necesaria, reejecución en venv externo, preflight posterior, compile, suite completa, benchmark RC5, benchmark RC6, comparación, seguridad, builds A/B, extracción limpia, suite desde ZIP, paridad proyecto↔docs y auditoría de artefactos. Las métricas de rendimiento se comparan solo en el mismo entorno y con fixtures idénticos.
-
-```text
-python tools/validate_rc6.py --all --output-dir ..\RC6-validation --confirm-install --recreate-venv
-python tools/build_release.py --output-dir ..\RC6-build-a
-python tools/build_docs.py --project-zip ..\RC6-build-a\GAIA-AI-v1.0-RC6-final.zip --output-dir ..\RC6-docs-a
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Setup-GAIA.ps1
 ```
 
-La evidencia, el venv, las bases, los logs y los resultados privados permanecen fuera del árbol del proyecto. Los comandos de Windows vigentes están en `WINDOWS_RC6_VALIDATION_CHECKLIST.md` y `UPDATE_ROLLBACK_GUIDE.md`.
+The wrapper selects the `full-computer` profile and prepares Desktop, Voice, Browser, Memory, Coding and deterministic Windows Computer Use. It may install Ollama and baseline voice models unless explicitly skipped. Large Ollama LLM models are never downloaded silently.
 
-## Seguridad y validación física
+See **`GAIA_WINDOWS_INSTALL_GUIDE_2_1.md`** for the complete procedure.
 
-El runner usa procesos en forma de lista, `shell=False`, límites temporales y redacción. No inicia Ollama, no descarga modelos, no modifica hardware y no deja servicios persistentes. La validación física mantiene los doce controles en `PENDING` hasta contar con evidencia humana en el equipo objetivo. Consulte `SECURITY_MODEL.md`, `THREAT_MODEL.md` y `PHYSICAL_VALIDATION_RC6.md` para los límites completos.
+## Normal resident lifecycle
 
-## Índice literal de archivos activos RC6
+```text
+Windows login
+  → GAIA supervisor
+  → Core starts and passes /api/health
+  → Desktop Shell/tray starts
+  → wake/PTT/Quick Command
+  → GAIA Core authority + capability routing
+  → local/provider backend
+  → audit/event state
+  → response/TTS
+```
 
-La siguiente tabla es el índice cruzado que valida el package gate:
+The Dashboard is secondary. The tray/orb/voice/Quick Command are the intended daily control surfaces.
 
-| Categoría | Archivos |
-|---|---|
-| Gobierno | `CHANGELOG.md`, `AUDIT.md`, `TEST_REPORT.md`, `FINAL_VALIDATION.txt`, `KNOWN_LIMITATIONS.md`, `MODIFIED_FILES.md`, `SECURITY_MODEL.md`, `THREAT_MODEL.md` |
-| Requisitos y operación | `RC6_REQUIREMENTS.md`, `PERFORMANCE_RC6_REPORT.md`, `PERFORMANCE_COMPARISON_RC5_RC6.md`, `PHYSICAL_VALIDATION_RC6.md`, `WINDOWS_RC6_VALIDATION_CHECKLIST.md`, `MIGRATION_MATRIX_RC5_RC6.md`, `RELEASE_DECISION_RC6.md`, `UPDATE_ROLLBACK_GUIDE.md`, `DOCUMENT_CLASSIFICATION_RC6.md` |
-| Entrypoints | `install-gaia.ps1`, `validate-gaia-rc6.ps1`, `setup-windows.bat`, `tools/validate_rc6.py`, `tools/build_release.py`, `tools/build_docs.py`, `tools/gaia_migrate.py`, `tools/gaia_benchmark.py`, `tools/physical_validation.py` |
-| Contratos | `tests/release_package_test.py`, `tests/rc6_identity_documentation_test.py`, `tests/rc6_document_parity_test.py`, `tests/rc6_validation_runner_test.py`, `tests/rc6_validation_runner_contract_test.py`, `tests/rc6_physical_validation_test.py`, `tests/rc6_migrator_cli_contract_test.py`, `tests/rc6_powershell_wrapper_contract_test.py`, `tests/rc6_benchmark_contract_test.py`, `tests/rc6_builder_contract_test.py` |
+## Security architecture
 
+External systems never become authority. Side effects remain under:
 
-## GAIA 2.0 - Asistente residente para Windows
+```text
+GAIA Core
+→ Capability Router / Planner
+→ Authority
+→ Kill Switch
+→ Safe Mode
+→ Permission Layer
+→ ActionCoordinator / Action Host
+→ provider/backend
+→ verification/audit
+```
 
-La instalación, el inicio con Windows, el micrófono y el control local de PC
-se documentan en [GAIA_RESIDENT_WINDOWS.md](GAIA_RESIDENT_WINDOWS.md).
-Los capítulos anteriores son documentación histórica del contrato RC6.
+Browser Use, OpenHands, Windows UI Automation, PyAutoGUI, MCP, voice and Android are providers/clients below that boundary.
+
+## Voice status
+
+The connected Desktop voice path in this RC is:
+
+```text
+wake or PTT
+→ local microphone capture
+→ /api/chat/voice
+→ faster-whisper
+→ normal GAIA Core chat/authority path
+→ Piper
+→ WAV
+→ Desktop audio output
+```
+
+Silero is used for endpointing and barge-in monitoring. Production defaults are CPU-safe and do not require NVIDIA/CUDA.
+
+Pipecat remains installed as an optional integration layer, but the generic Pipecat adapter now refuses to claim a fake production pipeline unless real processors/transports are configured.
+
+## Wake word status
+
+GAIA no longer substitutes a Jarvis detector and calls it “Gaia”. A real custom `gaia.onnx` is required. If it is absent, the runtime reports `CUSTOM_MODEL_MISSING` and wake mode remains fail-closed.
+
+The release includes official-training-oriented configuration and install/verification tooling under `assets/wakeword/` and `tools/`.
+
+## Windows Computer Use
+
+The current deterministic order is:
+
+1. Windows UI Automation (`pywinauto`) when a real control is addressable.
+2. PyAutoGUI coordinate fallback.
+3. Optional future visual-agent provider such as Agent-S or UI-TARS Desktop, not installed or falsely advertised by default.
+
+## Useful commands
+
+```powershell
+.\.venv\Scripts\python.exe tools\gaia.py version
+.\.venv\Scripts\python.exe tools\gaia_dependencies.py status --profile full-computer --strict-python
+.\.venv\Scripts\python.exe tools\gaia_models.py status
+.\.venv\Scripts\python.exe tools\gaia_doctor_v2.py
+.\.venv\Scripts\python.exe tools\gaia_startup.py enable
+.\.venv\Scripts\python.exe lumen-pc\gaia_desktop_launcher.py
+```
+
+Physical validation must be stored outside the project tree:
+
+```powershell
+.\.venv\Scripts\python.exe tools\physical_validation.py new --output-dir "$env:USERPROFILE\Documents\GAIA-Physical-Validation"
+```
+
+## Tests
+
+Current normal pytest collection is intentionally limited to proper `test_*.py` tests. Legacy script-style regression gates remain available separately.
+
+```text
+python -m compileall -q lumen-core lumen-pc tools tests
+pytest --collect-only -q
+pytest -q
+```
+
+The repair report also records critical legacy regression scripts for Authority, Core E2E, Security, Kill Switch, permission levels, memory security and voice permissions.
+
+## Current documents
+
+- `GAIA_FINAL_REPAIR_REPORT_2_1.md` — exact repair/reality report.
+- `GAIA_DEPENDENCY_AUDIT.md` — dependency/profile audit.
+- `GAIA_WINDOWS_INSTALL_GUIDE_2_1.md` — clean Windows installation and physical-validation path.
+- `release_manifest.json` — canonical release metadata.
+- `gaia_dependencies.toml` — canonical optional dependency/profile manifest.
+
+Older “GAIA_FINAL_*” reports from previous Manus runs were moved under `reports/history/pre-windows-complete-rc1/` so they cannot be mistaken for current reality. The old RC6 README is preserved at `reports/history/README_RC6.md`.
+
+## RC3 dependency isolation
+
+Full/Full-Computer now uses four environments by design: `.venv` (GAIA Core/Desktop/Voice/Computer Use on 3.11), `.venv-browser` (Browser Use 3.11), `.venv-memory` (Mem0 3.11) and `.venv-coding` (OpenHands 3.12). This prevents Browser Use exact pins from mutating Core/Voice dependencies, avoids the Browser Use/Mem0 PostHog conflict, and satisfies OpenHands' Python >=3.12 requirement. See `GAIA_RC3_DEPENDENCY_ISOLATION.md`.

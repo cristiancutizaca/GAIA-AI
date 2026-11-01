@@ -1,3 +1,4 @@
-# Optional GAIA coding group
-openhands-sdk==1.52.0
-smolagents==1.26.0
+# OpenHands lives in an isolated Python 3.12 sidecar environment.
+# Keep SDK + tools on the same published version.
+openhands-sdk==1.58.1
+openhands-tools==1.58.1

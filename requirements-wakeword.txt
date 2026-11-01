@@ -1,2 +1,0 @@
-# Optional: only install when GAIA_WAKEWORD_MODEL points to an actual GAIA model.
-openwakeword>=0.6

@@ -1,23 +1,35 @@
 #!/usr/bin/env python3
-"""GAIA Doctor: read-only, honest capability inventory with distribution/module mapping."""
+"""GAIA Doctor 2.1: read-only capability/dependency inventory from canonical manifest."""
 from __future__ import annotations
-import importlib.util, json, os, platform, shutil, sys
+import importlib.util, json, os, platform, shutil, subprocess, sys
 from pathlib import Path
-ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT/'lumen-core')); sys.path.insert(0,str(ROOT/'lumen-pc'))
+ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT/'lumen-core')); sys.path.insert(0,str(ROOT/'lumen-pc')); sys.path.insert(0,str(ROOT/'tools'))
 from gaia_ext.feature_flags import feature_flags
+from gaia_dependencies import component_status, load
 
-def check(name,status,detail="",suggestion=""): return {"name":name,"status":status,"detail":detail,"suggestion":suggestion}
-MAPPING={"browser-use":"browser_use","pipecat-ai":"pipecat","silero-vad":"silero_vad","openai-whisper":"whisper","edge-tts":"edge_tts","mem0ai":"mem0","graphiti-core":"graphiti_core","openhands-sdk":"openhands.sdk","PySide6":"PySide6","openwakeword":"openwakeword","sounddevice":"sounddevice"}
-def module_status(dist,module,enabled=False):
-    present=importlib.util.find_spec(module) is not None
-    if not present:return "MISSING_DEPENDENCY",f"distribution {dist} -> import {module} missing",f"Install {dist} in its optional environment."
-    return "PASS" if enabled else "DEGRADED",f"distribution {dist} -> import {module} available","Enable feature flag and run physical validation where applicable."
+def check(name,status,detail='',suggestion=''): return {'name':name,'status':status,'detail':detail,'suggestion':suggestion}
+def mod(name): return importlib.util.find_spec(name) is not None
+
 def run()->dict:
-    flags=feature_flags.as_dict(); checks=[check("CORE","PASS","GAIA Core and central authority are loaded"),check("OLLAMA","PASS" if shutil.which("ollama") else "CONFIG_REQUIRED","local Ollama executable"),check("MODELS","DEGRADED","model availability is deployment-specific"),check("MCP","PASS" if flags["mcp"] else "DEGRADED","MCP feature flag and manager"),check("CHROMIUM","PASS" if shutil.which("chromium") or shutil.which("chromium-browser") else "PHYSICAL_VALIDATION_REQUIRED","executable discovery only")]
-    for key,dist,module in [("browser","browser-use","browser_use"),("voice_v2","pipecat-ai","pipecat"),("vad","silero-vad","silero_vad"),("mem0","mem0ai","mem0"),("graph_memory","graphiti-core","graphiti_core"),("coding_worker","openhands-sdk","openhands.sdk"),("computer_use","ui-tars","ui_tars")]:
-        st,detail,sugg=module_status(dist,module,flags.get(key,False)); checks.append(check(key.upper(),st if flags.get(key,False) else ("DEGRADED" if st=="PASS" else st),detail,sugg))
-    for name,dist,module in [("STT","openai-whisper","whisper"),("TTS","edge-tts","edge_tts"),("DESKTOP_SHELL","PySide6","PySide6"),("SYSTEM_TRAY","PySide6","PySide6"),("WAKE_WORD","openwakeword","openwakeword"),("ANDROID_REALTIME","websockets","websockets")]:
-        st,detail,sugg=module_status(dist,module,False); checks.append(check(name,st,detail,sugg))
-    checks += [check("VISUALIZER","PASS","read-only HTML/SSE consumer"),check("PERMISSIONS","PASS","central Permission Layer + Action Host"),check("SAFE_MODE","PASS","fail-closed for effects"),check("KILL_SWITCH","PASS","global effect block"),check("PHYSICAL_WINDOWS","PHYSICAL_VALIDATION_REQUIRED","tray, microphone, wake word, overlay and GUI need Windows operator"),check("ANDROID","PHYSICAL_VALIDATION_REQUIRED","device/toolchain not present in Sandbox")]
-    return {"doctor":"2.0-final","read_only":True,"platform":platform.platform(),"flags":flags,"mapping":MAPPING,"checks":checks}
+    flags=feature_flags.as_dict(); checks=[]
+    checks.append(check('PYTHON','PASS' if sys.version_info[:2]==(3,11) else 'CONFIG_REQUIRED',sys.version.split()[0],'GAIA release targets Python 3.11.'))
+    checks.append(check('CORE','PASS','GAIA Core + central authority import path present'))
+    checks.append(check('OLLAMA','PASS' if shutil.which('ollama') else 'CONFIG_REQUIRED',shutil.which('ollama') or 'ollama executable not found','Install Ollama only if local LLM is desired.'))
+    checks.append(check('GIT','PASS' if shutil.which('git') else 'CONFIG_REQUIRED',shutil.which('git') or 'git executable not found'))
+    for item in component_status():
+        st='PASS' if item['status']=='READY' else item['status']
+        checks.append(check(item['name'].upper(),st,f"{item['distribution']} -> {item['import']}; profile={item['profile']}",item.get('external','')))
+        if 'model_status' in item: checks.append(check(item['name'].upper()+'_MODEL','PASS' if item['model_status']=='READY' else 'CONFIG_REQUIRED',item.get('model') or 'GAIA_WAKEWORD_MODEL not configured','Use tools/setup_gaia_wakeword.py with a trusted Gaia ONNX model.'))
+    piper_ready=mod('piper'); checks.append(check('PIPER_RUNTIME','PASS' if piper_ready else 'MISSING_DEPENDENCY','python -m piper' if piper_ready else 'piper module not found','Install Voice/Full profile (piper-tts).'))
+    wake_default=ROOT/'assets'/'wakeword'/'gaia.onnx'; wake=os.getenv('GAIA_WAKEWORD_MODEL','').strip(); wake_path=Path(wake) if wake else wake_default
+    checks.append(check('GAIA_WAKE_MODEL','PASS' if wake_path.is_file() else 'CONFIG_REQUIRED',str(wake_path),'Train/install an actual Gaia model; no Jarvis fallback is used.'))
+    browser_py=ROOT/'.venv-browser'/('Scripts/python.exe' if os.name=='nt' else 'bin/python')
+    browser_playwright=False
+    if browser_py.is_file():
+        try:
+            browser_playwright=subprocess.run([str(browser_py),'-c','import playwright'],capture_output=True,timeout=10).returncode==0
+        except Exception: browser_playwright=False
+    checks.append(check('CHROMIUM_RUNTIME','DEGRADED' if browser_playwright else 'MISSING_DEPENDENCY','Playwright present in .venv-browser' if browser_playwright else 'Browser sidecar/Playwright missing','Installer runs Chromium install inside .venv-browser; physical launch still needs validation.'))
+    checks += [check('PERMISSIONS','PASS','central Permission Layer + Action Host'),check('SAFE_MODE','PASS','fail-closed for effects'),check('KILL_SWITCH','PASS','global effect block'),check('PHYSICAL_WINDOWS','PHYSICAL_VALIDATION_REQUIRED','microphone, speaker, hotkeys, wake accuracy and real desktop control need operator validation')]
+    return {'doctor':'2.1-clean-install','read_only':True,'platform':platform.platform(),'flags':flags,'dependency_schema':load().get('schema'),'checks':checks}
 if __name__=='__main__': print(json.dumps(run(),ensure_ascii=False,indent=2))

@@ -4,8 +4,9 @@
   "manifest_format": 2,
   "product": "GAIA-AI",
   "protocol": "1.0-RC6",
-  "release": "2.0-RESIDENT-DESKTOP-ASSISTANT",
+  "release": "2.0-WINDOWS-COMPLETE-RC3",
   "schema_max": 9,
   "schema_min": 8,
+  "status": "DEPENDENCY_ISOLATION_FIXED_PHYSICAL_WINDOWS_VALIDATION_PENDING",
   "version": "2.0.0"
 }

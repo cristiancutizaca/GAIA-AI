@@ -1,233 +1,76 @@
-"""GAIA resident supervisor for Windows/Linux user sessions.
-
-Owns only processes it started. Does not elevate privileges, disable Windows
-security, or expose the local API on the network.
-"""
+"""Resident GAIA supervisor: Core first, health gate, then Desktop Shell."""
 from __future__ import annotations
-
-import argparse
-import os
-from datetime import datetime
-import subprocess
-import sys
-import time
+import argparse, ctypes, os, subprocess, sys, time
 from pathlib import Path
-
 import httpx
-from dotenv import load_dotenv
-
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env", override=False)
-CORE = ROOT / "lumen-core"
-SHELL = ROOT / "lumen-pc" / "desktop_shell.py"
-HOST = ROOT / "tools" / "run_remote_action_host.py"
-URL = os.getenv("LUMEN_CORE_URL", f"http://127.0.0.1:{os.getenv('LUMEN_PORT', '8090')}").rstrip("/")
-LOCK = Path(os.getenv("GAIA_LAUNCHER_LOCK", str(Path.home() / ".gaia" / "launcher.lock"))).expanduser()
-LOG_DIR = Path(os.getenv("GAIA_RESIDENT_LOG_DIR", str(Path.home() / ".gaia" / "logs"))).expanduser()
-RESTART_EXIT_CODE = 75
-
+ROOT=Path(__file__).resolve().parents[1]; CORE=ROOT/'lumen-core'; SHELL=ROOT/'lumen-pc'/'desktop_shell.py'
+URL=os.getenv('LUMEN_CORE_URL','http://127.0.0.1:'+os.getenv('LUMEN_PORT','8090')).rstrip('/')
+LOCK=Path(os.getenv('GAIA_LAUNCHER_LOCK',str(Path.home()/'.gaia'/'launcher.lock'))).expanduser(); RESTART_EXIT_CODE=75
 
 class SingleInstance:
     def __enter__(self):
-        LOCK.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = LOCK.open("a+")
-        try:
-            if os.name == "nt":
-                import msvcrt
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError):
-            self.handle.close()
-            raise SystemExit("GAIA launcher already running")
+        if os.name=='nt':
+            self.kernel32=ctypes.windll.kernel32; self.mutex=self.kernel32.CreateMutexW(None,False,'Local\\GAIA_Resident_Desktop_Assistant')
+            if not self.mutex: raise OSError('CreateMutexW failed')
+            if int(self.kernel32.GetLastError())==183:
+                self.kernel32.CloseHandle(self.mutex); raise SystemExit('GAIA launcher already running')
+            return self
+        LOCK.parent.mkdir(parents=True,exist_ok=True); self.handle=LOCK.open('a+'); self.handle.seek(0)
+        if self.handle.read(1)=='': self.handle.seek(0); self.handle.write('0'); self.handle.flush()
         self.handle.seek(0)
-        self.handle.truncate()
-        self.handle.write(str(os.getpid()))
-        self.handle.flush()
-        return self
-
-    def __exit__(self, *_):
         try:
-            if os.name == "nt":
-                import msvcrt
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            import fcntl; fcntl.flock(self.handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except (OSError,BlockingIOError): raise SystemExit('GAIA launcher already running')
+        self.handle.seek(0); self.handle.truncate(); self.handle.write(str(os.getpid())); self.handle.flush(); return self
+    def __exit__(self,*args):
+        try:
+            if os.name=='nt': self.kernel32.CloseHandle(self.mutex)
             else:
-                import fcntl
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
-            # Do not unlink a potentially re-acquired lock file on Windows.
-            if os.name != "nt":
-                LOCK.unlink(missing_ok=True)
+                import fcntl; fcntl.flock(self.handle.fileno(),fcntl.LOCK_UN); self.handle.close(); LOCK.unlink(missing_ok=True)
+        except OSError: pass
 
-
-def healthy() -> bool:
+def healthy()->bool:
     try:
-        response = httpx.get(URL + "/api/health", timeout=2.0)
-        return response.status_code == 200 and response.json().get("status") in {"online", "ok", "healthy"}
-    except (httpx.HTTPError, ValueError):
-        return False
+        r=httpx.get(URL+'/api/health',timeout=1.5); return r.status_code==200 and str(r.json().get('status','')).lower() in {'online','ok','healthy'}
+    except Exception:return False
 
+def start_core():
+    return subprocess.Popen([sys.executable,'-m','uvicorn','main:app','--host',os.getenv('LUMEN_HOST','127.0.0.1'),'--port',os.getenv('LUMEN_PORT','8090')],cwd=CORE,env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'},creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),close_fds=(os.name!='nt'))
 
-def _env() -> dict[str, str]:
-    return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+def stop_process(proc,timeout=8):
+    if not proc or proc.poll() is not None:return
+    proc.terminate()
+    try: proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired: proc.kill(); proc.wait(timeout=3)
 
-
-def _note(message: str) -> None:
-    """Durable, bounded diagnostics even when autostart uses pythonw.exe."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log = LOG_DIR / "supervisor.log"
-    if log.exists() and log.stat().st_size > 2_000_000:
-        old = log.with_suffix(".previous.log")
-        os.replace(log, old)
-    with log.open("a", encoding="utf-8") as out:
-        out.write(datetime.now().isoformat(timespec="seconds") + " " + message + "\n")
-
-
-def _spawn(name: str, args: list[str], *, cwd: Path = ROOT, env: dict | None = None):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logfile = LOG_DIR / f"{name}.log"
-    if logfile.exists() and logfile.stat().st_size > 5_000_000:
-        os.replace(logfile, LOG_DIR / f"{name}.previous.log")
-    log = logfile.open("a", encoding="utf-8", buffering=1)
-    try:
-        process = subprocess.Popen(
-            args, cwd=cwd, env=env or _env(),
-            stdout=log, stderr=subprocess.STDOUT,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            close_fds=(os.name != "nt"),
-        )
-    finally:
-        log.close()
-    return process
-
-
-def _stop(process) -> None:
-    if process is None or process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=7)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=3)
-
-
-def _core_process():
-    return _spawn("core", [
-        sys.executable, "-m", "uvicorn", "main:app",
-        "--host", os.getenv("LUMEN_HOST", "127.0.0.1"),
-        "--port", os.getenv("LUMEN_PORT", "8090"),
-    ], cwd=CORE)
-
-
-def _wait_for_core(timeout: int) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if healthy():
-            return True
-        time.sleep(0.5)
+def wait_healthy(wait):
+    deadline=time.monotonic()+wait
+    while time.monotonic()<deadline:
+        if healthy(): return True
+        time.sleep(.25)
     return healthy()
 
-
-def launch(*, shell: bool = True, host: bool = True, wait: int = 45, once: bool = False) -> int:
+def launch(*,shell=True,wait=30,once=False)->int:
     with SingleInstance():
-        core_proc = None
-        shell_proc = None
-        host_proc = None
-        host_enabled = host and os.getenv("GAIA_REMOTE_HOST_ENABLED", "true").lower() in {"1", "true", "yes"}
-        try:
-            if once:
-                if not healthy():
-                    core_proc = _core_process()
-                if not _wait_for_core(wait):
-                    raise RuntimeError("GAIA Core failed readiness; see ~/.gaia/logs/core.log")
-                return 0
-            # Windows can start before networking, permissions, or user apps
-            # settle. Keep retrying without spawning duplicate child processes.
-            while not healthy():
-                if core_proc is None or core_proc.poll() is not None:
-                    core_proc = _core_process()
-                    _note("Starting Core (resident readiness).")
-                if _wait_for_core(wait):
-                    break
-                _note("Core was not ready; restarting owned process after cooldown.")
-                _stop(core_proc)
-                core_proc = None
-                time.sleep(5)
-            if host_enabled:
-                host_proc = _spawn("action-host", [sys.executable, str(HOST)])
-            if not shell:
-                # A headless session keeps the Core and Action Host alive until Ctrl+C.
-                while True:
-                    if host_enabled and host_proc is not None and host_proc.poll() is not None:
-                        host_proc = _spawn("action-host", [sys.executable, str(HOST)])
-                    if core_proc is not None and core_proc.poll() is not None:
-                        core_proc = _core_process()
-                        if not _wait_for_core(wait):
-                            raise RuntimeError("GAIA Core failed to restart")
-                    time.sleep(2)
-            failures = []
-            shell_proc = _spawn("desktop", [sys.executable, str(SHELL)],
-                                env={**_env(), "GAIA_LAUNCHER_ACTIVE": "1"})
-            last_health = 0.0
-            while True:
-                exit_code = shell_proc.poll()
-                if exit_code is not None:
-                    if exit_code == 0:
-                        return 0  # User chose Exit GAIA.
-                    now = time.monotonic()
-                    failures = [t for t in failures if now - t < 60]
-                    failures.append(now)
-                    if exit_code == RESTART_EXIT_CODE:
-                        delay = 0.5
-                        failures.clear()
-                    else:
-                        delay = min(60.0, 2.0 ** min(len(failures), 6))
-                        _note(f"Desktop exited code={exit_code}; restart in {delay:.0f}s.")
-                    time.sleep(delay)
-                    shell_proc = _spawn("desktop", [sys.executable, str(SHELL)],
-                                        env={**_env(), "GAIA_LAUNCHER_ACTIVE": "1"})
-                if host_enabled and host_proc is not None and host_proc.poll() is not None:
-                    # The host's own 30 retries may be exhausted after a Core outage.
-                    time.sleep(2)
-                    host_proc = _spawn("action-host", [sys.executable, str(HOST)])
-                now = time.monotonic()
-                if now - last_health >= 8:
-                    last_health = now
-                    if not healthy():
-                        # Stop only a process started by *this* supervisor.
-                        # Never terminate an external Core on the same port.
-                        if core_proc is not None:
-                            _stop(core_proc)
-                        core_proc = _core_process()
-                        _note("Core not responsive; restarting owned Core.")
-                        if not _wait_for_core(wait):
-                            _note("Core still unavailable; will retry on next health check.")
-                            _stop(core_proc)
-                            core_proc = None
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            return 0
-        finally:
-            _stop(shell_proc)
-            _stop(host_proc)
-            _stop(core_proc)
+        core_proc=None
+        if not healthy(): core_proc=start_core()
+        if not wait_healthy(wait): stop_process(core_proc); raise RuntimeError('GAIA Core failed health readiness')
+        if once:
+            stop_process(core_proc); return 0
+        if not shell:return 0
+        while True:
+            shell_proc=subprocess.Popen([sys.executable,str(SHELL)],cwd=ROOT,env={**os.environ,'GAIA_LAUNCHER_ACTIVE':'1','PYTHONDONTWRITEBYTECODE':'1'},creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0),close_fds=(os.name!='nt'))
+            rc=shell_proc.wait()
+            if rc!=RESTART_EXIT_CODE:
+                stop_process(core_proc); return rc
+            # A normal launcher owns the Core. Restart it together with Desktop.
+            if core_proc is not None:
+                stop_process(core_proc); core_proc=start_core()
+                if not wait_healthy(wait): stop_process(core_proc); raise RuntimeError('GAIA Core failed restart readiness')
+            elif not healthy():
+                core_proc=start_core()
+                if not wait_healthy(wait): stop_process(core_proc); raise RuntimeError('GAIA Core failed restart readiness')
 
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true", help="Start/verify Core and exit.")
-    parser.add_argument("--no-shell", action="store_true")
-    parser.add_argument("--no-host", action="store_true")
-    parser.add_argument("--wait", type=int, default=45)
-    args = parser.parse_args()
-    return launch(shell=not args.no_shell, host=not args.no_host,
-                  wait=args.wait, once=args.once)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main():
+    p=argparse.ArgumentParser(); p.add_argument('--once',action='store_true'); p.add_argument('--no-shell',action='store_true'); p.add_argument('--wait',type=int,default=30); a=p.parse_args(); return launch(shell=not a.no_shell,wait=a.wait,once=a.once)
+if __name__=='__main__': raise SystemExit(main())

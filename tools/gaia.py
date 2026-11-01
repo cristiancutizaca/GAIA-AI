@@ -15,15 +15,15 @@ from gaia_platform.backup import BackupManager
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="gaia")
-    parser.add_argument("command", choices=["version","start","stop","restart","status","doctor","models","memory","skills","plugins","mcp","browser","voice","workers","automations","devices","backup","restore","update","rollback","logs","config","flags","plan","diagnostics","validate","desktop","startup"])
+    parser.add_argument("command", choices=["version","start","stop","restart","status","doctor","models","memory","skills","plugins","mcp","browser","voice","workers","automations","devices","backup","restore","update","rollback","logs","config","flags","plan","diagnostics","validate","desktop","startup","dependencies"])
     parser.add_argument("target", nargs="?", default="list")
     parser.add_argument("--output", default="")
     parser.add_argument("--message", default="")
     args = parser.parse_args(argv)
     foundation = build_foundation()
     if args.command == "version":
-        from gaia_version import PRODUCT_VERSION, RELEASE, WIRE_PROTOCOL
-        print(json.dumps({"gaia":PRODUCT_VERSION,"release":RELEASE,"wire_protocol":WIRE_PROTOCOL,"schema":1,"flags":feature_flags.as_dict()}, indent=2)); return 0
+        from gaia_version import PRODUCT_VERSION, RELEASE, PROTOCOL_VERSION
+        print(json.dumps({"gaia":PRODUCT_VERSION,"release":RELEASE,"wire_protocol":PROTOCOL_VERSION,"schema":1,"flags":feature_flags.as_dict()}, indent=2)); return 0
     if args.command in {"doctor","status"}:
         from gaia_doctor_v2 import run
         print(json.dumps(run(), ensure_ascii=False, indent=2)); return 0
@@ -50,6 +50,18 @@ def main(argv=None):
     if args.command == "startup":
         action = args.target if args.target in {"enable", "disable", "status"} else "status"
         return subprocess.call([sys.executable, str(ROOT / "tools" / "gaia_startup.py"), action])
+    if args.command == "dependencies":
+        action = args.target if args.target in {"profiles", "status"} else "status"
+        cmd=[sys.executable,str(ROOT/"tools"/"gaia_dependencies.py"),action]
+        if action=="status": cmd += ["--profile", args.output or "desktop"]
+        return subprocess.call(cmd)
+    if args.command == "models":
+        target=args.target if args.target in {"status","install"} else "status"
+        cmd=[sys.executable,str(ROOT/"tools"/"gaia_models.py"),target]
+        if target=="install":
+            # `gaia models install --output baseline|piper|stt` keeps the compact legacy CLI stable.
+            cmd.append(args.output or "baseline")
+        return subprocess.call(cmd)
     if args.command == "desktop":
         sys.path.insert(0, str(ROOT / "lumen-pc"))
         from desktop_shell import DesktopShell
