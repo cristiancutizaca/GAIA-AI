@@ -49,3 +49,6 @@ tmp/
 # Runtime JS opcional de DeepSeek Harness (no se empaqueta ni versiona)
 node_modules/
 deepseek-harness/node_modules/
+
+# Entornos virtuales de GAIA
+.venv-*/
