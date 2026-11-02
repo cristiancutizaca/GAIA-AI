@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+# The resident launcher imports this module directly. Load the same .env as
+# GAIA Core BEFORE ShellConfig defaults are evaluated (secret/hotkeys/wake).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+except ImportError:
+    pass
+
 try:
     from PySide6.QtCore import QObject, Qt, Signal
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
@@ -41,9 +49,9 @@ RESTART_EXIT_CODE = 75
 class ShellConfig:
     core_url: str = CORE_DEFAULT
     secret: str = os.getenv("LUMEN_SECRET", "")
-    orb_size: int = int(os.getenv("GAIA_ORB_SIZE", "72"))
+    orb_size: int = int(os.getenv("GAIA_ORB_SIZE", "196"))
     corner: str = os.getenv("GAIA_ORB_CORNER", "bottom-right")
-    orb_mode: str = os.getenv("GAIA_ORB_MODE", "wake_only").lower()
+    orb_mode: str = os.getenv("GAIA_ORB_MODE", "always_visible").lower()
     wake_word: bool = os.getenv("GAIA_WAKEWORD_ENABLED", "false").lower() in {"1","true","yes"}
     microphone: bool = os.getenv("GAIA_MICROPHONE_ENABLED", "true").lower() in {"1","true","yes"}
     ptt_hotkey: str = os.getenv("GAIA_PUSH_TO_TALK", "Ctrl+Space")
@@ -270,8 +278,7 @@ class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
 class DesktopShell:
     def __init__(self,config:ShellConfig|None=None,api=None):
         self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None
-        self.quick_command_window=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.bridge=None
-        self.events=DesktopEventClient(self.config.core_url,self.config.secret,self._queue_core_event)
+        self.quick_command_window=None; self.panel=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.bridge=None
         self.ptt_hotkey=GlobalHotkey(lambda:self._queue_hotkey("ptt_down"),lambda:self._queue_hotkey("ptt_up"),self.config.ptt_hotkey,0x4741)
         self.quick_hotkey=GlobalHotkey(lambda:self._queue_hotkey("quick"),lambda:None,self.config.quick_hotkey,0x4742)
         self.capture=AudioCapture(self._on_captured_audio); self.player=AudioPlayer(); self.barge=BargeInMonitor(lambda:self.bridge.barge_in.emit() if self.bridge is not None else None)
@@ -280,6 +287,10 @@ class DesktopShell:
                 from desktop_api import LumenDesktopAPI
                 self.api=LumenDesktopAPI(base_url=self.config.core_url,secret=self.config.secret or os.getenv("LUMEN_SECRET","lumen-dev-key"))
             except Exception: self.api=None
+        # Never connect SSE without the token that the API client loaded from
+        # .env. An empty token previously caused silent 401/disconnected events.
+        event_secret=self.config.secret or getattr(self.api,"secret","")
+        self.events=DesktopEventClient(self.config.core_url,event_secret,self._queue_core_event)
     def health(self):
         return {"status":"PASS" if PYSIDE_AVAILABLE else "DEPENDENCY_MISSING","ui":"PySide6" if PYSIDE_AVAILABLE else "MISSING_DEPENDENCY","event_client":self.events.connected,"wake_word":self.config.wake_word,"microphone":self._microphone_on,"ptt_hotkey":self.ptt_hotkey.registered,"quick_hotkey":self.quick_hotkey.registered,"authority":"GAIA Core"}
     def _queue_core_event(self,event):
@@ -289,8 +300,11 @@ class DesktopShell:
     def _set_state(self,state):
         self.state=str(state).upper()
         if self.orb is not None: self.orb.set_state(self.state)
+        if self.panel is not None: self.panel.set_state(self.state)
         if self.tray is not None: self.tray.setToolTip(f"GAIA — {self.state}")
     def _on_core_event_gui(self,event):
+        if event.get("source")=="tts_error" and self.panel:
+            self.panel.show_feedback(str(event.get("message", "TTS no disponible")))
         state=str(event.get("state") or event.get("event_type") or "IDLE").upper().replace(".","_")
         mapping={"USING_TOOL":"EXECUTING","SEARCHING_MEMORY":"THINKING","CORE_READY":"IDLE","CONNECTED":"IDLE"}
         allowed={"IDLE","LISTENING","TRANSCRIBING","THINKING","PLANNING","BROWSING","CODING","EXECUTING","SPEAKING","WAITING_PERMISSION","INTERRUPTED","SAFE_MODE","ERROR","OFFLINE"}
@@ -305,16 +319,26 @@ class DesktopShell:
         self.bridge=QtBridge(); self.bridge.core_event.connect(self._on_core_event_gui); self.bridge.wake_audio.connect(self._handle_wake_audio_gui)
         self.bridge.voice_result.connect(self._handle_voice_result_gui); self.bridge.voice_error.connect(self._handle_error_gui); self.bridge.quick_result.connect(self._handle_quick_result_gui); self.bridge.quick_error.connect(self._handle_error_gui)
         self.bridge.hotkey_action.connect(self._handle_hotkey_gui); self.bridge.playback_done.connect(self._playback_done_gui); self.bridge.playback_error.connect(self._handle_error_gui); self.bridge.barge_in.connect(self._barge_in_gui)
-        class Orb(QWidget):
-            def __init__(inner):
-                super().__init__(); inner.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus); inner.setAttribute(Qt.WA_TranslucentBackground); inner.resize(shell.config.orb_size,shell.config.orb_size); inner.state="SLEEPING"
-            def set_state(inner,state): inner.state=state; inner.update()
-            def paintEvent(inner,_):
-                p=QPainter(inner); p.setRenderHint(QPainter.Antialiasing); colors={"ERROR":"#ff526b","WAITING_PERMISSION":"#ffcc66","SAFE_MODE":"#aa8cff","LISTENING":"#55e6ff","THINKING":"#8f7cff","SPEAKING":"#65a8ff","OFFLINE":"#77808f","INTERRUPTED":"#ff8b5c","TRANSCRIBING":"#7ae6c4","CODING":"#b17cff","BROWSING":"#4fc3ff"}; p.setBrush(QColor(colors.get(inner.state,"#277dff"))); p.setPen(Qt.NoPen); p.drawEllipse(8,8,inner.width()-16,inner.height()-16)
-        self.orb=Orb(); self._position_orb(); self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu()
+        from gaia_hologram import GaiaHologram
+        from gaia_panel import GaiaControlPanel
+        self.orb=GaiaHologram(self.config.orb_size)
+        self.orb.setWindowFlags(Qt.FramelessWindowHint|Qt.WindowStaysOnTopHint|Qt.Tool|Qt.WindowDoesNotAcceptFocus)
+        self.orb.setAttribute(Qt.WA_TranslucentBackground)
+        self.orb.clicked.connect(self.show_quick)
+        self._position_orb()
+        self.panel=GaiaControlPanel()
+        self.panel.send_requested.connect(self._submit_text)
+        self.panel.vision_requested.connect(self._request_screen)
+        self.panel.mic_requested.connect(self.toggle_mic)
+        self.panel.wake_requested.connect(self.toggle_wake)
+        self.panel.refresh_requested.connect(self.refresh_diagnostics)
+        self.panel.ptt_requested.connect(self.push_to_talk)
+        self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu()
         for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Open Dashboard",self.open_dashboard),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Push-to-talk",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
         self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.ptt_hotkey.register(); self.quick_hotkey.register()
         if self.config.wake_word and self._microphone_on: self._start_wake_word()
+        if self.config.orb_mode == "always_visible": self._show_orb()
+        self.refresh_diagnostics()
         if not hidden: self.show_quick()
         return self
     @staticmethod
@@ -328,7 +352,10 @@ class DesktopShell:
         if self.orb and self.config.orb_mode!="always_visible": self.orb.hide()
     def _on_wake_detected(self,audio_path):
         if self.bridge is not None: self.bridge.wake_audio.emit(Path(audio_path))
-    def _handle_wake_audio_gui(self,path): self._show_orb(); self._set_state("LISTENING"); threading.Thread(target=self._send_voice_worker,args=(Path(path),),name="gaia-voice-request",daemon=True).start()
+    def _handle_wake_audio_gui(self,path):
+        self._show_orb();self._set_state("TRANSCRIBING")
+        if self.panel:self.panel.show_feedback("Transcribiendo y enviando la orden de voz…")
+        threading.Thread(target=self._send_voice_worker,args=(Path(path),),name="gaia-voice-request",daemon=True).start()
     def _send_voice_worker(self,path):
         try:
             if not self.api: raise RuntimeError("Core unavailable")
@@ -342,6 +369,18 @@ class DesktopShell:
             try: path.unlink(missing_ok=True)
             except Exception: pass
     def _handle_voice_result_gui(self,data):
+        if isinstance(data,dict) and data.get("vision_requested"):
+            user_text=str(data.get("user_text", "Mira mi pantalla"))
+            if self.panel: self.panel.add_message("Tú (voz)",user_text)
+            self._request_screen("",user_text)
+            return
+        if isinstance(data,dict):
+            user_text=str(data.get("user_text", "")).strip()
+            response=str(data.get("response", "")).strip()
+            if user_text and self.panel:self.panel.add_message("Tú (voz)",user_text)
+            if response and self.panel:self.panel.add_message("GAIA",response)
+            if data.get("tts_error") and self.panel:
+                self.panel.show_feedback("La respuesta de texto funciona, pero la voz falló: " + str(data["tts_error"]))
         audio_path=data.get("_audio_path") if isinstance(data,dict) else None
         if audio_path:
             self._set_state("SPEAKING")
@@ -371,18 +410,33 @@ class DesktopShell:
             try:self.wake.begin_session()
             except Exception:pass
         self._continue_conversation_gui()
-    def _handle_error_gui(self,message): self._set_state("ERROR"); self.tray.showMessage("GAIA",str(message)[:500]) if self.tray else None
+    def _handle_error_gui(self,message):
+        self._set_state("ERROR")
+        if self.panel:
+            self.panel.set_busy(False)
+            self.panel.add_message("ERROR",str(message))
+            self.panel.show_feedback(str(message))
+        if self.tray:self.tray.showMessage("GAIA: error",str(message)[:500])
     def _on_wake_session_end(self):
         if self.bridge is not None: self.bridge.core_event.emit({"state":"IDLE","source":"wake_session"})
     def _start_wake_word(self):
         from wake_word import WakeWordListener
         if self.wake is None:
-            self.wake=WakeWordListener(on_wake=self._on_wake_detected,on_session_end=self._on_wake_session_end)
+            listener=WakeWordListener(on_wake=self._on_wake_detected,on_session_end=self._on_wake_session_end)
+            info=listener.health()
+            if info.get("status") != "GAIA_MODEL_READY":
+                self.config.wake_word=False
+                self._handle_error_gui("Wake-word no disponible: falta el modelo personalizado gaia.onnx. "
+                                       "Puedes usar Ctrl+Espacio o el botón Hablar. "
+                                       "Estado: " + str(info.get("status")))
+                return
+            self.wake=listener
             self.wake.start()
     def toggle_wake(self,*_):
         self.config.wake_word=not self.config.wake_word
         if self.config.wake_word and self._microphone_on: self._start_wake_word()
         elif self.wake: self.wake.stop(); self.wake=None
+        if self.panel:self.panel.set_systems(voice="Wake activo" if self.wake else "PTT disponible (wake no activo)")
     def toggle_mic(self,*_):
         self._microphone_on=not self._microphone_on
         if not self._microphone_on:
@@ -392,6 +446,7 @@ class DesktopShell:
         else:
             self._set_state("IDLE")
             if self.config.wake_word: self._start_wake_word()
+        if self.panel:self.panel.set_systems(voice="Micrófono activo" if self._microphone_on else "Micrófono desactivado")
     def _handle_hotkey_gui(self,action):
         if action=="quick": self.show_quick()
         elif action=="ptt_down": self._ptt_down()
@@ -406,6 +461,7 @@ class DesktopShell:
             if self.api and hasattr(self.api,"cancel_generation"): threading.Thread(target=self.api.cancel_generation,daemon=True).start()
         except Exception: pass
         self._show_orb(); self._set_state("LISTENING")
+        if self.panel:self.panel.show_feedback("Grabando… Suelta Ctrl+Espacio para enviar.")
         try: self.capture.start()
         except Exception as exc: self._handle_error_gui(str(exc))
     def _ptt_up(self):
@@ -417,25 +473,124 @@ class DesktopShell:
         self._ptt_up() if self.capture.recording else self._ptt_down()
     def _on_captured_audio(self,path): self._on_wake_detected(path)
     def show_quick(self,*_):
-        if not self.qt: return
-        if self.quick_command_window: self.quick_command_window.show(); self.quick_command_window.raise_(); return
-        w=QWidget(); w.setWindowTitle("GAIA Quick Command"); layout=QVBoxLayout(w); layout.addWidget(QLabel("GAIA")); inp=QLineEdit(); inp.setPlaceholderText("What do you need?"); layout.addWidget(inp)
-        def send():
-            text=inp.text().strip()
-            if not text:return
-            inp.setEnabled(False); self._show_orb(); self._set_state("THINKING")
-            def worker():
-                try:
-                    if not self.api: raise RuntimeError("Core unavailable")
-                    result=self.api.send_message(text); self.bridge.quick_result.emit(result or {})
-                except Exception as exc: self.bridge.quick_error.emit(f"{type(exc).__name__}: {exc}")
-            threading.Thread(target=worker,name="gaia-quick-command",daemon=True).start()
-        inp.returnPressed.connect(send); w.resize(420,110); self.quick_command_window=w; w.destroyed.connect(lambda:self.__setattr__("quick_command_window",None)); w.show(); inp.setFocus()
+        if not self.qt or not self.panel:return
+        self.panel.show();self.panel.raise_();self.panel.activateWindow();self.panel.input.setFocus()
+
+    def _submit_text(self,text):
+        if not text:return
+        if self.panel:self.panel.add_message("Tú",text)
+        from gaia_vision import is_screen_request
+        if is_screen_request(text):
+            self._request_screen("",text)
+            return
+        self._set_state("THINKING");self._show_orb()
+        if self.panel:self.panel.set_busy(True)
+        def worker():
+            try:
+                if not self.api:raise RuntimeError("Core no disponible. Comprueba si el servidor está ejecutándose.")
+                result=self.api.send_message(text)
+                if self.bridge:self.bridge.quick_result.emit(result or {})
+            except Exception as exc:
+                if self.bridge:self.bridge.quick_error.emit(f"{type(exc).__name__}: {exc}")
+        threading.Thread(target=worker,name="gaia-quick-command",daemon=True).start()
+
     def _handle_quick_result_gui(self,result):
+        if isinstance(result,dict) and result.get("_gaia_diagnostic"):
+            info=result.get("vision") or {}
+            if self.panel:
+                self.panel.set_systems(core=result.get("core","Desconocido"),chat=result.get("chat","Desconocido"),
+                    vision=info.get("status","Desconocido"), voice=result.get("voice","PTT (wake opcional)"))
+                if result.get("chat_hint"):
+                    self.panel.show_feedback("Chat: " + str(result["chat_hint"]))
+                elif info.get("status") != "READY":
+                    self.panel.show_feedback(info.get("hint") or info.get("reason") or "Visión no preparada")
+            return
         self._set_state("IDLE")
-        if self.quick_command_window: self.quick_command_window.hide()
-        text=str(result.get("response","")).strip() if isinstance(result,dict) else ""
-        if text and self.tray: self.tray.showMessage("GAIA",text[:300])
+        if self.panel:self.panel.set_busy(False)
+        response=str(result.get("response", "")).strip() if isinstance(result,dict) else ""
+        if not response:response="El Core no devolvió texto. Comprueba Ollama y el modelo de chat."
+        if self.panel:self.panel.add_message("GAIA",response)
+        if self.tray:self.tray.showMessage("GAIA",response[:300])
+
+    def _request_screen(self,display_id="",question="Describe lo que ves en mi pantalla."):
+        from gaia_vision import available_displays
+        try:
+            monitors=available_displays()
+            if self.panel:self.panel.set_displays(monitors)
+            if not monitors:
+                raise RuntimeError("No hay monitores compatibles. La visión del escritorio está disponible en Windows.")
+            # For a spoken/written request require conscious screen selection in UI.
+            if not display_id:
+                from PySide6.QtWidgets import QInputDialog
+                labels=[f"{m['name']} ({m['width']}x{m['height']})" for m in monitors]
+                choice,ok=QInputDialog.getItem(self.panel,"GAIA · autorizar captura",
+                      "Selecciona el monitor que GAIA puede analizar (una captura):",labels,0,False)
+                if not ok:
+                    if self.panel:self.panel.show_feedback("Captura cancelada. GAIA no vio la pantalla.")
+                    return
+                display_id=monitors[labels.index(choice)]["display_id"]
+            if display_id not in {d["display_id"] for d in monitors}:
+                raise ValueError("Selecciona un monitor disponible.")
+            self._show_orb();self._set_state("THINKING")
+            if self.panel:
+                self.panel.show();self.panel.set_busy(True)
+                self.panel.show_feedback("Captura única autorizada; analizando localmente…")
+            threading.Thread(target=self._vision_worker,args=(display_id,question),name="gaia-vision",daemon=True).start()
+        except Exception as exc:
+            self._handle_error_gui(str(exc))
+
+    def _vision_worker(self,display_id,question):
+        try:
+            from gaia_vision import describe_monitor
+            result=describe_monitor(display_id,question)
+            if self.bridge:self.bridge.quick_result.emit(result)
+            self._speak_text_worker(result["response"])
+        except Exception as exc:
+            if self.bridge:self.bridge.quick_error.emit(f"Visión: {exc}")
+
+    def _speak_text_worker(self,text):
+        try:
+            if not self.api:return
+            path=self.api.request_tts(str(text)[:1500])
+            if self.bridge:self.bridge.voice_result.emit({"_audio_path":str(path),"response":""})
+        except Exception as exc:
+            # Keep the visual answer even when Piper or the audio device is missing.
+            if self.bridge:self.bridge.core_event.emit({"state":"IDLE","source":"tts_error",
+                                                        "message":"TTS no disponible: "+str(exc)[:250]})
+
+    def refresh_diagnostics(self,*_):
+        from gaia_vision import available_displays
+        try:
+            if self.panel:self.panel.set_displays(available_displays())
+        except Exception as exc:
+            if self.panel:self.panel.show_feedback("Monitores: " + str(exc))
+        def worker():
+            try:
+                from gaia_vision import vision_readiness
+                readiness=vision_readiness()
+                if not self.api:raise RuntimeError("Cliente de GAIA no disponible")
+                core_info=self.api._request("GET","/api/health",timeout=5).json()
+                core="Conectado" if core_info.get("status")=="online" else "Sin respuesta"
+                status=self.api._request("GET","/api/status",timeout=8).json()
+                llm=status.get("llm") or {}
+                chat=str(llm.get("status") or "desconocido")
+                voice_status="STT habilitado" if (status.get("voice") or {}).get("stt_enabled") else "STT desactivado"
+                try:
+                    voices=self.api._request("GET","/api/voice/voices",timeout=6).json()
+                    voice_list=voices if isinstance(voices,list) else voices.get("voices",[])
+                    if isinstance(voice_list,list) and voice_list and not any(v.get("Ready",False) for v in voice_list):
+                        voice_status += ", Piper sin modelo"
+                except Exception:
+                    voice_status += ", verificar Piper"
+                info={"_gaia_diagnostic":True,"core":core,"chat":chat,"chat_hint":llm.get("hint", ""),
+                      "vision":readiness,"voice":voice_status}
+                if self.bridge:self.bridge.quick_result.emit(info)
+            except Exception as exc:
+                from gaia_vision import vision_readiness
+                if self.bridge:self.bridge.quick_result.emit({"_gaia_diagnostic":True,"core":"Desconectado: "+str(exc)[:60],
+                                                              "chat":"Sin verificar","vision":vision_readiness(),"voice":"Sin verificar"})
+        threading.Thread(target=worker,daemon=True,name="gaia-diagnostics").start()
+
     def _show_permission(self,request):
         if self.permission_dialog: self.permission_dialog.close()
         self.permission_dialog=PermissionDialog(request,self._submit_permission); self.permission_dialog.show(); self.permission_dialog.raise_()
@@ -453,6 +608,7 @@ class DesktopShell:
         if self.wake: self.wake.stop(); self.wake=None
         self.ptt_hotkey.unregister(); self.quick_hotkey.unregister(); self.events.stop(); self.capture.stop(); self.barge.stop(); self.player.stop()
         if self.quick_command_window: self.quick_command_window.close(); self.quick_command_window=None
+        if self.panel:self.panel.close();self.panel=None
         if self.permission_dialog: self.permission_dialog.close(); self.permission_dialog=None
         if self.tray: self.tray.hide()
         if self.orb: self.orb.close()

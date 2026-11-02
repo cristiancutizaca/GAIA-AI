@@ -417,7 +417,10 @@ class LumenDesktopAPI:
 
     def request_tts(self, text: str) -> Path:
         response = self._request("POST", "/api/voice/tts", json={"text": text}, timeout=90.0)
-        return _save_temp(response.content, ".mp3")
+        # Piper returns WAV; a hardcoded MP3 suffix breaks some Windows players.
+        data = response.content
+        suffix = ".wav" if data.startswith(b"RIFF") else ".mp3"
+        return _save_temp(data, suffix)
 
     def download_audio(self, url: str) -> Path:
         path = url if url.startswith("/") else f"/{url}"

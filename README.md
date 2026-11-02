@@ -36,6 +36,19 @@ Windows login
 
 The Dashboard is secondary. The tray/orb/voice/Quick Command are the intended daily control surfaces.
 
+### GAIA hologram, voice and screen understanding
+
+The resident Desktop now has an animated holographic status widget (not the former
+single-color dot), a persistent **Control Center** for errors/replies, live LLM
+readiness and explicit multi-monitor screen inspection using a local Ollama
+vision model. Hold `Ctrl+Space` for push-to-talk. Saying or typing *“GAIA, mira
+mi pantalla”* requests one monitor choice and one read-only capture; images
+are not saved or used as instructions to execute actions. Install a vision model
+explicitly (`ollama pull qwen2.5vl:7b`) and see
+[`GAIA_DESKTOP_VISION_VOICE_GUIDE.md`](GAIA_DESKTOP_VISION_VOICE_GUIDE.md)
+for configuration and honest Windows-validation limitations. Wake-by-name still
+requires a genuine custom `gaia.onnx` and is not silently faked.
+
 ## Security architecture
 
 External systems never become authority. Side effects remain under:

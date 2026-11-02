@@ -1870,6 +1870,13 @@ async def chat_voice(
     envelope_device = str(envelope.get("requesting_device") or device)[:40]
     envelope_target = str(envelope.get("target_host") or target_host)[:80]
     voice_context = {"desktop_snapshot": snapshot} if snapshot else {}
+    # A desktop screen request must be handled by the local desktop only.
+    # Do not invoke a text LLM or claim to see a monitor from this API.
+    from vision_intent import is_screen_vision_request
+    if channel == "desktop_voice" and is_screen_vision_request(user_text):
+        return {"user_text": user_text, "response": "Selecciona el monitor en GAIA para autorizar una captura local.",
+                "session_id": envelope_session, "kind": "desktop_vision", "vision_requested": True,
+                "audio_url": None, "tts_error": None}
     chat_resp = await _chat_service(ChatRequest(message=user_text, session_id=envelope_session, device=envelope_device, target_host=envelope_target, channel=str(channel or "desktop_voice")[:32], request_envelope=envelope, desktop_snapshot=snapshot or None, pc_context=voice_context), principal)
     audio_url: str | None = None
     tts_error: str | None = None
