@@ -15,11 +15,16 @@ from gaia_platform.backup import BackupManager
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="gaia")
-    parser.add_argument("command", choices=["version","start","stop","restart","status","doctor","models","memory","skills","plugins","mcp","browser","voice","workers","automations","devices","backup","restore","update","rollback","logs","config","flags","plan","diagnostics","validate","desktop","startup","dependencies"])
+    parser.add_argument("command", choices=["version","start","stop","restart","status","doctor","models","memory","skills","plugins","mcp","browser","voice","workers","automations","devices","backup","restore","update","rollback","logs","config","flags","plan","diagnostics","validate","desktop","startup","dependencies","operator"])
     parser.add_argument("target", nargs="?", default="list")
     parser.add_argument("--output", default="")
     parser.add_argument("--message", default="")
     args = parser.parse_args(argv)
+    if args.command == "operator":
+        cmd = [sys.executable, str(ROOT / "tools" / "gaia_operator.py"), args.target]
+        if args.message: cmd.append(args.message)
+        if args.output: cmd += ["--db", args.output]
+        return subprocess.call(cmd)
     foundation = build_foundation()
     if args.command == "version":
         from gaia_version import PRODUCT_VERSION, RELEASE, PROTOCOL_VERSION

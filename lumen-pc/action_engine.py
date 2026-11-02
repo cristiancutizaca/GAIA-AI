@@ -521,7 +521,11 @@ class ActionEngine:
                 if len(row) >= 4:
                     data = {"gpu_name": row[0], "gpu_percent": self._number(row[1]), "gpu_memory_used_mb": self._number(row[2]), "gpu_memory_total_mb": self._number(row[3])}
                     return ExecutionResult(True, "system_gpu", f"GPU: {row[0]}, uso {row[1]}%, memoria {row[2]}/{row[3]} MB.", data)
-        return ExecutionResult(True, "system_gpu", "No pude obtener métricas de GPU (nvidia-smi no está disponible).", {"gpu_available": False})
+        from gpu_probe import windows_gpu_inventory
+        data = windows_gpu_inventory()
+        if data.get('gpu_available'):
+            return ExecutionResult(True, "system_gpu", f"GPU detectada: {data['gpu_name']}. Las métricas AMD/VRAM requieren backend dedicado.", data)
+        return ExecutionResult(True, "system_gpu", "Métricas de GPU no disponibles (NVIDIA/AMD sin proveedor compatible).", data)
 
     def _system_disk(self, _args: dict) -> ExecutionResult:
         usage = shutil.disk_usage(self.project_dir)
@@ -754,6 +758,10 @@ class ActionEngine:
         rows = [{"name": item.name, "is_dir": item.is_dir(), "size": item.stat().st_size if item.is_file() else None} for item in sorted(path.iterdir(), key=lambda item: item.name.casefold())[:200]]
         return ExecutionResult(True, "file_list", f"Listé {len(rows)} elementos sin leer su contenido.", {"path": str(path), "entries": rows})
 
+    def _file_list(self, args: dict) -> ExecutionResult:
+        """Canonical dispatch name; keep the legacy implementation for compatibility."""
+        return self._list_files(args)
+
     def _file_info(self, args: dict) -> ExecutionResult:
         path = self._safe_file(args.get("path", ""), must_exist=True, write=False)
         stat = path.stat()
@@ -765,6 +773,10 @@ class ActionEngine:
             raise ActionEngineError("files.open requiere un archivo.")
         self._open_path(path)
         return ExecutionResult(True, "file_open", f"Abrí {path.name} mediante la asociación del sistema.", {"path": str(path), "verified": True})
+
+    def _file_open(self, args: dict) -> ExecutionResult:
+        """Dispatch alias for files.open; OS association still runs under normal policy."""
+        return self._open_file(args)
 
     def _file_delete(self, args: dict) -> ExecutionResult:
         path = self._safe_file(args.get("path", ""), must_exist=True, right="DELETE")
@@ -814,6 +826,10 @@ class ActionEngine:
         self._ensure_allowed_parent(path, right="CREATE")
         path.mkdir(parents=True, exist_ok=False)
         return ExecutionResult(True, "folder_create", f"Creé la carpeta {path.name}.", {"path": str(path), "verified": path.is_dir()})
+
+    def _folder_create(self, args: dict) -> ExecutionResult:
+        """Dispatch alias for folders.create; path scope is checked by _create_folder."""
+        return self._create_folder(args)
 
     def _windows_list(self, _args: dict) -> ExecutionResult:
         try:

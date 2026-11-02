@@ -1214,7 +1214,7 @@ async def visualizer_page():
     path = Path(__file__).resolve().parents[1] / "static" / "gaia_visualizer.html"
     return HTMLResponse(path.read_text(encoding="utf-8"))
 
-@router.get("/visualizer/events")
+@router.get("/visualizer/events", dependencies=[Depends(require_diagnostics)])
 async def visualizer_events(request: Request):
     runtime = getattr(request.app.state, "platform_runtime", None)
     if runtime is None:
