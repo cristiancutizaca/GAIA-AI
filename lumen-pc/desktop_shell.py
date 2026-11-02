@@ -24,14 +24,14 @@ except ImportError:
 try:
     from PySide6.QtCore import QObject, Qt, Signal
     from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-    from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget
+    from PySide6.QtWidgets import QApplication, QDialog, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget, QMessageBox
     PYSIDE_AVAILABLE = True
 except ImportError:
     PYSIDE_AVAILABLE = False
     class QObject: pass
     class Signal:
         def __init__(self,*a,**k): pass
-    QAction=QColor=QIcon=QPainter=QPixmap=QApplication=QDialog=QFormLayout=QLabel=QLineEdit=QMenu=QPushButton=QSystemTrayIcon=QVBoxLayout=QWidget=None
+    QAction=QColor=QIcon=QPainter=QPixmap=QApplication=QDialog=QFormLayout=QLabel=QLineEdit=QMenu=QPushButton=QSystemTrayIcon=QVBoxLayout=QWidget=QMessageBox=None
 
 try:
     import httpx
@@ -391,6 +391,12 @@ class DesktopShell:
             if self.panel: self.panel.add_message("Tú (voz)",user_text)
             self._request_screen("",user_text)
             return
+        # Chat and voice action proposals follow the same explicit UI approval.
+        if isinstance(data,dict) and data.get('kind') in {'action', 'plan'} and not data.get('local_result'):
+            if self.panel and data.get('user_text'):
+                self.panel.add_message('Tú (voz)',str(data['user_text']))
+            self._show_action_proposal(data)
+            return
         if isinstance(data,dict):
             user_text=str(data.get("user_text", "")).strip()
             response=str(data.get("response", "")).strip()
@@ -552,6 +558,9 @@ class DesktopShell:
         threading.Thread(target=worker,daemon=True,name='gaia-recent-tasks').start()
 
     def _handle_quick_result_gui(self,result):
+        if isinstance(result,dict) and result.get('kind') in {'action','plan'} and not result.get('local_result'):
+            self._show_action_proposal(result)
+            return
         if isinstance(result,dict) and result.get("_gaia_diagnostic"):
             info=result.get("vision") or {}
             if self.panel:
@@ -568,6 +577,38 @@ class DesktopShell:
         if not response:response="El Core no devolvió texto. Comprueba Ollama y el modelo de chat."
         if self.panel:self.panel.add_message("GAIA",response)
         if self.tray:self.tray.showMessage("GAIA",response[:300])
+
+    def _show_action_proposal(self, contract):
+        """Never execute PC actions solely from an LLM or a voice transcript."""
+        from action_response import parse_action_response, response_for_display
+        parsed = parse_action_response(contract)
+        if parsed is None:
+            self._handle_error_gui('El Core devolvió una propuesta de acción inválida.')
+            return
+        self._set_state('WAITING_PERMISSION')
+        if self.panel:self.panel.set_busy(False)
+        preview=response_for_display(parsed)
+        if self.panel:
+            self.panel.show()
+            self.panel.add_message('GAIA · PERMISO',preview+'\nNo se ejecutó ninguna acción todavía.')
+        # Even Core AUTO_SAFE proposals must be approved at the GUI boundary.
+        response=QMessageBox.question(self.panel,'GAIA · Autorizar acción local',
+            preview[:1400]+'\n\n¿Autorizar esta ejecución en tu equipo?',
+            QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+        approved=(response==QMessageBox.Yes)
+        self._set_state('EXECUTING' if approved else 'IDLE')
+        if self.panel:self.panel.set_busy(True)
+        def worker():
+            try:
+                if not self.api:raise RuntimeError('Core no disponible')
+                if approved:
+                    result=self.api.confirm_action(contract)
+                else:
+                    result=self.api.cancel_action(contract)
+                if self.bridge:self.bridge.quick_result.emit(result or {})
+            except Exception as exc:
+                if self.bridge:self.bridge.quick_error.emit('Acción de escritorio: '+str(exc)[:400])
+        threading.Thread(target=worker,daemon=True,name='gaia-pc-action-approval').start()
 
     def _request_screen(self,display_id="",question="Describe lo que ves en mi pantalla."):
         from gaia_vision import available_displays

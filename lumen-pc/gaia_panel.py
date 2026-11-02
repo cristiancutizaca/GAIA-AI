@@ -68,7 +68,7 @@ class GaiaControlPanel(QWidget):
         self.readiness_button=QPushButton("⚙  Comprobar voz e IA");self.readiness_button.clicked.connect(self.readiness_requested);left.addWidget(self.readiness_button)
         self.tasks_button=QPushButton("≡  Historial de tareas");self.tasks_button.clicked.connect(self.tasks_requested);left.addWidget(self.tasks_button)
         left.addStretch()
-        caution=self._small("Privacidad: GAIA solo captura el\nmonitor cuando se lo ordenas.\nNo ejecuta acciones desde imágenes.")
+        caution=self._small("Privacidad: monitor solo con permiso.\nLas acciones de PC se confirman\nantes de ejecutarse.")
         caution.setWordWrap(True);left.addWidget(caution)
         # Side content must scroll on small laptop displays rather than clip buttons.
         side_scroll=QScrollArea()

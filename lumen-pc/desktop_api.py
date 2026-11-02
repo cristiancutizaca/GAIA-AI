@@ -224,9 +224,9 @@ class LumenDesktopAPI:
         self.session_id = data.get("session_id", self.session_id)
         parsed = parse_action_response(data)
         if parsed:
-            if parsed.confirmation_required and ACTION_CONFIRM_POLICY == "CONFIRM_EXECUTION":
-                return {**data, "response": response_for_display(parsed), "confirmation_required": True}
-            return self.confirm_action(data)
+            # A voice transcript is NOT consent to execute a PC action.
+            # Always return a proposal to the resident UI for explicit approval.
+            return {**data, "response": response_for_display(parsed), "confirmation_required": True}
         return data
 
     def send_assistant(self, text: str, engine: ActionEngine | None = None, profile: str = "", speak: bool = False) -> dict:

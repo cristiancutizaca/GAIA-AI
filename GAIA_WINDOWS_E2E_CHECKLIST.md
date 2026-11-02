@@ -20,9 +20,10 @@ Desde la carpeta del proyecto, con el entorno de GAIA:
 3. Pulsar **Diagnosticar PC**: debe crear una tarea de lectura auditada, consultar CPU/RAM/GPU/discos/procesos/red y mostrar resultado, aun sin Ollama.
 4. Pulsar **Diagnosticar ComfyUI**: sólo inventario de hardware y procesos. **No promete reparar automáticamente ROCm**.
 5. Pulsar **Historial de tareas** y comprobar que permanecen tras reiniciar GAIA.
-6. Pulsar **Hablar** o mantener **Ctrl+Espacio**: comprobar transcripción y respuesta escrita/hablada. Solicitar «GAIA, diagnostica mi PC» y comprobar que responde mediante el operador local.
-7. Solicitar «GAIA, mira mi pantalla», seleccionar conscientemente un monitor y comprobar que sólo lo describe mediante un modelo de visión Ollama instalado. Repetir en el segundo monitor. **La captura nunca concede permiso de hacer clic**.
-8. Comprobar una orden peligrosa: el sistema no debe ejecutar una modificación sin aprobación. `GAIA_OPERATOR_HALT=1` bloquea pasos nuevos del operador y `GAIA_SAFE_MODE=1` bloquea acciones con efectos.
+6. Escribir «GAIA, abre VS Code» u otra acción admitida. Si el Core devuelve una propuesta, debe abrirse un diálogo de confirmación **antes** de ejecutar. Pulsar **No** y verificar que nada se abrió; repetir y pulsar **Sí** para validar permisos, ejecución local y auditoría.
+7. Pulsar **Hablar** o mantener **Ctrl+Espacio**: comprobar transcripción y respuesta escrita/hablada. Solicitar «GAIA, diagnostica mi PC» y comprobar que responde mediante el operador local.
+8. Solicitar «GAIA, mira mi pantalla», seleccionar conscientemente un monitor y comprobar que sólo lo describe mediante un modelo de visión Ollama instalado. Repetir en el segundo monitor. **La captura nunca concede permiso de hacer clic**.
+9. Comprobar una orden peligrosa: el sistema no debe ejecutar una modificación sin aprobación. `GAIA_OPERATOR_HALT=1` bloquea pasos nuevos del operador y `GAIA_SAFE_MODE=1` bloquea acciones con efectos.
 
 ## Límites
 

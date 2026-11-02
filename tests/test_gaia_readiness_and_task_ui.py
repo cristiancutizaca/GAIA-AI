@@ -109,3 +109,33 @@ def test_ui_buttons_and_safety_guards_present():
 def test_shell_loads_dotenv_before_configuration_defaults():
     src=(ROOT/'lumen-pc/desktop_shell.py').read_text(encoding='utf-8')
     assert src.index('load_dotenv(Path(__file__)') < src.index('class ShellConfig:')
+
+
+def test_voice_action_contract_is_never_implicitly_executed(monkeypatch, tmp_path):
+    from desktop_api import LumenDesktopAPI
+    class Response:
+        def json(self):
+            return {
+                'kind':'action', 'session_id':'s1', 'action_id':'action-local-1',
+                'confirmation_required':False, 'preview':'Abrir aplicación',
+                'action':{'name':'open_vscode','args':{},'risk_level':2},
+            }
+    api=LumenDesktopAPI()
+    monkeypatch.setattr(api,'desktop_context',lambda **kwargs: {'desktop_snapshot':{}})
+    monkeypatch.setattr(api,'request_envelope',lambda **kwargs:{})
+    monkeypatch.setattr(api,'_request',lambda *a,**k:Response())
+    monkeypatch.setattr(api,'confirm_action',lambda *a,**k:pytest.fail('voice may never auto-execute'))
+    audio=tmp_path/'test.wav';audio.write_bytes(b'WAV')
+    returned=api.send_voice(audio)
+    assert returned['kind']=='action'
+    assert returned['confirmation_required'] is True
+    assert 'Abrir aplicación' in returned['response']
+
+
+def test_shell_action_proposals_use_visible_approval_gate():
+    shell=(ROOT/'lumen-pc/desktop_shell.py').read_text(encoding='utf-8')
+    assert 'QMessageBox.question' in shell
+    assert 'self.api.confirm_action(contract)' in shell
+    assert 'self.api.cancel_action(contract)' in shell
+    assert "result.get('kind') in {'action','plan'}" in shell
+    assert 'No se ejecutó ninguna acción todavía.' in shell
