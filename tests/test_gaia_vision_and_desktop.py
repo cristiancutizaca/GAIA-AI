@@ -11,6 +11,7 @@ from vision_intent import is_screen_vision_request
 @pytest.mark.parametrize('utterance',[
     'GAIA mira mi pantalla', 'Describe el monitor',
     '¿Qué ves en mi pantalla?', 'analiza mi escritorio', 'look at my screen',
+    'GAIA, quiero que vieras mi pantalla', '¿Puedes ver mi pantalla?',
 ])
 def test_screen_request_recognized_in_voice_and_desktop(utterance):
     assert is_screen_request(utterance)
@@ -89,3 +90,18 @@ def test_shell_defaults_show_hologram_and_usable_voice_fallback():
     source=(ROOT/'lumen-pc'/'desktop_shell.py').read_text(encoding='utf-8')
     assert 'GaiaHologram' in source and 'GaiaControlPanel' in source
     assert 'Ctrl+Espacio' in source
+
+
+def test_windows_sapi_fallback_is_used_when_piper_missing(monkeypatch,tmp_path):
+    import voice
+    monkeypatch.setattr(voice,'TTS_ENGINE','piper')
+    monkeypatch.setattr(voice,'TTS_ENABLED',True)
+    monkeypatch.setattr(voice,'_windows_fallback_ready',lambda:True)
+    monkeypatch.setattr(voice,'piper_voice_ready',lambda _:False)
+    expected=tmp_path/'voice.wav'
+    def fake_sapi(text,target):
+        assert text=='Hola desde GAIA'
+        assert target==str(expected)
+        return target
+    monkeypatch.setattr(voice,'_windows_tts',fake_sapi)
+    assert asyncio.run(voice.text_to_speech('Hola desde GAIA',output_path=str(expected)))==str(expected)

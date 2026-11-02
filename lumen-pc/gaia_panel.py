@@ -130,7 +130,8 @@ class GaiaControlPanel(QWidget):
         sender=str(sender).strip()[:40]
         message=str(message).strip()[:8000]
         if not message:return
-        self.log.append(f"{sender.upper()}\n{message}\n")
+        self.log.moveCursor(__import__("PySide6.QtGui",fromlist=["QTextCursor"]).QTextCursor.End)
+        self.log.insertPlainText(f"{sender.upper()}\n{message}\n\n")
         self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def show_feedback(self, message):

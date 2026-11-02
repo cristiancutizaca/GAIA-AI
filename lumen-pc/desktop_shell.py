@@ -579,7 +579,7 @@ class DesktopShell:
                     voices=self.api._request("GET","/api/voice/voices",timeout=6).json()
                     voice_list=voices if isinstance(voices,list) else voices.get("voices",[])
                     if isinstance(voice_list,list) and voice_list and not any(v.get("Ready",False) for v in voice_list):
-                        voice_status += ", Piper sin modelo"
+                        voice_status += ", Piper sin modelo (SAPI Windows opcional)"
                 except Exception:
                     voice_status += ", verificar Piper"
                 info={"_gaia_diagnostic":True,"core":core,"chat":chat,"chat_hint":llm.get("hint", ""),

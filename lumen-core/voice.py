@@ -44,6 +44,32 @@ def piper_voice_ready(model: str | None = None) -> bool:
     return importlib.util.find_spec("piper") is not None and base.is_file() and Path(str(base) + ".json").is_file()
 
 
+def _windows_fallback_ready() -> bool:
+    """Windows SAPI fallback is local and uses no additional voice downloads."""
+    return sys.platform == "win32" and os.getenv("GAIA_WINDOWS_TTS_FALLBACK", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _windows_tts(text: str, target: str) -> str:
+    """Use a fixed PowerShell script; untrusted speech text goes through stdin."""
+    if not _windows_fallback_ready():
+        raise RuntimeError("Windows SAPI no está disponible o está desactivado.")
+    script = (
+        "[Console]::InputEncoding=[System.Text.Encoding]::UTF8; "
+        "Add-Type -AssemblyName System.Speech; "
+        "$text=[Console]::In.ReadToEnd(); "
+        "$voice=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "try {$voice.SetOutputToWaveFile($env:GAIA_TTS_OUTPUT); $voice.Speak($text)} "
+        "finally {$voice.Dispose()}"
+    )
+    env={**os.environ, "GAIA_TTS_OUTPUT":str(Path(target).resolve())}
+    result=subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                          input=text[:4000], encoding="utf-8", errors="replace", capture_output=True,
+                          timeout=90, check=False, shell=False, env=env)
+    if result.returncode != 0 or not Path(target).is_file() or Path(target).stat().st_size < 44:
+        raise RuntimeError("Síntesis de Windows SAPI falló: " + (result.stderr or result.stdout or str(result.returncode))[-500:])
+    return target
+
+
 async def text_to_speech(text: str, output_path: str | None = None) -> str:
     if not TTS_ENABLED:
         raise RuntimeError("TTS está desactivado en la configuración.")
@@ -51,14 +77,13 @@ async def text_to_speech(text: str, output_path: str | None = None) -> str:
         raise ValueError("No hay texto para convertir a voz.")
     engine = (TTS_ENGINE or "piper").lower().strip()
     if engine in {"piper", "local"}:
-        if importlib.util.find_spec("piper") is None:
-            raise RuntimeError("Falta Piper TTS. Instala el perfil Voice/Full (piper-tts).")
         model = _piper_model()
         data_dir = _piper_data_dir()
-        if not piper_voice_ready(model):
-            raise RuntimeError(
-                f"Falta la voz Piper '{model}'. Ejecuta: gaia models install piper --voice {model}"
-            )
+        if importlib.util.find_spec("piper") is None or not piper_voice_ready(model):
+            if _windows_fallback_ready():
+                target = output_path or str(AUDIO_DIR / f"gaia_windows_tts_{uuid.uuid4().hex}.wav")
+                return await asyncio.to_thread(_windows_tts, text, target)
+            raise RuntimeError(f"Falta Piper o la voz '{model}'. Instala Voice/Full y gaia models install piper --voice {model}.")
         target = output_path or str(AUDIO_DIR / f"lumen_tts_{uuid.uuid4().hex}.wav")
         cmd = [
             sys.executable,
