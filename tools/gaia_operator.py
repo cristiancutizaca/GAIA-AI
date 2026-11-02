@@ -25,6 +25,31 @@ OBSERVE = frozenset({'system_status', 'system_ram', 'system_cpu', 'system_gpu',
                      'list_projects', 'show_project', 'git_status', 'file_list'})
 PERMITTED_EFFECTS = frozenset({'open_vscode', 'open_project', 'run_tests'})
 MAX_STEPS = 10
+# Only non-sensitive, bounded hardware facts may be journaled alongside
+# read-only observations. Never persist arbitrary command output/process lists.
+SAFE_FACT_KEYS = frozenset({
+    'cpu_percent', 'cpu_count', 'ram_used_percent', 'ram_used_gb',
+    'ram_total_gb', 'disk_used_percent', 'disk_free_gb', 'disk_total_gb',
+    'gpu_available', 'gpu_name', 'gpu_percent', 'gpu_memory_used_mb',
+    'gpu_memory_total_mb', 'gpu_vendor', 'gpu_memory_total_gb',
+})
+
+
+def _non_sensitive_facts(action: str, result: dict) -> dict:
+    if action not in {'system_status', 'system_ram', 'system_cpu', 'system_gpu', 'system_disk'}:
+        return {}
+    observations = (result.get('data') or {}).get('actions') or []
+    if not observations or not isinstance(observations[0], dict):
+        return {}
+    raw = observations[0].get('data') or {}
+    facts = {}
+    for key in SAFE_FACT_KEYS:
+        value = raw.get(key)
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            facts[key] = value
+        elif isinstance(value, str):
+            facts[key] = value[:90]
+    return facts
 
 
 def now():
@@ -207,6 +232,7 @@ class Operator:
             safe_result = {key: result.get(key) for key in ('success', 'status', 'execution_verified',
                                                              'execution_attempted', 'audit_digest')}
             safe_result['message'] = str(result.get('message') or '')[:450]
+            safe_result['facts'] = _non_sensitive_facts(action, result)
             verified = bool(result.get('success') and result.get('execution_verified'))
             with self._connect() as con:
                 con.execute('BEGIN IMMEDIATE')

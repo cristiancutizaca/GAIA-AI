@@ -5,6 +5,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+# Load the project configuration BEFORE evaluating ShellConfig dataclass defaults.
+# Otherwise GAIA_WAKEWORD_ENABLED/ORB_MODE can silently ignore .env settings.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / '.env', override=False)
+except ImportError:
+    pass
+
 # The resident launcher imports this module directly. Load the same .env as
 # GAIA Core BEFORE ShellConfig defaults are evaluated (secret/hotkeys/wake).
 try:
@@ -333,6 +341,10 @@ class DesktopShell:
         self.panel.wake_requested.connect(self.toggle_wake)
         self.panel.refresh_requested.connect(self.refresh_diagnostics)
         self.panel.ptt_requested.connect(self.push_to_talk)
+        self.panel.pc_diagnostic_requested.connect(lambda:self._submit_text('GAIA, diagnostica mi PC'))
+        self.panel.comfy_diagnostic_requested.connect(lambda:self._submit_text('GAIA, diagnostica ComfyUI y ROCm'))
+        self.panel.readiness_requested.connect(self.run_readiness)
+        self.panel.tasks_requested.connect(self.show_tasks)
         self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu()
         for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Open Dashboard",self.open_dashboard),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Push-to-talk",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
         self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.ptt_hotkey.register(); self.quick_hotkey.register()
@@ -369,6 +381,11 @@ class DesktopShell:
             try: path.unlink(missing_ok=True)
             except Exception: pass
     def _handle_voice_result_gui(self,data):
+        if isinstance(data,dict) and data.get("operator_requested"):
+            user_text=str(data.get("user_text", "GAIA, diagnostica mi PC"))
+            if self.panel:self.panel.add_message("Tú (voz)",user_text)
+            self._submit_text(user_text, display_user=False, voice_reply=True)
+            return
         if isinstance(data,dict) and data.get("vision_requested"):
             user_text=str(data.get("user_text", "Mira mi pantalla"))
             if self.panel: self.panel.add_message("Tú (voz)",user_text)
@@ -476,12 +493,16 @@ class DesktopShell:
         if not self.qt or not self.panel:return
         self.panel.show();self.panel.raise_();self.panel.activateWindow();self.panel.input.setFocus()
 
-    def _submit_text(self,text):
+    def _submit_text(self,text, *, display_user=True, voice_reply=False):
         if not text:return
-        if self.panel:self.panel.add_message("Tú",text)
+        if display_user and self.panel:self.panel.add_message("Tú",text)
         from gaia_vision import is_screen_request
         if is_screen_request(text):
             self._request_screen("",text)
+            return
+        from gaia_desktop_tasks import is_local_diagnostic_request
+        if is_local_diagnostic_request(text):
+            self._run_local_diagnostic(text, voice_reply=voice_reply)
             return
         self._set_state("THINKING");self._show_orb()
         if self.panel:self.panel.set_busy(True)
@@ -493,6 +514,42 @@ class DesktopShell:
             except Exception as exc:
                 if self.bridge:self.bridge.quick_error.emit(f"{type(exc).__name__}: {exc}")
         threading.Thread(target=worker,name="gaia-quick-command",daemon=True).start()
+
+    def _run_local_diagnostic(self,text, *, voice_reply=False):
+        self._show_orb(); self._set_state('EXECUTING')
+        if self.panel:
+            self.panel.set_busy(True)
+            self.panel.show_feedback('Diagnóstico local en curso; no requiere Ollama ni modifica tu PC.')
+        def worker():
+            try:
+                from gaia_desktop_tasks import execute_diagnostic
+                result = execute_diagnostic(text)
+                if self.bridge:self.bridge.quick_result.emit(result)
+                if voice_reply and result.get('state') == 'SUCCEEDED':
+                    self._speak_text_worker(str(result.get('response', ''))[:650])
+            except Exception as exc:
+                if self.bridge:self.bridge.quick_error.emit('Diagnóstico local: '+str(exc)[:400])
+        threading.Thread(target=worker,daemon=True,name='gaia-desktop-diagnostic').start()
+
+    def run_readiness(self,*_):
+        if self.panel:self.panel.show_feedback('Verificando componentes locales, sin grabar audio ni capturar pantalla…')
+        def worker():
+            try:
+                from gaia_readiness import run, to_text
+                result=to_text(run())
+                if self.bridge:self.bridge.quick_result.emit({'response':result})
+            except Exception as exc:
+                if self.bridge:self.bridge.quick_error.emit('Autodiagnóstico: '+str(exc)[:350])
+        threading.Thread(target=worker,daemon=True,name='gaia-readiness').start()
+
+    def show_tasks(self,*_):
+        def worker():
+            try:
+                from gaia_desktop_tasks import recent_tasks
+                if self.bridge:self.bridge.quick_result.emit({'response':'Historial de tareas locales:\n'+recent_tasks()})
+            except Exception as exc:
+                if self.bridge:self.bridge.quick_error.emit('Tareas: '+str(exc)[:300])
+        threading.Thread(target=worker,daemon=True,name='gaia-recent-tasks').start()
 
     def _handle_quick_result_gui(self,result):
         if isinstance(result,dict) and result.get("_gaia_diagnostic"):

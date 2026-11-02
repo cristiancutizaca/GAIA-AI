@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 
 STYLES = """
 QWidget#gaiaPanel { background: #0a0f1d; color: #e5f2ff; }
+QScrollArea { border:0; background: #0e192a; }
 QWidget { font-family: 'Segoe UI'; font-size: 13px; }
 QLabel { color: #dceaf8; background: transparent; }
 QLabel#brand { font-size: 28px; font-weight: 800; color: #e7fbff; }
@@ -34,10 +35,14 @@ class GaiaControlPanel(QWidget):
     wake_requested = Signal()
     refresh_requested = Signal()
     ptt_requested = Signal()
+    pc_diagnostic_requested = Signal()
+    comfy_diagnostic_requested = Signal()
+    readiness_requested = Signal()
+    tasks_requested = Signal()
     def __init__(self):
         super().__init__()
         self.setObjectName("gaiaPanel"); self.setWindowTitle("GAIA · Centro de Control")
-        self.setStyleSheet(STYLES); self.setMinimumSize(730, 550); self.resize(850, 610)
+        self.setStyleSheet(STYLES); self.setMinimumSize(730, 550); self.resize(900, 690)
         base=QHBoxLayout(self);base.setContentsMargins(0,0,0,0);base.setSpacing(0)
         side=QFrame();side.setObjectName("side");side.setFixedWidth(230)
         left=QVBoxLayout(side);left.setContentsMargins(20,25,20,18);left.setSpacing(14)
@@ -57,11 +62,21 @@ class GaiaControlPanel(QWidget):
         self.ptt_button=QPushButton("🎙  Hablar / Detener");self.ptt_button.clicked.connect(self.ptt_requested);left.addWidget(self.ptt_button)
         self.mic_button=QPushButton("Micrófono ON/OFF");self.mic_button.clicked.connect(self.mic_requested);left.addWidget(self.mic_button)
         self.wake_button=QPushButton("Activación por voz");self.wake_button.clicked.connect(self.wake_requested);left.addWidget(self.wake_button)
-        self.refresh_button=QPushButton("↻  Diagnóstico");self.refresh_button.clicked.connect(self.refresh_requested);left.addWidget(self.refresh_button)
+        self.refresh_button=QPushButton("↻  Estado Core");self.refresh_button.clicked.connect(self.refresh_requested);left.addWidget(self.refresh_button)
+        self.pc_button=QPushButton("▣  Diagnosticar PC");self.pc_button.clicked.connect(self.pc_diagnostic_requested);left.addWidget(self.pc_button)
+        self.comfy_button=QPushButton("◈  Diagnosticar ComfyUI");self.comfy_button.clicked.connect(self.comfy_diagnostic_requested);left.addWidget(self.comfy_button)
+        self.readiness_button=QPushButton("⚙  Comprobar voz e IA");self.readiness_button.clicked.connect(self.readiness_requested);left.addWidget(self.readiness_button)
+        self.tasks_button=QPushButton("≡  Historial de tareas");self.tasks_button.clicked.connect(self.tasks_requested);left.addWidget(self.tasks_button)
         left.addStretch()
         caution=self._small("Privacidad: GAIA solo captura el\nmonitor cuando se lo ordenas.\nNo ejecuta acciones desde imágenes.")
         caution.setWordWrap(True);left.addWidget(caution)
-        base.addWidget(side)
+        # Side content must scroll on small laptop displays rather than clip buttons.
+        side_scroll=QScrollArea()
+        side_scroll.setWidget(side)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        side_scroll.setFixedWidth(250)
+        base.addWidget(side_scroll)
         right=QWidget();area=QVBoxLayout(right);area.setContentsMargins(25,25,25,22);area.setSpacing(13)
         title=QLabel("Centro de Control");title.setStyleSheet("font-size:24px;font-weight:700;color:#ecfaff");area.addWidget(title)
         subtitle=self._small("Conversación, visión y estado del equipo · Todo bajo tu control")

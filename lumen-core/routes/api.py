@@ -1877,6 +1877,13 @@ async def chat_voice(
         return {"user_text": user_text, "response": "Selecciona el monitor en GAIA para autorizar una captura local.",
                 "session_id": envelope_session, "kind": "desktop_vision", "vision_requested": True,
                 "audio_url": None, "tts_error": None}
+    # Diagnóstico local reconocido por voz: delegar al escritorio del usuario,
+    # que conserva permisos y dispositivo. No ejecutar herramientas en el Core.
+    from operator_intent import is_local_diagnostic_request
+    if channel == "desktop_voice" and is_local_diagnostic_request(user_text):
+        return {"user_text": user_text, "response": "GAIA va a diagnosticar el equipo localmente.",
+                "session_id": envelope_session, "kind": "desktop_diagnostic",
+                "operator_requested": True, "audio_url": None, "tts_error": None}
     chat_resp = await _chat_service(ChatRequest(message=user_text, session_id=envelope_session, device=envelope_device, target_host=envelope_target, channel=str(channel or "desktop_voice")[:32], request_envelope=envelope, desktop_snapshot=snapshot or None, pc_context=voice_context), principal)
     audio_url: str | None = None
     tts_error: str | None = None
