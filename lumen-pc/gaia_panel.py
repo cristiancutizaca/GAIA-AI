@@ -32,6 +32,7 @@ class GaiaControlPanel(QWidget):
     send_requested = Signal(str)
     vision_requested = Signal(str, str)
     mic_requested = Signal()
+    mic_selection_requested = Signal()
     wake_requested = Signal()
     refresh_requested = Signal()
     ptt_requested = Signal()
@@ -57,11 +58,16 @@ class GaiaControlPanel(QWidget):
         self.chat_state=self._small("Chat/IA: verificando…")
         self.vision_state=self._small("Visión: verificando…")
         self.voice_state=self._small("Voz: Push-to-talk")
-        for label in (self.core_state,self.chat_state,self.vision_state,self.voice_state):left.addWidget(label)
+        self.memory_state = self._small("Memoria: verificando…")
+        for label in (self.core_state, self.chat_state, self.vision_state, self.voice_state, self.memory_state):
+            left.addWidget(label)
         left.addSpacing(10)
         left.addWidget(self._title("ACCESOS RÁPIDOS"))
         self.ptt_button=QPushButton("🎙  Hablar / Detener");self.ptt_button.clicked.connect(self.ptt_requested);left.addWidget(self.ptt_button)
         self.mic_button=QPushButton("Micrófono ON/OFF");self.mic_button.clicked.connect(self.mic_requested);left.addWidget(self.mic_button)
+        choose_mic = QPushButton("Elegir micrófono")
+        choose_mic.clicked.connect(self.mic_selection_requested)
+        left.addWidget(choose_mic)
         self.wake_button=QPushButton("Activación por voz");self.wake_button.clicked.connect(self.wake_requested);left.addWidget(self.wake_button)
         self.refresh_button=QPushButton("↻  Estado Core");self.refresh_button.clicked.connect(self.refresh_requested);left.addWidget(self.refresh_button)
         self.pc_button=QPushButton("▣  Diagnosticar PC");self.pc_button.clicked.connect(self.pc_diagnostic_requested);left.addWidget(self.pc_button)
@@ -133,13 +139,17 @@ class GaiaControlPanel(QWidget):
             self.displays.setCurrentIndex(index)
 
     def set_state(self, state):
-        self.state_label.setText("● " + str(state).upper())
+        labels = {"IDLE": "INACTIVO", "LISTENING": "ESCUCHANDO", "TRANSCRIBING": "TRANSCRIBIENDO",
+                  "THINKING": "PENSANDO", "SPEAKING": "HABLANDO", "EXECUTING": "EJECUTANDO",
+                  "SLEEPING": "EN PAUSA", "OFFLINE": "DESCONECTADO", "WAITING_PERMISSION": "PERMISO"}
+        self.state_label.setText("● " + labels.get(str(state).upper(), str(state).upper()))
 
-    def set_systems(self, *, core=None, chat=None, vision=None, voice=None):
+    def set_systems(self, *, core=None, chat=None, vision=None, voice=None, memory=None):
         if core is not None:self.core_state.setText("Core: " + str(core))
         if chat is not None:self.chat_state.setText("Chat/IA: " + str(chat))
         if vision is not None:self.vision_state.setText("Visión: " + str(vision))
         if voice is not None:self.voice_state.setText("Voz: " + str(voice))
+        if memory is not None:self.memory_state.setText("Memoria: " + str(memory))
 
     def set_busy(self, busy):
         self.send_button.setEnabled(not busy);self.vision_button.setEnabled(not busy)

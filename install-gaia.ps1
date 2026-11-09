@@ -139,7 +139,18 @@ function Ensure-EnvFile {
     } else {
         $content = "LUMEN_SECRET=$secret`r`n$content"
     }
-    [System.IO.File]::WriteAllText($envPath, $content, [System.Text.UTF8Encoding]::new($false))
+    $suffix = [Guid]::NewGuid().ToString('N')
+    $temporaryEnv = "$envPath.tmp-$suffix"
+    try {
+        [System.IO.File]::WriteAllText($temporaryEnv, $content, [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $envPath) {
+            [System.IO.File]::Replace($temporaryEnv, $envPath, "$envPath.backup-$suffix")
+        } else {
+            [System.IO.File]::Move($temporaryEnv, $envPath)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporaryEnv -ErrorAction SilentlyContinue
+    }
     Write-Host "==> .env preparado con un secreto fuerte; el valor no se imprime." -ForegroundColor Green
 }
 

@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 
+from urllib.parse import urlsplit
 import httpx
 
 from config import (
@@ -29,25 +30,33 @@ from model_router import PROFILES, ModelSelection, fallback_selection, profile_o
 
 logger = logging.getLogger("lumen.llm")
 _LLM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
-_HTTP_CLIENT: httpx.AsyncClient | None = None
+_HTTP_CLIENTS: dict[bool, httpx.AsyncClient] = {}
 _HTTP_CLIENT_LOOP_ID: int | None = None
 _METRICS = {"queued": 0, "generating": 0, "completed": 0, "cancelled": 0, "failed": 0, "llm_calls": 0, "queue_wait_ms": 0.0, "llm_ttft_ms": 0.0, "llm_total_ms": 0.0}
 
 
-async def _http_client() -> httpx.AsyncClient:
-    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP_ID
+def _ollama_trust_env() -> bool:
+    # Loopback never needs a proxy. Invalid environment proxy schemes can make
+    # HTTPX reject the whole client before considering NO_PROXY.
+    return urlsplit(OLLAMA_URL).hostname not in {"127.0.0.1", "localhost", "::1"}
+
+
+async def _http_client(*, trust_env: bool = True) -> httpx.AsyncClient:
+    global _HTTP_CLIENT_LOOP_ID
     loop_id = id(asyncio.get_running_loop())
-    if _HTTP_CLIENT is None or _HTTP_CLIENT_LOOP_ID != loop_id:
-        _HTTP_CLIENT = httpx.AsyncClient(timeout=_timeout())
+    if _HTTP_CLIENT_LOOP_ID != loop_id:
+        _HTTP_CLIENTS.clear()
         _HTTP_CLIENT_LOOP_ID = loop_id
-    return _HTTP_CLIENT
+    if trust_env not in _HTTP_CLIENTS:
+        _HTTP_CLIENTS[trust_env] = httpx.AsyncClient(timeout=_timeout(), trust_env=trust_env)
+    return _HTTP_CLIENTS[trust_env]
 
 
 async def shutdown_http_client() -> None:
-    global _HTTP_CLIENT, _HTTP_CLIENT_LOOP_ID
-    if _HTTP_CLIENT is not None:
-        await _HTTP_CLIENT.aclose()
-    _HTTP_CLIENT = None
+    global _HTTP_CLIENT_LOOP_ID
+    for client in _HTTP_CLIENTS.values():
+        await client.aclose()
+    _HTTP_CLIENTS.clear()
     _HTTP_CLIENT_LOOP_ID = None
     try:
         from harness_backend import shutdown_harnesses
@@ -236,11 +245,11 @@ def _timeout() -> httpx.Timeout:
     return httpx.Timeout(LLM_TIMEOUT_SECONDS, connect=min(15.0, LLM_TIMEOUT_SECONDS), read=LLM_TIMEOUT_SECONDS, write=30.0, pool=30.0)
 
 
-async def _post_json(url: str, **kwargs) -> dict:
+async def _post_json(url: str, *, trust_env: bool = True, **kwargs) -> dict:
     last_error: Exception | None = None
     for attempt in range(LLM_RETRY_COUNT + 1):
         try:
-            client = await _http_client()
+            client = await _http_client(trust_env=trust_env)
             response = await client.post(url, **kwargs)
             response.raise_for_status()
             return response.json()
@@ -261,7 +270,9 @@ async def _post_json(url: str, **kwargs) -> dict:
         except httpx.HTTPStatusError as exc:
             detail = ""
             try:
-                detail = exc.response.json().get("error", {}).get("message", "")
+                body = exc.response.json()
+                error = body.get("error") if isinstance(body, dict) else None
+                detail = str(error.get("message", "") if isinstance(error, dict) else error or "")[:240]
             except ValueError:
                 detail = exc.response.text[:240]
             logger.warning("Backend LLM devolvió HTTP %s: %s", exc.response.status_code, detail)
@@ -283,8 +294,11 @@ def _ollama_options(options: dict) -> dict:
 
 async def _ollama_chat(system_prompt: str, messages: list[dict], options: dict, model: str) -> str:
     payload = {"model": model, "messages": _payload_messages(system_prompt, messages), "stream": False, "keep_alive": LLM_KEEP_ALIVE, "options": _ollama_options(options)}
-    data = await _post_json(f"{OLLAMA_URL}/api/chat", json=payload)
-    text = _visible_text(data.get("message", {}).get("content", ""))
+    data = await _post_json(f"{OLLAMA_URL}/api/chat", trust_env=_ollama_trust_env(), json=payload)
+    message = data.get("message") or {}
+    if message.get("tool_calls"):
+        raise LLMError("Ollama propuso una herramienta fuera del canal de acciones de GAIA.")
+    text = _visible_text(message.get("content", ""))
     if not text:
         logger.warning("event=llm_empty_visible_output backend=ollama model=%s reasoning_filtered=true", model)
         return ""
@@ -316,7 +330,7 @@ async def _anthropic_chat(system_prompt: str, messages: list[dict], options: dic
 async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options: dict, model: str) -> AsyncIterator[str]:
     payload = {"model": model, "messages": _payload_messages(system_prompt, messages), "stream": True, "keep_alive": LLM_KEEP_ALIVE, "options": _ollama_options(options)}
     try:
-        client = await _http_client()
+        client = await _http_client(trust_env=_ollama_trust_env())
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as response:
                 if response.status_code == 404:
                     raise LLMError(f"Ollama no encuentra el modelo {model!r}. Instálalo o configura GAIA_MODEL_FALLBACK.")
@@ -332,7 +346,11 @@ async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options:
                     except json.JSONDecodeError:
                         logger.debug("Ignorando línea no JSON de Ollama")
                         continue
+                    if data.get("error"):
+                        raise LLMError("Ollama interrumpió la generación con un error.")
                     message = data.get("message") or {}
+                    if message.get("tool_calls"):
+                        raise LLMError("Ollama propuso una herramienta fuera del canal de acciones de GAIA.")
                     chunk = message.get("content", "")
                     if message.get("thinking") or not chunk:
                         continue
@@ -486,10 +504,24 @@ async def check_backend() -> dict:
             from harness_backend import harness_health
             info.update(await harness_health())
         elif LLM_BACKEND == "ollama":
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=_ollama_trust_env()) as client:
                 response = await client.get(f"{OLLAMA_URL}/api/tags")
                 response.raise_for_status()
                 models = [m.get("name", "") for m in response.json().get("models", [])]
+
+                async def optional_json(path):
+                    try:
+                        response = await client.get(f"{OLLAMA_URL}{path}")
+                        response.raise_for_status()
+                        payload = response.json()
+                        return payload if isinstance(payload, dict) else {}
+                    except (httpx.HTTPError, ValueError):
+                        return {}
+
+                running, version = await asyncio.gather(optional_json("/api/ps"), optional_json("/api/version"))
+                loaded = running.get("models")
+                if not isinstance(loaded, list):
+                    loaded = None
             effective_profile = resolve_profile(requested=LLM_PROFILE)
             selection = selection_for(effective_profile, models)
             preferred_installed = selection.preferred_model in models
@@ -502,7 +534,17 @@ async def check_backend() -> dict:
             else:
                 status = "online"
                 hint = ""
-            info.update(status=status, reachable=True, available_models=models, model_loaded=preferred_installed, selected_model=selection.selected_model, model_selection=selection.as_dict(), hint=hint)
+            loaded_models = [
+                {key: row.get(key) for key in ("name", "model", "size", "size_vram", "context_length")}
+                for row in (loaded or []) if isinstance(row, dict)
+            ]
+            info.update(status=status, reachable=True, available_models=models,
+                        model_installed=selection.selected_model in models,
+                        model_loaded=None if loaded is None else any(
+                            selection.selected_model in {row["name"], row["model"]} for row in loaded_models
+                        ),
+                        loaded_models=loaded_models, ollama_version=version.get("version"),
+                        selected_model=selection.selected_model, model_selection=selection.as_dict(), hint=hint)
         elif LLM_BACKEND == "openai":
             info["status"] = "configured" if OPENAI_API_KEY else "no_api_key"
         elif LLM_BACKEND == "anthropic":

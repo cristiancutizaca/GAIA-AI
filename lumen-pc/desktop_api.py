@@ -35,7 +35,7 @@ logger = logging.getLogger("lumen.desktop_api")
 load_dotenv(PROJECT_DIR / ".env")
 load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
-DEFAULT_URL = os.getenv("LUMEN_CORE_URL", "http://127.0.0.1:8090").rstrip("/")
+DEFAULT_URL = (os.getenv("LUMEN_CORE_URL") or f"http://127.0.0.1:{os.getenv('LUMEN_PORT', '8090')}").rstrip("/")
 DEFAULT_SECRET = os.getenv("LUMEN_SECRET", "lumen-dev-key")
 DEVICE = os.getenv("GAIA_PC_DEVICE_ID", "pc-main").strip() or "pc-main"
 
@@ -63,8 +63,9 @@ REQUESTED_CLIENT_TIMEOUT = _positive_float_env("GAIA_CLIENT_ACTION_TIMEOUT", 60.
 ACTION_COMPLETION_TIMEOUT = max(60.0, REQUESTED_CLIENT_TIMEOUT, POST_ACTION_TIMEOUT + 15.0)
 CAPTURE_DOWNLOAD_TIMEOUT = _positive_float_env("GAIA_CAPTURE_DOWNLOAD_TIMEOUT", 30.0)
 
-_TEMP_FILES: list[Path] = []
-MIC_PREFERENCE_FILE = Path(os.getenv("GAIA_MIC_PREFERENCE_FILE", str(Path.home() / ".gaia_mic.json"))).expanduser()
+_TEMP_FILES: set[Path] = set()
+_TEMP_LOCK = threading.Lock()
+MIC_PREFERENCE_FILE = Path(os.getenv("GAIA_MIC_PREFERENCE_FILE", "").strip() or Path.home() / ".gaia_mic.json").expanduser()
 
 
 class SentenceTTSBuffer:
@@ -74,7 +75,7 @@ class SentenceTTSBuffer:
         self.buffer = ""
         self.lock = threading.Lock()
         self.stopped = threading.Event()
-        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="gaia-tts")
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gaia-tts")
         self.processes: list[object] = []
 
     def feed(self, text: str) -> None:
@@ -116,25 +117,46 @@ class SentenceTTSBuffer:
     def _synthesize_and_play(self, sentence: str) -> None:
         if self.stopped.is_set():
             return
+        path = None
         try:
             path = self.api.request_tts(sentence)
-            if self.stopped.is_set():
-                return
-            play_audio(path, process_registry=self.processes)
+            if not self.stopped.is_set():
+                play_audio(path, process_registry=self.processes)
         except Exception:
-            # Streaming text remains useful when local TTS is unavailable.
-            return
+            logger.debug("La voz del fragmento no se pudo reproducir.", exc_info=True)
+        finally:
+            if path:
+                release_temp(path)
+
+
+def release_temp(path: Path) -> None:
+    path = Path(path)
+    path.unlink(missing_ok=True)
+    with _TEMP_LOCK:
+        _TEMP_FILES.discard(path)
+
+
+def _remember_temp(path: Path) -> None:
+    with _TEMP_LOCK:
+        _TEMP_FILES.add(path)
 
 
 def _cleanup() -> None:
-    for path in _TEMP_FILES:
-        path.unlink(missing_ok=True)
+    with _TEMP_LOCK:
+        paths = tuple(_TEMP_FILES)
+    for path in paths:
+        try:
+            release_temp(path)
+        except OSError:
+            logger.debug("No se pudo cerrar un temporal del escritorio.")
 
 atexit.register(_cleanup)
 
 
 class LumenAPIError(RuntimeError):
-    pass
+    def __init__(self, message: str, payload: dict | None = None):
+        super().__init__(message)
+        self.payload = payload or {}
 
 
 class LumenDesktopAPI:
@@ -152,21 +174,23 @@ class LumenDesktopAPI:
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         try:
-            with httpx.Client(timeout=kwargs.pop("timeout", LLM_CLIENT_TIMEOUT)) as client:
+            with httpx.Client(timeout=kwargs.pop("timeout", LLM_CLIENT_TIMEOUT), trust_env=False) as client:
                 response = client.request(method, f"{self.base_url}{path}", headers=self.headers, **kwargs)
             if response.is_error:
                 try:
-                    message = response.json().get("detail", response.text)
+                    payload = response.json()
                 except ValueError:
-                    message = response.text
-                raise LumenAPIError(f"HTTP {response.status_code}: {message}")
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                raise LumenAPIError(f"HTTP {response.status_code}: {payload.get('detail', response.text)}", payload)
             return response
         except httpx.RequestError as exc:
             raise LumenAPIError(f"No se pudo conectar con el Core: {exc}") from exc
 
     def health(self) -> dict:
         try:
-            with httpx.Client(timeout=4.0) as client:
+            with httpx.Client(timeout=4.0, trust_env=False) as client:
                 response = client.get(f"{self.base_url}/api/health")
             response.raise_for_status()
             return response.json()
@@ -231,10 +255,10 @@ class LumenDesktopAPI:
         self.session_id = data.get("session_id", self.session_id)
         return data
 
-    def send_voice(self, audio_path: Path) -> dict:
+    def send_voice(self, audio_path: Path, *, synthesize_audio: bool = True) -> dict:
         context = self.desktop_context(snapshot_only=True, force_refresh=True)
         envelope = self.request_envelope(channel="desktop_voice", context=context)
-        form = {"channel": "desktop_voice", "request_envelope": json.dumps(envelope, ensure_ascii=False), "desktop_snapshot": json.dumps(context.get("desktop_snapshot") or {}, ensure_ascii=False)}
+        form = {"channel": "desktop_voice", "synthesize_audio": str(synthesize_audio).lower(), "request_envelope": json.dumps(envelope, ensure_ascii=False), "desktop_snapshot": json.dumps(context.get("desktop_snapshot") or {}, ensure_ascii=False)}
         with audio_path.open("rb") as handle:
             data = self._request("POST", "/api/chat/voice", params={"session_id": self.session_id, "device": DEVICE}, data=form,
                                  files={"audio": (audio_path.name, handle, "audio/wav")}, timeout=LLM_CLIENT_TIMEOUT).json()
@@ -255,7 +279,7 @@ class LumenDesktopAPI:
         tts_buffer = SentenceTTSBuffer(self) if speak else None
         self._active_tts = tts_buffer
         try:
-            with httpx.Client(timeout=LLM_CLIENT_TIMEOUT) as client:
+            with httpx.Client(timeout=LLM_CLIENT_TIMEOUT, trust_env=False) as client:
                 context = self._text_context(text)
                 with client.stream("POST", f"{self.base_url}/api/assistant/stream", headers=self.headers, json={"message": text, "session_id": self.session_id, "device": DEVICE, "profile": profile, "channel": "desktop_text", "pc_context": context, "desktop_snapshot": context.get("desktop_snapshot"), "request_envelope": self.request_envelope(text, channel="desktop_text", context=context)}) as response:
                     response.raise_for_status()
@@ -321,7 +345,7 @@ class LumenDesktopAPI:
         response = self._request("GET", f"/api/captures/{candidate}", timeout=CAPTURE_DOWNLOAD_TIMEOUT)
         path = Path(tempfile.gettempdir()) / f"gaia_{candidate}.png"
         path.write_bytes(response.content)
-        _TEMP_FILES.append(path)
+        _remember_temp(path)
         return path
 
     def list_permissions(self) -> list[dict]:
@@ -432,8 +456,8 @@ class LumenDesktopAPI:
             return {"status": "no_active_request"}
         return self._request("POST", "/api/assistant/cancel", json={"request_id": self.request_id}, timeout=10.0).json()
 
-    def request_tts(self, text: str) -> Path:
-        response = self._request("POST", "/api/voice/tts", json={"text": text}, timeout=90.0)
+    def request_tts(self, text: str, *, local_only: bool = False) -> Path:
+        response = self._request("POST", "/api/voice/tts", json={"text": text, "local_only": local_only}, timeout=90.0)
         # Piper returns WAV; a hardcoded MP3 suffix breaks some Windows players.
         data = response.content
         suffix = ".wav" if data.startswith(b"RIFF") else ".mp3"
@@ -512,7 +536,7 @@ def _save_temp(content: bytes, suffix: str) -> Path:
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
         temp.write(content)
         path = Path(temp.name)
-    _TEMP_FILES.append(path)
+    _remember_temp(path)
     return path
 
 
@@ -574,7 +598,7 @@ def record_microphone(duration: int = 5, device: int | None = None) -> Path:
         wav.setsampwidth(2)
         wav.setframerate(sample_rate)
         wav.writeframes(audio.tobytes())
-    _TEMP_FILES.append(path)
+    _remember_temp(path)
     return path
 
 

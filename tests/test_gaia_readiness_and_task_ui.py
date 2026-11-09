@@ -65,7 +65,7 @@ def test_readiness_reports_missing_components_without_side_effects(monkeypatch):
                audio_probe=lambda: [],display_probe=lambda: [])
     assert output['read_only'] and output['physical_validation_required']
     checks={c['id']:c for c in output['checks']}
-    assert checks['wake']['status']=='MISSING'
+    assert checks['wake']['status']=='CUSTOM_MODEL_MISSING'
     assert checks['vision_model']['status']=='MISSING'
     assert checks['stt']['status']=='MISSING'
     assert 'ollama pull' in to_text(output)

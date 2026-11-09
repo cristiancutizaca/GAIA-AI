@@ -5,16 +5,18 @@ It deliberately does not download LLMs without an explicit command. The baseline
 voice installer can prefetch Piper Spanish voice + faster-whisper model.
 """
 from __future__ import annotations
-import argparse, hashlib, importlib.util, json, os, subprocess, sys
+import argparse, hashlib, importlib.util, json, os, subprocess, sys, wave
+from io import BytesIO
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
-DATA_DIR=ROOT/'lumen-core'/'data'
-MODEL_DIR=DATA_DIR/'models'
-PIPER_DIR=MODEL_DIR/'piper'
-WAKE_DIR=ROOT/'assets'/'wakeword'
-DEFAULT_PIPER=os.getenv('LUMEN_PIPER_MODEL','es_MX-claude-high')
-DEFAULT_STT=os.getenv('LUMEN_WHISPER_MODEL','base')
+sys.path.insert(0, str(ROOT / "lumen-core"))
+from config import LLM_MODEL, WHISPER_MODEL
+from voice import _piper_data_dir, _piper_model
+
+WAKE_DIR = ROOT / "assets" / "wakeword"
+DEFAULT_PIPER = _piper_model()
+DEFAULT_STT = WHISPER_MODEL
 
 
 def _module(name:str)->bool:
@@ -29,14 +31,14 @@ def _sha(path:Path)->str:
 
 def status()->dict:
     voice=os.getenv('LUMEN_PIPER_MODEL',DEFAULT_PIPER)
-    piper_model=PIPER_DIR/f'{voice}.onnx'
+    piper_model=_piper_data_dir()/f'{voice}.onnx'
     piper_cfg=Path(str(piper_model)+'.json')
     wake_raw=os.getenv('GAIA_WAKEWORD_MODEL','').strip()
     wake=Path(wake_raw).expanduser() if wake_raw else WAKE_DIR/'gaia.onnx'
-    ollama_model=os.getenv('LUMEN_LLM_MODEL','qwen3.5:4b')
+    ollama_model=LLM_MODEL
     return {
-      'status':'READY' if _module('faster_whisper') and _module('piper') else 'PARTIAL',
-      'stt':{'engine':'faster-whisper','package':_module('faster_whisper'),'model':DEFAULT_STT,'download':'lazy/HuggingFace cache'},
+      'status':'COMPONENTS_PRESENT' if _module('faster_whisper') and _module('piper') and piper_model.is_file() and piper_cfg.is_file() else 'PARTIAL',
+      'stt':{'engine':'faster-whisper','package':_module('faster_whisper'),'model':DEFAULT_STT,'download':'explicit install stt / local Hugging Face cache'},
       'tts':{'engine':'piper','package':_module('piper'),'voice':voice,'model':str(piper_model),'model_ready':piper_model.is_file() and piper_cfg.is_file()},
       'wake':{'engine':'openwakeword','package':_module('openwakeword'),'model':str(wake),'model_ready':wake.is_file(),'sha256':_sha(wake) if wake.is_file() else ''},
       'ollama':{'model':ollama_model,'installed_by_this_tool':False,'note':'LLMs are never downloaded implicitly.'},
@@ -44,20 +46,30 @@ def status()->dict:
 
 def install_piper(voice:str)->dict:
     if not _module('piper'): raise RuntimeError('piper-tts is not installed; install the Voice/Full profile first')
-    PIPER_DIR.mkdir(parents=True,exist_ok=True)
-    cmd=[sys.executable,'-m','piper.download_voices','--data-dir',str(PIPER_DIR),voice]
+    piper_dir = _piper_data_dir()
+    cmd=[sys.executable,'-m','piper.download_voices','--data-dir',str(piper_dir),voice]
     subprocess.run(cmd,check=True,timeout=300)
-    model=PIPER_DIR/f'{voice}.onnx'; cfg=Path(str(model)+'.json')
+    model=piper_dir/f'{voice}.onnx'; cfg=Path(str(model)+'.json')
     if not model.is_file() or not cfg.is_file(): raise RuntimeError('Piper download completed but expected model/config are missing')
     return {'status':'INSTALLED','component':'piper','voice':voice,'model':str(model),'sha256':_sha(model)}
 
 def install_stt(model:str)->dict:
     if not _module('faster_whisper'): raise RuntimeError('faster-whisper is not installed; install the Voice/Full profile first')
     from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
+    sample = BytesIO()
+    with wave.open(sample, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(bytes(3200))
+    sample.seek(0)
+    if len(decode_audio(sample)) != 1600:
+        raise RuntimeError("PyAV no pudo decodificar el WAV de prueba.")
     device=os.getenv('LUMEN_STT_DEVICE','cpu')
     compute=os.getenv('LUMEN_STT_COMPUTE_TYPE','int8' if device=='cpu' else 'float16')
     WhisperModel(model,device=device,compute_type=compute)
-    return {'status':'READY','component':'stt','engine':'faster-whisper','model':model,'device':device,'compute_type':compute}
+    return {'status':'READY','component':'stt','engine':'faster-whisper','model':model,'device':device,'compute_type':compute,'wav_decode_verified':True}
 
 def main(argv=None)->int:
     ap=argparse.ArgumentParser(prog='gaia models')

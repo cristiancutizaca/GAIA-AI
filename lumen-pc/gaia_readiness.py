@@ -62,9 +62,11 @@ def run(*, models_probe=None, platform_name=None, audio_probe=None, display_prob
     checks.append(_check("desktop", "READY" if _import_available("PySide6") else "MISSING",
                          "PySide6 presente" if _import_available("PySide6") else "No está instalado PySide6.",
                          "Instala el perfil desktop/full-computer de GAIA."))
-    checks.append(_check("stt", "READY" if _import_available("faster_whisper") else "MISSING",
-                         "Faster-Whisper importable (captura de voz aún por probar)." if _import_available("faster_whisper") else "Falta Faster-Whisper.",
-                         "Instala requirements-voice.txt y el modelo de transcripción."))
+    stt_package = _import_available("faster_whisper")
+    checks.append(_check("stt", "PACKAGE_PRESENT" if stt_package else "MISSING",
+                         "Paquete faster-whisper presente. Verifica pesos y transcripción."
+                         if stt_package else "Falta faster-whisper.",
+                         "Usa gaia_models.py install stt para preparar los pesos y probar el decodificador WAV."))
     piper = _import_available("piper")
     if piper:
         try:
@@ -101,8 +103,12 @@ def run(*, models_probe=None, platform_name=None, audio_probe=None, display_prob
                              "Instala sounddevice y conecta un micrófono; valida permisos de Windows."))
     wake = os.getenv("GAIA_WAKEWORD_MODEL", "").strip()
     wake_path = Path(wake).expanduser() if wake else ROOT / "assets" / "wakeword" / "gaia.onnx"
-    checks.append(_check("wake", "READY" if wake_path.is_file() else "MISSING",
-                         "Modelo Gaia ONNX presente (precisión aún sin validar)." if wake_path.is_file() else "Falta el modelo de activación real gaia.onnx.",
+    wake_status = "CUSTOM_MODEL_MISSING"
+    if wake_path.is_file():
+        wake_status = "MODEL_PRESENT" if wake_path.name.casefold() == "gaia.onnx" else "CUSTOM_MODEL_INVALID"
+    checks.append(_check("wake", wake_status,
+                         "Archivo gaia.onnx presente. La palabra se verifica con una prueba física." if wake_status == "MODEL_PRESENT"
+                         else "Se requiere un modelo auténtico de GAIA con el nombre gaia.onnx.",
                          "Usa Ctrl+Espacio para hablar; el wake word requiere entrenar/instalar gaia.onnx."))
     try:
         displays = list((display_probe or _default_displays)())
@@ -117,13 +123,13 @@ def run(*, models_probe=None, platform_name=None, audio_probe=None, display_prob
         names = (models_probe or local_models)()["models"]
     except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
         checks.extend([_check("ollama", "OFFLINE", f"Ollama local no responde: {type(exc).__name__}", "Abre Ollama en Windows."),
-                       _check("chat_model", "MISSING", f"Modelo solicitado: {chat_model}", f"ollama pull {chat_model}"),
-                       _check("vision_model", "MISSING", f"Modelo visual solicitado: {vision_model}", f"ollama pull {vision_model}")])
+                       _check("chat_model", "UNVERIFIED", f"Modelo solicitado: {chat_model}"),
+                       _check("vision_model", "UNVERIFIED", f"Modelo visual solicitado: {vision_model}")])
     else:
         checks.append(_check("ollama", "READY", f"Ollama local responde; {len(names)} modelos instalados."))
         for key, target in (("chat_model", chat_model), ("vision_model", vision_model)):
             exists = _has_model(target, names)
-            checks.append(_check(key, "READY" if exists else "MISSING", f"Modelo {target}: {'instalado' if exists else 'no instalado'}; inferencia aún sin validar.",
+            checks.append(_check(key, "INSTALLED" if exists else "MISSING", f"Modelo {target}: {'instalado' if exists else 'no instalado'}; inferencia aún sin validar.",
                                  "" if exists else f"ollama pull {target}"))
     return {"read_only": True, "platform": system,
             "checks": checks, "ready": sum(c["status"] == "READY" for c in checks),
@@ -136,7 +142,7 @@ def _default_displays():
 
 
 def to_text(result: dict) -> str:
-    icon = {"READY": "✓", "WARNING": "!", "FALLBACK": "~", "OFFLINE": "×", "MISSING": "×", "NOT_APPLICABLE": "-"}
+    icon = {"READY": "✓", "INSTALLED": "~", "MODEL_PRESENT": "~", "CUSTOM_MODEL_MISSING": "×", "WARNING": "!", "FALLBACK": "~", "OFFLINE": "×", "MISSING": "×", "NOT_APPLICABLE": "-"}
     lines = [f"GAIA · Diagnóstico local ({result['ready']}/{result['total']} controles READY)"]
     for item in result["checks"]:
         lines.append(f"{icon.get(item['status'], '?')} {item['id']}: {item['detail']}")

@@ -1,5 +1,16 @@
 # Changelog
 
+## En revisión · Estabilización de GAIA 2.0 RC3
+
+- Corrige la incompatibilidad de PyAV 19 con faster-whisper 1.2.1 y evita descargas de Whisper al iniciar una grabación de forma predeterminada.
+- Separa respuesta y síntesis en el escritorio. Reutiliza una voz Piper y reproduce frases en orden con cancelación local.
+- Respeta el micrófono seleccionado, descarta audio pendiente al desactivarlo y hace visibles los conflictos de atajos.
+- Valida la capacidad visual antes de capturar y distingue el estado de los modelos de Ollama instalados y cargados.
+- Mejora la supervisión del Core, la limpieza de estado SSE, el diagnóstico de memoria y OpenCode, y el respaldo de `.env` durante una reparación autorizada.
+
+La evidencia y el estado de cada problema están en [GAIA_BUG_FIX_REPORT.md](GAIA_BUG_FIX_REPORT.md).
+
+
 ## 2.0-WINDOWS-COMPLETE-RC3
 
 - Browser Use isolated into `.venv-browser` to prevent exact runtime pins from mutating Core/Voice dependencies.
