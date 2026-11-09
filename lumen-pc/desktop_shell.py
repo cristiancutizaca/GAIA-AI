@@ -345,6 +345,7 @@ class DesktopShell:
         self.panel.comfy_diagnostic_requested.connect(lambda:self._submit_text('GAIA, diagnostica ComfyUI y ROCm'))
         self.panel.readiness_requested.connect(self.run_readiness)
         self.panel.tasks_requested.connect(self.show_tasks)
+        self.panel.memory_requested.connect(self.show_memory)
         self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu()
         for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Open Dashboard",self.open_dashboard),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Push-to-talk",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
         self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.ptt_hotkey.register(); self.quick_hotkey.register()
@@ -413,7 +414,9 @@ class DesktopShell:
             except Exception as exc: self._handle_error_gui(str(exc))
         else:
             response=str(data.get("response","")).strip() if isinstance(data,dict) else ""
-            if response and self.tray: self.tray.showMessage("GAIA",response[:300])
+            capability = str((data.get("active_context") or {}).get("capability") or "") if isinstance(data, dict) else ""
+            if response and self.tray and not capability.startswith("memory."):
+                self.tray.showMessage("GAIA", response[:300])
             self._continue_conversation_gui()
     def _continue_conversation_gui(self):
         if self.wake and self._microphone_on and self.wake.session_active:
@@ -502,14 +505,16 @@ class DesktopShell:
     def _submit_text(self,text, *, display_user=True, voice_reply=False):
         if not text:return
         if display_user and self.panel:self.panel.add_message("Tú",text)
-        from gaia_vision import is_screen_request
-        if is_screen_request(text):
-            self._request_screen("",text)
-            return
         from gaia_desktop_tasks import is_local_diagnostic_request
-        if is_local_diagnostic_request(text):
-            self._run_local_diagnostic(text, voice_reply=voice_reply)
-            return
+        from gaia_vision import is_screen_request
+        from memory_intent import parse_memory_intent
+        if parse_memory_intent(text) is None:
+            if is_screen_request(text):
+                self._request_screen("",text)
+                return
+            if is_local_diagnostic_request(text):
+                self._run_local_diagnostic(text, voice_reply=voice_reply)
+                return
         self._set_state("THINKING");self._show_orb()
         if self.panel:self.panel.set_busy(True)
         def worker():
@@ -548,6 +553,18 @@ class DesktopShell:
                 if self.bridge:self.bridge.quick_error.emit('Autodiagnóstico: '+str(exc)[:350])
         threading.Thread(target=worker,daemon=True,name='gaia-readiness').start()
 
+    def show_memory(self):
+        if self.api is None:
+            self._handle_error_gui("Core no disponible.")
+            return
+        from gaia_memory_panel import MemoryPanel
+        panel = getattr(self, "_memory_panel", None)
+        if panel is None:
+            panel = self._memory_panel = MemoryPanel(self.api, self.panel)
+        panel.show()
+        panel.raise_()
+        panel.refresh()
+
     def show_tasks(self,*_):
         def worker():
             try:
@@ -576,7 +593,9 @@ class DesktopShell:
         response=str(result.get("response", "")).strip() if isinstance(result,dict) else ""
         if not response:response="El Core no devolvió texto. Comprueba Ollama y el modelo de chat."
         if self.panel:self.panel.add_message("GAIA",response)
-        if self.tray:self.tray.showMessage("GAIA",response[:300])
+        capability = str((result.get("active_context") or {}).get("capability") or "") if isinstance(result, dict) else ""
+        if self.tray and not capability.startswith("memory."):
+            self.tray.showMessage("GAIA", response[:300])
 
     def _show_action_proposal(self, contract):
         """Never execute PC actions solely from an LLM or a voice transcript."""

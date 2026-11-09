@@ -1,4 +1,4 @@
-# GAIA-AI 2.0 — Windows Complete RC1
+# GAIA-AI 2.0 — Windows Complete RC3
 
 GAIA is a local-first resident personal assistant. This release focuses on a reproducible Windows installation, a resident Core + Desktop lifecycle, local voice, browser/coding providers, memory isolation and deterministic Windows automation while preserving GAIA's central authority model.
 
@@ -6,7 +6,7 @@ GAIA is a local-first resident personal assistant. This release focuses on a rep
 **Release:** `2.0-WINDOWS-COMPLETE-RC3`  
 **Wire protocol:** `1.0-RC6` (compatibility identifier, not the product release)
 
-RC1 is intentional. The software has been hardened, but a genuine custom **Gaia** wake-word model and physical Windows validation are still required before calling the package FINAL.
+The release remains at RC3. The software has been hardened, but a genuine custom **Gaia** wake-word model and physical Windows validation are still required before calling the package FINAL.
 
 ## Fastest clean Windows setup
 
@@ -130,6 +130,8 @@ pytest -q
 The repair report also records critical legacy regression scripts for Authority, Core E2E, Security, Kill Switch, permission levels, memory security and voice permissions.
 
 ## Current documents
+
+- `GAIA_PROGRESO.md` — audit, memory, Reflex, measured timings and remaining Windows checks.
 
 - `GAIA_FINAL_REPAIR_REPORT_2_1.md` — exact repair/reality report.
 - `GAIA_DEPENDENCY_AUDIT.md` — dependency/profile audit.

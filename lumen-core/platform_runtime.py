@@ -8,6 +8,9 @@ from gaia_ext.event_bus import EventBus, GaiaEvent
 from gaia_ext.feature_flags import feature_flags
 from gaia_platform.browser_real import BrowserProfile, HttpBrowserBackend, BrowserUseBackend
 from gaia_platform.memory_v2 import MemoryV2Store
+import gaia_latency
+from memory_intent import parse_memory_intent
+from memory_privacy import contains_credentials
 from gaia_platform.mcp_real import MCPManager, MCPServerConfig
 from gaia_platform.security import guard_web_content
 from gaia_platform.automation_persistent import PersistentAutomationStore
@@ -41,7 +44,7 @@ class CapabilityRouter:
 
 class PlatformRuntime:
     """Owner of v1.3 production-path capabilities; Core remains permission authority."""
-    def __init__(self, root: Path, *, event_bus: EventBus | None = None):
+    def __init__(self, root: Path, *, event_bus: EventBus | None = None, memory_db: Path | None = None):
         self.root = Path(root).resolve()
         self.data = self.root / "data"
         self.data.mkdir(parents=True, exist_ok=True)
@@ -49,7 +52,8 @@ class PlatformRuntime:
         self.visualizer_stream = VisualizerStream()
         self.events.subscribe("visualizer", self.visualizer_stream.publish)
         self.capabilities = CapabilityRouter()
-        self.memory = MemoryV2Store(self.data / "platform_memory_v13.db")
+        legacy_memory = self.data / "platform_memory_v13.db"
+        self.memory = MemoryV2Store(memory_db or legacy_memory, legacy_path=legacy_memory if memory_db else None)
         browser_profile = BrowserProfile(name="temporary", allowed_domains=set(), allow_private=os.getenv("GAIA_BROWSER_ALLOW_PRIVATE", "false").lower() in {"1", "true", "yes"})
         self.browser = BrowserUseBackend(browser_profile) if feature_flags.browser else HttpBrowserBackend(browser_profile)
         self.mcp = MCPManager()
@@ -153,47 +157,101 @@ class PlatformRuntime:
             return None
         return {"response":f"{response_prefix}: {decision.reason}","capability":decision.capability,"risk":decision.risk,"status":decision.status,"authority":decision.as_dict()}
 
-    async def handle_chat(self, message: str, *, principal, session_id: str, device_id: str, request_id: str = "") -> dict[str, Any] | None:
-        """Return a handled response only for capabilities this runtime owns; otherwise None delegates to legacy GAIA chat."""
-        text = message.strip(); low = text.lower(); correlation = request_id or uuid.uuid4().hex
-        owner = self._owner(principal)
+    @classmethod
+    def memory_scope(cls, principal, device_id: str) -> dict[str, str]:
+        owner = cls._owner(principal)
+        if owner == "master" and not principal.is_master:
+            # Old records with this reserved ID cannot be attributed safely to a device.
+            owner = "device:master"
+        return {"owner_id": owner, "namespace": f"device:{device_id}"}
+
+    async def handle_memory_chat(self, message: str, *, principal, session_id: str, device_id: str,
+                                 request_id: str = "") -> dict[str, Any] | None:
+        """Handle explicit memory commands without a model or a transcript copy."""
+        intent = parse_memory_intent(message)
+        if intent is None:
+            return None
+        write, query, project = intent
+        capability = "memory.write" if write else "memory.read"
+        scope = self.memory_scope(principal, device_id)
+        decision = authorize(
+            principal, capability=capability, permission=capability.replace(".", "_"),
+            risk=LOW_RISK if write else READ_ONLY, resource_scope=f"memory:{scope['owner_id']}",
+            confirmed=bool(write),
+        )
+        blocked = self._authority_result(decision)
+        if blocked:
+            return blocked
+        correlation = request_id or uuid.uuid4().hex
+        if write:
+            try:
+                mid = await asyncio.to_thread(
+                    self.memory.add, query, **scope, project=project, session=session_id,
+                    device=device_id, source="chat", kind="episodic", importance=.8,
+                )
+            except ValueError as exc:
+                return {"response": str(exc), "capability": capability, "status": "INVALID_MEMORY"}
+            semantic = graph = None
+            if feature_flags.mem0:
+                try:
+                    semantic = await asyncio.to_thread(
+                        self.mem0.add, query, owner=scope["owner_id"], namespace=scope["namespace"],
+                        session=session_id, project=project,
+                    )
+                except Exception as exc:
+                    semantic = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
+            if feature_flags.graph_memory and not project:
+                try:
+                    graph = await self.graphiti.add_episode(
+                        query, owner=scope["owner_id"], namespace=scope["namespace"], source="gaia.chat.memory",
+                    )
+                except Exception as exc:
+                    graph = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
+            self._emit("USING_TOOL", "memory_v2", {"capability": capability, "memory_id": mid},
+                       session_id=session_id, correlation_id=correlation)
+            return {"response": "Guardé el recuerdo.", "capability": capability, "memory_id": mid,
+                    "semantic_memory": semantic, "graph_memory": graph, "status": "SUCCEEDED"}
+
+        if contains_credentials(query):
+            return {"response": "La consulta contiene posibles credenciales.",
+                    "capability": capability, "status": "INVALID_MEMORY"}
+        with gaia_latency.measure("explicit_memory_retrieval"):
+            rows = await asyncio.to_thread(self.memory.search, query, **scope, project=project, limit=5)
+        semantic = graph = None
+        if query and feature_flags.mem0:
+            try:
+                semantic = await asyncio.to_thread(
+                    self.mem0.search, query, owner=scope["owner_id"], namespace=scope["namespace"], project=project, limit=5,
+                )
+            except Exception as exc:
+                semantic = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
+        if query and feature_flags.graph_memory and not project:
+            try:
+                graph = await self.graphiti.search(query, owner=scope["owner_id"], namespace=scope["namespace"], limit=5)
+            except Exception as exc:
+                graph = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
+        response = "No encontré un recuerdo relevante."
+        if rows:
+            response = "Recuerdos guardados:\n" + "\n".join(row["content"] for row in rows)
+        self._emit("SEARCHING_MEMORY", "memory_v2", {"count": len(rows)},
+                   session_id=session_id, correlation_id=correlation)
+        return {"response": response, "capability": capability, "results": rows,
+                "semantic_results": semantic, "graph_results": graph, "status": "SUCCEEDED"}
+
+    async def handle_chat(self, message: str, *, principal, session_id: str, device_id: str, request_id: str = "",
+                          include_memory: bool = True) -> dict[str, Any] | None:
+        """Handle platform capabilities or delegate to the Core chat path."""
+        if include_memory:
+            result = await self.handle_memory_chat(message, principal=principal, session_id=session_id,
+                                                   device_id=device_id, request_id=request_id)
+            if result is not None:
+                return result
+        text = message.strip()
+        low = text.lower()
+        correlation = request_id or uuid.uuid4().hex
         plan = self.planner.plan(text, mcp_configs=self.mcp.configs)
         self._emit("PLANNING", "planner_v2", {"plan_id":plan.id,"state":plan.state,"skill":plan.steps[0].skill}, session_id=session_id, correlation_id=correlation)
         self._emit("THINKING", "platform_runtime", {"message_length":len(text)}, session_id=session_id, correlation_id=correlation)
-
-        if re.search(r"\b(recuerda|recuerdame|remember)\b", low):
-            decision = authorize(principal, capability="memory.write", permission="memory_write", risk=LOW_RISK, resource_scope=f"memory:{owner}", confirmed=True)
-            blocked = self._authority_result(decision, response_prefix="Memory write blocked")
-            if blocked: return blocked
-            content = re.split(r"\b(?:que|that)\b", text, maxsplit=1, flags=re.I)[-1].strip(" .:") or text
-            mid = self.memory.add(content, owner_id=owner, namespace=f"device:{device_id}", session=session_id, device=device_id, source="chat", kind="episodic", importance=.8)
-            semantic = None
-            graph = None
-            if feature_flags.mem0:
-                try: semantic = await asyncio.to_thread(self.mem0.add, content, owner=owner, namespace=f"device:{device_id}", session=session_id)
-                except Exception as exc: semantic = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
-            if feature_flags.graph_memory:
-                try: graph = await self.graphiti.add_episode(content, owner=owner, namespace=f"device:{device_id}", source="gaia.chat.memory")
-                except Exception as exc: graph = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
-            self._emit("USING_TOOL", "memory_v2", {"capability":"memory.write","memory_id":mid}, session_id=session_id, correlation_id=correlation)
-            return {"response":f"Guardé el recuerdo en el espacio privado de {owner}.","capability":"memory.write","memory_id":mid,"semantic_memory":semantic,"graph_memory":graph,"status":"SUCCEEDED","plan":self.planner.serialize(plan)}
-
-        if re.search(r"\b(?:qué|que|what)\b.*\b(?:recuerd|base de datos|database|proyecto)\b", low) or "what do you remember" in low:
-            decision = authorize(principal, capability="memory.read", permission="memory_read", risk=READ_ONLY, resource_scope=f"memory:{owner}")
-            blocked = self._authority_result(decision, response_prefix="Memory read blocked")
-            if blocked: return blocked
-            rows = self.memory.search(text, owner_id=owner, namespace=f"device:{device_id}", limit=5)
-            semantic = None
-            graph = None
-            if feature_flags.mem0:
-                try: semantic = await asyncio.to_thread(self.mem0.search, text, owner=owner, namespace=f"device:{device_id}", limit=5)
-                except Exception as exc: semantic = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
-            if feature_flags.graph_memory:
-                try: graph = await self.graphiti.search(text, owner=owner, namespace=f"device:{device_id}", limit=5)
-                except Exception as exc: graph = {"status": "BACKEND_FAILED", "error": type(exc).__name__}
-            response = "No encontré un recuerdo relevante." if not rows else "Recuerdo relevante: " + "; ".join(str(x["content"]) for x in rows)
-            self._emit("SEARCHING_MEMORY", "memory_v2", {"count":len(rows)}, session_id=session_id, correlation_id=correlation)
-            return {"response":response,"capability":"memory.read","results":rows,"semantic_results":semantic,"graph_results":graph,"status":"SUCCEEDED","plan":self.planner.serialize(plan)}
 
         interaction = re.search(r"(?i)\b(?:click|haz click|pulsa)\s+(?:en\s+)?([#.]?[\w-]+)|\b(?:escribe|type|rellena)\s+(.+?)\s+(?:en|into)\s+([#.]?[\w-]+)", text)
         if interaction and re.search(r"(?i)\b(?:browser|navegador|página|pagina|click|pulsa|escribe|type|rellena)\b", text):
