@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -18,7 +19,7 @@ from typing import Any, Annotated, AsyncIterator
 from fastapi import APIRouter, UploadFile, File, Form, Header, HTTPException, Depends, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 import llm
 import memory
@@ -74,6 +75,7 @@ from voice import get_available_voices, speech_to_text, text_to_speech
 
 _PROMPT_METRICS: dict[str, int] = {}
 _RESOURCE_GOVERNOR = None
+_ACTIVE_STREAMS: dict[str, asyncio.Task] = {}
 
 
 def _resource_governor():
@@ -446,9 +448,17 @@ async def actions_control(principal: Annotated[Principal, Depends(require_chat)]
 
 @router.post("/actions/kill-switch")
 async def actions_kill_switch(principal: Annotated[Principal, Depends(require_master)]):
-    cancelled = memory.delete_states_prefix("pending_action:")
     memory.set_state("gaia_actions_enabled", "0")
     memory.set_state("gaia_actions_kill_switch_at", datetime.now().isoformat())
+    cancelled = 0
+    for row in memory.list_states("pending_action:"):
+        try:
+            pending = json.loads(row["value"])
+        except ValueError:
+            pending = None
+        if isinstance(pending, dict) and (pending.get("claimed_by") or pending.get("completed")):
+            continue
+        cancelled += memory.replace_state_if_current(row["key"], row["value"], None)
     return _actions_control_payload(pending_cancelled=cancelled)
 
 
@@ -549,7 +559,7 @@ def _ground_conversation_response(text: str, *, user_message: str = "", profile:
     if not visible:
         logger.warning("event=llm_empty_visible_output backend=%s model=%s profile=%s reasoning_filtered=true", llm.LLM_BACKEND, llm.LLM_MODEL, profile or "auto")
         return _EMPTY_RESPONSE_FALLBACK
-    tool_markup = re.match(r"^\s*<(?:tool_call|function_call)\b", visible, flags=re.I)
+    tool_markup = re.search(r"<(?:tool_call|function_call)\b", visible, flags=re.I)
     if tool_markup:
         return _UNAVAILABLE_ACTION_FALLBACK
     if request_state in {"CONVERSATION", "ACTION_REQUEST"} and (_has_effect_claim(visible) or (request_state == "CONVERSATION" and _has_unverified_execution_report(visible))):
@@ -723,6 +733,7 @@ class ChatRequest(BaseModel):
     profile: str = Field(default="", max_length=20)
     context: int | None = Field(default=None, ge=512, le=32768)
     intent: dict | None = None
+    require_confirmation: bool = False
     pc_context: dict | None = None
     desktop_snapshot: dict | None = None
     request_envelope: dict | None = None
@@ -1143,6 +1154,10 @@ def _permission_entries(intent: ActionIntent | ActionPlan, principal: Principal,
 def _action_policy_notice(intent: ActionIntent | ActionPlan | None, principal: Principal | None = None, device_id: str = "") -> str | None:
     if not intent:
         return None
+    if SAFE_MODE:
+        return _SAFE_MODE_ACTION_FALLBACK
+    if not _actions_enabled():
+        return _ACTIONS_DISABLED_FALLBACK
     permission = _permission_for_intent(intent, principal, device_id)
     if permission and permission["effective_decision"] in {"DENY", "ALWAYS_DENY"}:
         return "La política de permisos deniega esta capability para el scope solicitado; no se ejecutó nada."
@@ -1153,10 +1168,16 @@ def _action_policy_notice(intent: ActionIntent | ActionPlan | None, principal: P
     return None
 
 
-def _action_capability_failure(session_id: str, user_message: str, device_id: str) -> ChatResponse:
+def _save_chat_message(session_id: str, role: str, text: str, device_id: str, principal: Principal) -> None:
+    memory.save_message(session_id, role, text, device_id,
+                        principal_id="master" if principal.is_master else device_id,
+                        is_master=principal.is_master)
+
+
+def _action_capability_failure(session_id: str, user_message: str, device_id: str, principal: Principal) -> ChatResponse:
     """Close an explicit unsupported action request without invoking free chat narration."""
-    memory.save_message(session_id, "user", user_message, device_id)
-    memory.save_message(session_id, "assistant", _UNAVAILABLE_ACTION_FALLBACK, device_id)
+    _save_chat_message(session_id, "user", user_message, device_id, principal)
+    _save_chat_message(session_id, "assistant", _UNAVAILABLE_ACTION_FALLBACK, device_id, principal)
     return ChatResponse(response=_UNAVAILABLE_ACTION_FALLBACK, session_id=session_id, timestamp=datetime.now().isoformat(), request_state="ACTION_REQUEST")
 
 
@@ -1390,17 +1411,17 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
                 include_memory=False,
             )
             if result is not None:
-                memory.save_message(session_id, "user", user_message, device_id)
-                memory.save_message(session_id, "assistant", str(result.get("response") or ""), device_id)
+                _save_chat_message(session_id, "user", user_message, device_id, principal)
+                _save_chat_message(session_id, "assistant", str(result.get("response") or ""), device_id, principal)
                 return _platform_chat_response(result, session_id)
     request_state = "ACTION_REQUEST" if _is_action_request(user_message) or classify_reflex(user_message, request_context) else "CONVERSATION"
     if SAFE_MODE and request_state == "ACTION_REQUEST":
-        memory.save_message(session_id, "user", user_message, device_id)
-        memory.save_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id)
+        _save_chat_message(session_id, "user", user_message, device_id, principal)
+        _save_chat_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id, principal)
         return ChatResponse(response=_SAFE_MODE_ACTION_FALLBACK, session_id=session_id, timestamp=datetime.now().isoformat(), request_state="ACTION_REQUEST")
     if request_state == "ACTION_REQUEST" and not _actions_enabled():
-        memory.save_message(session_id, "user", user_message, device_id)
-        memory.save_message(session_id, "assistant", _ACTIONS_DISABLED_FALLBACK, device_id)
+        _save_chat_message(session_id, "user", user_message, device_id, principal)
+        _save_chat_message(session_id, "assistant", _ACTIONS_DISABLED_FALLBACK, device_id, principal)
         return ChatResponse(response=_ACTIONS_DISABLED_FALLBACK, session_id=session_id, timestamp=datetime.now().isoformat(), request_state="ACTION_REQUEST")
     can_actions = can_request_actions(principal)
     if can_actions and not _is_capability_question(user_message):
@@ -1411,16 +1432,18 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
     else:
         candidate = None
     if can_actions and request_state == "ACTION_REQUEST" and candidate is None:
-        return _action_capability_failure(session_id, user_message, device_id)
+        return _action_capability_failure(session_id, user_message, device_id, principal)
     notice = _action_policy_notice(candidate, principal, device_id)
     if notice:
-        memory.save_message(session_id, "user", user_message, device_id)
-        memory.save_message(session_id, "assistant", notice, device_id)
+        _save_chat_message(session_id, "user", user_message, device_id, principal)
+        _save_chat_message(session_id, "assistant", notice, device_id, principal)
         return ChatResponse(response=notice, session_id=session_id, timestamp=datetime.now().isoformat())
     intent = _apply_action_policy(candidate, principal, device_id)
     if intent:
+        if req.require_confirmation:
+            intent = replace(intent, confirmation_required=True)
         action_id = uuid.uuid4().hex
-        memory.save_message(session_id, "user", user_message, device_id)
+        _save_chat_message(session_id, "user", user_message, device_id, principal)
         memory.set_state("last_message_time", datetime.now().isoformat())
         memory.set_state("last_device", device_id)
         pending_state = _pending_action_state(intent, session_id=session_id, principal=principal, requesting_device=device_id, target_host=target_host)
@@ -1435,7 +1458,7 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
         logger.warning("Fallo de chat: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     response_text = _ground_conversation_response(response_text, user_message=user_message, profile=req.profile or "auto", request_state=request_state)
-    memory.save_message(session_id, "assistant", response_text, device_id)
+    _save_chat_message(session_id, "assistant", response_text, device_id, principal)
     return ChatResponse(response=response_text, session_id=session_id, timestamp=datetime.now().isoformat(), active_context=_relevant_active_context(user_message, request_context))
 
 
@@ -1470,6 +1493,10 @@ async def _assistant_stream(req: ChatRequest, principal: Principal, platform_run
     memory.set_state(owner_key, json.dumps({"request_id": request_id, "principal_type": principal.type, "device_id": principal.device_id, "token_id": principal.token_id, "session_id": session_id, "created_at": datetime.now().isoformat()}))
     try:
         yield await _sse_event("meta", {"session_id": session_id, "request_id": request_id})
+        cancelled = {"session_id": session_id, "request_id": request_id, "detail": "Generación cancelada por el usuario."}
+        if memory.get_state(cancel_key, "0") == "1":
+            yield await _sse_event("cancelled", cancelled)
+            return
         if platform_runtime is not None:
             result = await platform_runtime.handle_memory_chat(
                 user_message, principal=principal, session_id=session_id, device_id=device_id, request_id=request_id,
@@ -1481,13 +1508,13 @@ async def _assistant_stream(req: ChatRequest, principal: Principal, platform_run
                 return
         request_state = "ACTION_REQUEST" if _is_action_request(user_message) or classify_reflex(user_message, request_context) else "CONVERSATION"
         if SAFE_MODE and request_state == "ACTION_REQUEST":
-            memory.save_message(session_id, "user", user_message, device_id)
-            memory.save_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id)
+            _save_chat_message(session_id, "user", user_message, device_id, principal)
+            _save_chat_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id, principal)
             yield await _sse_event("done", {"kind": "chat", "response": _SAFE_MODE_ACTION_FALLBACK, "session_id": session_id, "request_id": request_id, "request_state": "ACTION_REQUEST", "safe_mode_blocked": True, "timestamp": datetime.now().isoformat()})
             return
         if request_state == "ACTION_REQUEST" and not _actions_enabled():
-            memory.save_message(session_id, "user", user_message, device_id)
-            memory.save_message(session_id, "assistant", _ACTIONS_DISABLED_FALLBACK, device_id)
+            _save_chat_message(session_id, "user", user_message, device_id, principal)
+            _save_chat_message(session_id, "assistant", _ACTIONS_DISABLED_FALLBACK, device_id, principal)
             yield await _sse_event("done", {"kind": "chat", "response": _ACTIONS_DISABLED_FALLBACK, "session_id": session_id, "request_id": request_id, "request_state": "ACTION_REQUEST", "timestamp": datetime.now().isoformat()})
             return
         can_actions = can_request_actions(principal)
@@ -1499,20 +1526,22 @@ async def _assistant_stream(req: ChatRequest, principal: Principal, platform_run
         else:
             candidate = None
         if can_actions and request_state == "ACTION_REQUEST" and candidate is None:
-            memory.save_message(session_id, "user", user_message, device_id)
-            memory.save_message(session_id, "assistant", _UNAVAILABLE_ACTION_FALLBACK, device_id)
+            _save_chat_message(session_id, "user", user_message, device_id, principal)
+            _save_chat_message(session_id, "assistant", _UNAVAILABLE_ACTION_FALLBACK, device_id, principal)
             yield await _sse_event("done", {"kind": "chat", "response": _UNAVAILABLE_ACTION_FALLBACK, "session_id": session_id, "request_id": request_id, "request_state": "ACTION_REQUEST", "timestamp": datetime.now().isoformat()})
             return
         notice = _action_policy_notice(candidate, principal, device_id)
         if notice:
-            memory.save_message(session_id, "user", user_message, device_id)
-            memory.save_message(session_id, "assistant", notice, device_id)
+            _save_chat_message(session_id, "user", user_message, device_id, principal)
+            _save_chat_message(session_id, "assistant", notice, device_id, principal)
             yield await _sse_event("done", {"kind": "chat", "response": notice, "session_id": session_id, "request_id": request_id, "timestamp": datetime.now().isoformat()})
             return
         intent = _apply_action_policy(candidate, principal, device_id)
         if intent:
+            if req.require_confirmation:
+                intent = replace(intent, confirmation_required=True)
             action_id = uuid.uuid4().hex
-            memory.save_message(session_id, "user", user_message, device_id)
+            _save_chat_message(session_id, "user", user_message, device_id, principal)
             pending_state = _pending_action_state(intent, session_id=session_id, principal=principal, requesting_device=device_id, target_host=target_host, request_id=request_id)
             memory.set_state(f"pending_action:{action_id}", json.dumps(pending_state, ensure_ascii=False))
             payload = _action_contract(intent, action_id, session_id, request_id, requesting_device=device_id, target_host=target_host, approved=bool(pending_state["approved"]), permission_entries=_permission_entries(intent, principal, device_id))
@@ -1524,27 +1553,40 @@ async def _assistant_stream(req: ChatRequest, principal: Principal, platform_run
         system_prompt, messages = _prepare_context(session_id, user_message, device_id, request_context, principal=principal, request_id=request_id, explicit_memories=explicit)
         chunks: list[str] = []
         model_started = perf_counter()
+
+        async def collect_model_text():
+            # Buffer until grounding has inspected the complete visible answer.
+            async with aclosing(llm.chat_completion_stream(
+                system_prompt, messages, profile=req.profile or None, context_override=req.context,
+            )) as stream:
+                async for chunk in stream:
+                    if chunk:
+                        if not chunks:
+                            gaia_latency.record("llm_first_internal_token", model_started)
+                        chunks.append(chunk)
+
         try:
-            async for chunk in llm.chat_completion_stream(system_prompt, messages, profile=req.profile or None, context_override=req.context):
-                if memory.get_state(cancel_key, "0") == "1":
-                    yield await _sse_event("cancelled", {"session_id": session_id, "request_id": request_id, "detail": "Generación cancelada por el usuario."})
-                    return
-                if chunk:
-                    if not chunks:
-                        gaia_latency.record("llm_first_internal_token", model_started)
-                    # Buffer until policy grounding has inspected the complete visible response.
-                    # Safety wins over token-by-token display for untrusted conversational text.
-                    chunks.append(chunk)
+            if memory.get_state(cancel_key, "0") != "1":
+                task = _ACTIVE_STREAMS[request_id] = asyncio.create_task(collect_model_text())
+                await task
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling() or memory.get_state(cancel_key, "0") != "1":
+                raise
         except llm.LLMError as exc:
             logger.warning("Fallo de streaming: %s", exc)
             yield await _sse_event("error", {"detail": str(exc), "session_id": session_id, "request_id": request_id})
             return
+        finally:
+            _ACTIVE_STREAMS.pop(request_id, None)
+        if memory.get_state(cancel_key, "0") == "1":
+            yield await _sse_event("cancelled", cancelled)
+            return
         raw_response_text = "".join(chunks).strip()
         response_text = _ground_conversation_response(raw_response_text, user_message=user_message, profile=req.profile or "auto", request_state=request_state)
         gaia_latency.record("llm_grounded_text", model_started)
-        yield await _sse_event("token", {"text": response_text})
-        memory.save_message(session_id, "assistant", response_text, device_id)
+        _save_chat_message(session_id, "assistant", response_text, device_id, principal)
         memory.set_state(cancel_key, "done")
+        yield await _sse_event("token", {"text": response_text})
         yield await _sse_event("done", {"kind": "chat", "response": response_text, "session_id": session_id, "request_id": request_id, "timestamp": datetime.now().isoformat()})
     finally:
         memory.delete_state(owner_key)
@@ -1583,12 +1625,16 @@ async def cancel_assistant(req: CancelRequest, principal: Annotated[Principal, D
         if not same_device:
             raise HTTPException(status_code=403, detail="Solo el Principal propietario puede cancelar esta generación.")
     memory.set_state(f"cancel:{req.request_id}", "1")
+    task = _ACTIVE_STREAMS.get(req.request_id)
+    if task is not None:
+        task.cancel()
     return {"status": "cancel_requested", "request_id": req.request_id}
 
 
 class ActionClaimPayload(BaseModel):
     action_id: str = Field(min_length=1, max_length=120)
     session_id: str = Field(min_length=1, max_length=120)
+    local_host: str = Field(default="", max_length=80)
 
 
 class ActionApprovalPayload(BaseModel):
@@ -1644,12 +1690,10 @@ async def pending_actions(principal: Annotated[Principal, Depends(require_action
             item = json.loads(row["value"])
         except (TypeError, json.JSONDecodeError):
             continue
-        if item.get("completed") or item.get("cancelled") or not item.get("approved"):
+        if item.get("completed") or item.get("cancelled") or item.get("claimed_by") or not item.get("approved"):
             continue
         target_host = str(item.get("target_host") or item.get("execution_host") or item.get("device") or PC_DEVICE_ID)
         if not principal.is_master and target_host != str(principal.device_id or ""):
-            continue
-        if item.get("claimed_by") and item.get("claimed_by") != principal.device_id and not principal.is_master:
             continue
         intent = item.get("intent") if isinstance(item.get("intent"), dict) else {}
         pending.append({"action_id": row["key"].split("pending_action:", 1)[-1], "session_id": item.get("session_id", ""), "device": item.get("device", ""), "requesting_device": item.get("requesting_device") or item.get("device", ""), "target_host": target_host, "intent": intent, "request_state": item.get("request_state", ""), "approved": bool(item.get("approved")), "auto_approved": bool(item.get("auto_approved")), "claimed_by": item.get("claimed_by")})
@@ -1671,6 +1715,10 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
     same_owner = principal.is_master or (pending.get("principal_type") == "device" and pending.get("device_id") == principal.device_id and pending.get("token_id") == principal.token_id)
     if not same_owner:
         raise HTTPException(status_code=403, detail="Solo el Principal propietario puede aprobar o rechazar esta acción.")
+    if pending.get("claimed_by"):
+        raise HTTPException(status_code=409, detail="La acción ya fue reclamada por un host.")
+    if approved and (not _actions_enabled() or ACTION_CONFIRM_POLICY == "BLOCKED"):
+        raise HTTPException(status_code=409, detail=_ACTIONS_DISABLED_FALLBACK)
     if approved:
         decision = str(payload.decision or "").strip().upper()
         valid_decisions = {"ALLOW_ONCE", "ALWAYS_ALLOW", "ASK", "ALWAYS_ASK", "DENY", "ALWAYS_DENY"}
@@ -1715,6 +1763,14 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
                         raise
                     except (ImportError, OSError, ValueError) as exc:
                         raise HTTPException(status_code=409, detail=f"No se pudo validar el trust de la app: {exc}") from exc
+        if decision in {"DENY", "ALWAYS_DENY", "ASK", "ALWAYS_ASK"}:
+            denied = decision in {"DENY", "ALWAYS_DENY"}
+            pending.update(approved=False, auto_approved=False, approval_decision=decision)
+            next_state = None if denied else json.dumps(pending, ensure_ascii=False)
+            if not memory.replace_state_if_current(state_key, raw, next_state):
+                raise HTTPException(status_code=409, detail="La acción cambió o dejó de estar pendiente.")
+            return {"status": "rejected" if denied else "awaiting_confirmation", "action_id": payload.action_id,
+                    "session_id": payload.session_id, "decision": decision, "permission_ids": permission_ids}
         pending["approved"] = True
         pending["approved_by"] = principal.device_id or "master"
         pending["approved_at"] = datetime.now().isoformat()
@@ -1722,9 +1778,11 @@ async def _set_action_approval(payload: ActionApprovalPayload, principal: Princi
         pending["permission_ids"] = permission_ids
         pending["temporary_trust_apps"] = temporary_trust_apps
         pending["trusted_apps"] = trusted_apps
-        memory.set_state(state_key, json.dumps(pending, ensure_ascii=False))
+        if not memory.replace_state_if_current(state_key, raw, json.dumps(pending, ensure_ascii=False)):
+            raise HTTPException(status_code=409, detail="La acción cambió o dejó de estar pendiente.")
         return {"status": "approved", "action_id": payload.action_id, "session_id": payload.session_id, "decision": decision or "CONFIRM_ONCE", "permission_ids": permission_ids, "trusted_apps": trusted_apps}
-    memory.delete_state(state_key)
+    if not memory.replace_state_if_current(state_key, raw, None):
+        raise HTTPException(status_code=409, detail="La acción cambió o dejó de estar pendiente.")
     return {"status": "rejected", "action_id": payload.action_id, "session_id": payload.session_id}
 
 
@@ -1739,9 +1797,11 @@ async def reject_action(payload: ActionApprovalPayload, principal: Annotated[Pri
 
 
 @router.post("/actions/claim")
-async def claim_action(payload: ActionClaimPayload, principal: Annotated[Principal, Depends(require_action_host)]):
+async def claim_action(payload: ActionClaimPayload, principal: Annotated[Principal, Depends(require_action_execution)]):
     if SAFE_MODE:
         raise HTTPException(status_code=409, detail="SAFE_MODE_BLOCKED: no se pueden reclamar acciones remotas en Safe Mode.")
+    if not _actions_enabled() or ACTION_CONFIRM_POLICY == "BLOCKED":
+        raise HTTPException(status_code=409, detail=_ACTIONS_DISABLED_FALLBACK)
     state_key = f"pending_action:{payload.action_id}"
     raw = memory.get_state(state_key)
     if not raw:
@@ -1752,17 +1812,27 @@ async def claim_action(payload: ActionClaimPayload, principal: Annotated[Princip
         raise HTTPException(status_code=500, detail="Estado de acción inválido.") from exc
     if pending.get("session_id") != payload.session_id:
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
-    if not pending.get("approved"):
-        raise HTTPException(status_code=409, detail="La acción requiere aprobación explícita del dispositivo solicitante.")
     target_host = str(pending.get("target_host") or pending.get("execution_host") or pending.get("device") or PC_DEVICE_ID)
     if not principal.is_master and target_host != str(principal.device_id or ""):
         raise HTTPException(status_code=403, detail="La acción está dirigida a otro host autorizado.")
-    claimed_by = str(pending.get("claimed_by") or "")
-    if claimed_by and claimed_by != str(principal.device_id or "") and not principal.is_master:
-        raise HTTPException(status_code=409, detail="La acción ya fue reclamada por otro host.")
+    if pending.get("claimed_by"):
+        raise HTTPException(status_code=409, detail="La acción ya fue reclamada por un host.")
+    if payload.local_host:
+        requester = str(pending.get("requesting_device") or pending.get("device") or "")
+        same_owner = (principal.is_master and pending.get("principal_type") == "master") or (
+            not principal.is_master and pending.get("device_id") == principal.device_id
+            and pending.get("token_id") == principal.token_id
+        )
+        if not same_owner or payload.local_host != target_host or requester != target_host:
+            raise HTTPException(status_code=403, detail="La propuesta no pertenece a esta sesión y host locales.")
+        pending.update(approved=True, approved_by=principal.device_id or "master",
+                       approved_at=datetime.now().isoformat(), approval_source="local_confirmation")
+    elif not pending.get("approved"):
+        raise HTTPException(status_code=409, detail="La acción requiere aprobación explícita del dispositivo solicitante.")
     pending["claimed_by"] = str(principal.device_id or "master")
     pending["claimed_by_token"] = str(principal.token_id or "") if not principal.is_master else "master"
-    memory.set_state(state_key, json.dumps(pending, ensure_ascii=False))
+    if not memory.replace_state_if_current(state_key, raw, json.dumps(pending, ensure_ascii=False)):
+        raise HTTPException(status_code=409, detail="La acción cambió o dejó de estar pendiente.")
     return {"status": "claimed", "action_id": payload.action_id, "session_id": payload.session_id, "intent": pending.get("intent", {}), "claimed_by": pending["claimed_by"]}
 
 
@@ -1784,8 +1854,10 @@ async def complete_action(req: ActionCompleteRequest, principal: Annotated[Princ
         raise HTTPException(status_code=409, detail="La sesión no coincide con la acción pendiente.")
     if not principal.is_master:
         same_device = pending.get("principal_type") == "device" and pending.get("device_id") == principal.device_id and pending.get("token_id") == principal.token_id
-        claimed_host = pending.get("claimed_by") == principal.device_id and principal.allows(CAP_ACTION_HOST)
-        if not same_device and not claimed_host:
+        claimed_host = (pending.get("claimed_by") == principal.device_id
+                        and pending.get("claimed_by_token") == principal.token_id
+                        and principal.allows(CAP_ACTION_HOST))
+        if not (claimed_host if pending.get("claimed_by") else same_device):
             raise HTTPException(status_code=403, detail="La acción pertenece a otro Principal y no fue reclamada por este host.")
     pending_intent = pending.get("intent", {}) if isinstance(pending.get("intent"), dict) else {}
     if pending_intent.get("type") == "plan" and req.data.get("plan_id") != req.action_id:
@@ -1848,7 +1920,10 @@ async def complete_action(req: ActionCompleteRequest, principal: Annotated[Princ
         except (ImportError, OSError, ValueError):
             logger.warning("No se pudo retirar trust temporal de app para la acción %s", req.action_id)
     owner_device = str(pending.get("requesting_device") or pending.get("device") or device_id)[:80]
-    memory.save_verified_owner_message(req.session_id, natural_response, owner_device)
+    if pending.get("principal_type") == "master":
+        memory.save_message(req.session_id, "assistant", natural_response, owner_device, principal_id="master", is_master=True)
+    else:
+        memory.save_verified_owner_message(req.session_id, natural_response, owner_device)
     memory.set_state(state_key, json.dumps({"completed": True, **result_payload}))
     automation_run_id = str(pending.get("automation_run_id") or "")[:80]
     if automation_run_id:
@@ -1900,75 +1975,84 @@ def _register_private_voice(path: Path, principal: Principal) -> None:
     _private_voice_files[path.name] = (_voice_owner(principal), now + 120)
 
 
+def _transcribe_upload(content: bytes, suffix: str) -> str:
+    # A cancelled HTTP request cannot stop a running decoder thread. Keep the
+    # temporary WAV alive until that thread has finished using it.
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / f"input{suffix}"
+        path.write_bytes(content)
+        with gaia_latency.measure("stt_final_transcript"):
+            return speech_to_text(str(path))
+
+
 @router.post("/chat/voice")
 async def chat_voice(
     principal: Annotated[Principal, Depends(require_voice_chat)],
     audio: UploadFile = File(...),
     session_id: str = "",
     device: str = "pc",
-    target_host: str = Form(default=""),
-    channel: str = Form(default="desktop_voice", max_length=32),
-    request_envelope: str = Form(default="", max_length=24000),
-    desktop_snapshot: str = Form(default="", max_length=24000),
+    target_host: Annotated[str, Form()] = "",
+    channel: Annotated[str, Form(max_length=32)] = "desktop_voice",
+    request_envelope: Annotated[str, Form(max_length=24000)] = "",
+    desktop_snapshot: Annotated[str, Form(max_length=24000)] = "",
     request: Request = None,
-    synthesize_audio: bool = Form(default=True),
+    synthesize_audio: Annotated[bool, Form()] = True,
 ):
     voice_started = perf_counter()
     suffix = Path(audio.filename or "audio.wav").suffix.lower() or ".wav"
     if suffix not in {".wav", ".mp3", ".m4a", ".ogg", ".webm"}:
         raise HTTPException(status_code=415, detail="Formato de audio no admitido.")
-    content = await audio.read((MAX_AUDIO_UPLOAD_MB * 1024 * 1024) + 1)
-    if len(content) > MAX_AUDIO_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Archivo de audio demasiado grande.")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-    try:
-        try:
-            with gaia_latency.measure("stt_final_transcript"):
-                user_text = await asyncio.to_thread(speech_to_text, tmp_path)
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"Falló la transcripción: {exc}") from exc
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-    if not user_text.strip():
-        raise HTTPException(status_code=400, detail="No se detectó voz en el audio.")
     envelope = _form_dict(request_envelope)
     snapshot = _form_dict(desktop_snapshot)
     if not snapshot and isinstance(envelope.get("desktop_snapshot"), dict):
-        snapshot = dict(envelope["desktop_snapshot"])
-    envelope_session = str(envelope.get("session_id") or session_id)[:64]
-    envelope_device = str(envelope.get("requesting_device") or device)[:40]
-    envelope_target = str(envelope.get("target_host") or target_host)[:80]
-    voice_context = {"desktop_snapshot": snapshot} if snapshot else {}
+        snapshot = envelope["desktop_snapshot"]
+    try:
+        chat_req = ChatRequest(message="Audio", session_id=envelope.get("session_id") or session_id,
+                               device=envelope.get("requesting_device") or device,
+                               target_host=envelope.get("target_host") or target_host,
+                               channel=channel, require_confirmation=channel == "desktop_voice",
+                               request_envelope=envelope, desktop_snapshot=snapshot or None)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Sesión, dispositivo o destino de voz inválido.") from exc
+    content = await audio.read((MAX_AUDIO_UPLOAD_MB * 1024 * 1024) + 1)
+    if len(content) > MAX_AUDIO_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Archivo de audio demasiado grande.")
+    try:
+        user_text = (await asyncio.to_thread(_transcribe_upload, content, suffix)).strip()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Falló la transcripción: {exc}") from exc
+    if not user_text:
+        raise HTTPException(status_code=400, detail="No se detectó voz en el audio.")
+    try:
+        chat_req = ChatRequest.model_validate({**chat_req.model_dump(), "message": user_text})
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="La transcripción supera el límite del chat.") from exc
     # A desktop screen request must be handled by the local desktop only.
     # Do not invoke a text LLM or claim to see a monitor from this API.
     from vision_intent import is_screen_vision_request
     memory_request = parse_memory_intent(user_text) is not None
     if channel == "desktop_voice" and not memory_request and is_screen_vision_request(user_text):
         return {"user_text": user_text, "response": "Selecciona el monitor en GAIA para autorizar una captura local.",
-                "session_id": envelope_session, "kind": "desktop_vision", "vision_requested": True,
+                "session_id": chat_req.session_id, "kind": "desktop_vision", "vision_requested": True,
                 "audio_url": None, "tts_error": None}
     # Diagnóstico local reconocido por voz: delegar al escritorio del usuario,
     # que conserva permisos y dispositivo. No ejecutar herramientas en el Core.
     from operator_intent import is_local_diagnostic_request
     if channel == "desktop_voice" and not memory_request and is_local_diagnostic_request(user_text):
         return {"user_text": user_text, "response": "GAIA va a diagnosticar el equipo localmente.",
-                "session_id": envelope_session, "kind": "desktop_diagnostic",
+                "session_id": chat_req.session_id, "kind": "desktop_diagnostic",
                 "operator_requested": True, "audio_url": None, "tts_error": None}
     try:
         with gaia_latency.measure("voice_chat_after_transcript"):
             chat_resp = await _chat_service(
-                ChatRequest(message=user_text, session_id=envelope_session, device=envelope_device,
-                            target_host=envelope_target, channel=str(channel or "desktop_voice")[:32],
-                            request_envelope=envelope, desktop_snapshot=snapshot or None, pc_context=voice_context),
-                principal, getattr(request.app.state, "platform_runtime", None) if request else None, memory_only=True,
+                chat_req, principal, getattr(request.app.state, "platform_runtime", None) if request else None,
+                memory_only=True,
             )
     except HTTPException as exc:
         if exc.status_code != 502:
             raise
         # Preserve the recognized text even if Ollama cannot answer.
-        return JSONResponse({"kind": "voice_error", "user_text": user_text, "session_id": envelope_session,
+        return JSONResponse({"kind": "voice_error", "user_text": user_text, "session_id": chat_req.session_id,
                              "response": "", "stage": "chat", "detail": str(exc.detail), "audio_url": None},
                             status_code=502, headers={"Cache-Control": "no-store"})
     audio_url: str | None = None
@@ -1991,7 +2075,8 @@ async def chat_voice(
             tts_error = str(exc)
             logger.warning("Respuesta generada, pero TTS falló: %s", exc)
     gaia_latency.record("voice_http_total", voice_started)
-    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "audio_url": audio_url, "tts_error": tts_error, "tts_enabled": TTS_ENABLED, "active_context": chat_resp.active_context}
+    return {**chat_resp.model_dump(), "user_text": user_text, "audio_url": audio_url,
+            "tts_error": tts_error, "tts_enabled": TTS_ENABLED}
 
 
 @router.get("/captures/{capture_id}")

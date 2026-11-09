@@ -1,5 +1,12 @@
 # Changelog
 
+## En revisión · Segunda auditoría de GAIA 2.0 RC3
+
+- Valida los metadatos de voz antes de transcribir, conserva permisos y destino en las propuestas y mantiene disponible el escritorio si falta una biblioteca nativa de audio.
+- Exige una reclamación única en Core antes de ejecutar desde Desktop. Respeta las denegaciones y bloquea propuestas estructuradas con el Kill Switch activo.
+- Cancela la generación SSE aunque el modelo aún no haya emitido texto y detecta respuestas Ollama incompletas.
+- Conserva el dueño de las sesiones entre dispositivos, revalida el monitor antes de capturar y verifica el estado de la ventana tras una acción.
+
 ## En revisión · Estabilización de GAIA 2.0 RC3
 
 - Corrige la incompatibilidad de PyAV 19 con faster-whisper 1.2.1 y evita descargas de Whisper al iniciar una grabación de forma predeterminada.

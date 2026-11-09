@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="gaia_grounding_") as tmp:
     import memory
     import routes.api as api_routes
 
-    async def no_action(_message: str, _structured=None):
+    async def no_action(_message: str, _structured=None, _pc_context=None):
         return None
 
     async def hallucinated_response(*_args, **_kwargs):

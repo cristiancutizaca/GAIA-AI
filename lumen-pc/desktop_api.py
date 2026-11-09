@@ -70,8 +70,9 @@ MIC_PREFERENCE_FILE = Path(os.getenv("GAIA_MIC_PREFERENCE_FILE", "").strip() or 
 
 class SentenceTTSBuffer:
     """Acumula tokens y sintetiza frases completas en segundo plano."""
-    def __init__(self, api: "LumenDesktopAPI") -> None:
+    def __init__(self, api: "LumenDesktopAPI", *, local_only: bool = False) -> None:
         self.api = api
+        self.local_only = local_only
         self.buffer = ""
         self.lock = threading.Lock()
         self.stopped = threading.Event()
@@ -118,14 +119,15 @@ class SentenceTTSBuffer:
         if self.stopped.is_set():
             return
         path = None
+        detached = False
         try:
-            path = self.api.request_tts(sentence)
+            path = self.api.request_tts(sentence, local_only=self.local_only)
             if not self.stopped.is_set():
-                play_audio(path, process_registry=self.processes)
+                detached = not play_audio(path, process_registry=self.processes)
         except Exception:
             logger.debug("La voz del fragmento no se pudo reproducir.", exc_info=True)
         finally:
-            if path:
+            if path and not detached:
                 release_temp(path)
 
 
@@ -251,7 +253,7 @@ class LumenDesktopAPI:
 
     def send_message(self, text: str) -> dict:
         context = self._text_context(text)
-        data = self._request("POST", "/api/chat", json={"message": text, "session_id": self.session_id, "device": DEVICE, "channel": "desktop_text", "pc_context": context, "desktop_snapshot": context.get("desktop_snapshot"), "request_envelope": self.request_envelope(text, channel="desktop_text", context=context)}).json()
+        data = self._request("POST", "/api/chat", json={"message": text, "session_id": self.session_id, "device": DEVICE, "channel": "desktop_text", "require_confirmation": True, "pc_context": context, "desktop_snapshot": context.get("desktop_snapshot"), "request_envelope": self.request_envelope(text, channel="desktop_text", context=context)}).json()
         self.session_id = data.get("session_id", self.session_id)
         return data
 
@@ -272,11 +274,17 @@ class LumenDesktopAPI:
 
     def send_assistant(self, text: str, engine: ActionEngine | None = None, profile: str = "", speak: bool = False) -> dict:
         """Consume SSE and optionally synthesize complete sentences in the background."""
+        from memory_intent import parse_memory_intent
+
+        if self._active_tts is not None:
+            self._active_tts.stop()
         self._plan_cancel_requested.clear()
+        self.request_id = ""
         event_name = ""
         final: dict = {}
         action_data: dict | None = None
-        tts_buffer = SentenceTTSBuffer(self) if speak else None
+        memory_intent = parse_memory_intent(text)
+        tts_buffer = SentenceTTSBuffer(self, local_only=bool(memory_intent and not memory_intent[0])) if speak else None
         self._active_tts = tts_buffer
         try:
             with httpx.Client(timeout=LLM_CLIENT_TIMEOUT, trust_env=False) as client:
@@ -304,18 +312,28 @@ class LumenDesktopAPI:
                                 final = {"kind": "cancelled", "response": payload.get("detail", "Generación cancelada."), "session_id": self.session_id, "request_id": self.request_id}
                             elif event_name == "error":
                                 raise LumenAPIError(payload.get("detail", "El Core informó un error."))
-        except httpx.RequestError as exc:
+            if not final:
+                raise LumenAPIError("El Core cerró la transmisión sin confirmar el resultado.")
+            if tts_buffer:
+                tts_buffer.finish()
+        except BaseException as exc:
             if tts_buffer:
                 tts_buffer.stop()
-            raise LumenAPIError(f"No se pudo conectar con el Core: {exc}") from exc
-        if tts_buffer:
-            tts_buffer.finish()
-        self._active_tts = None
+                if self._active_tts is tts_buffer:
+                    self._active_tts = None
+            if isinstance(exc, httpx.RequestError):
+                raise LumenAPIError(f"No se pudo conectar con el Core: {exc}") from exc
+            raise
+        finally:
+            self.request_id = ""
+        if self._plan_cancel_requested.is_set():
+            final = {"kind": "cancelled", "response": "Generación cancelada.", "session_id": self.session_id}
+            action_data = None
         if action_data:
             parsed = parse_action_response(action_data)
             if not parsed:
                 raise LumenAPIError("El Core devolvió una respuesta de acción inválida.")
-            if parsed.confirmation_required and ACTION_CONFIRM_POLICY == "CONFIRM_EXECUTION":
+            if parsed.confirmation_required:
                 return {**action_data, "response": response_for_display(parsed), "confirmation_required": True, "tts_streamed": bool(speak)}
             result = self.confirm_action(action_data, engine=engine)
             result["tts_streamed"] = bool(speak)
@@ -398,6 +416,7 @@ class LumenDesktopAPI:
         parsed = parse_action_response(action_data)
         if not parsed:
             raise LumenAPIError("Respuesta de acción inválida o incompleta.")
+        grants = []
         permission_ids: list[int] = []
         if permission_decision:
             entries = action_data.get("permission_entries")
@@ -412,18 +431,23 @@ class LumenDesktopAPI:
                 scope = str(entry.get("resource_scope") or "")[:500]
                 if not capability or not scope or "unresolved" in scope:
                     raise LumenAPIError("Scope de permiso vacío o no resuelto; se requiere autorización puntual.")
-                grant = self.grant_permission(capability, scope, permission_decision, int(entry.get("risk_level", 0)), DEVICE)
-                if grant.get("permission_id") is not None:
-                    permission_ids.append(int(grant["permission_id"]))
+                grants.append((capability, scope, int(entry.get("risk_level", 0))))
+        self._request("POST", "/api/actions/claim", json={
+            "action_id": parsed.action_id, "session_id": parsed.session_id, "local_host": DEVICE,
+        }, timeout=10.0)
+        for capability, scope, risk in grants:
+            grant = self.grant_permission(capability, scope, permission_decision, risk, DEVICE)
+            if grant.get("permission_id") is not None:
+                permission_ids.append(int(grant["permission_id"]))
         host = ActionHost(PROJECT_DIR, policy=ACTION_CONFIRM_POLICY)
         if engine is not None:
             host.engine = engine
             host.coordinator.engine = engine
         verified = host.execute({**action_data, "device": DEVICE}, confirmed=True)
         local_result = verified.as_dict()
-        if local_result.get("blocked"):
-            return {**action_data, "response": local_result["message"], "local_result": local_result}
         completion_data = dict(local_result.get("data") or {})
+        if parsed.is_plan:
+            completion_data["plan_id"] = parsed.action_id
         completion_data["cancelled"] = bool(local_result.get("cancelled"))
         completion_data["execution_verified"] = bool(local_result.get("execution_verified"))
         completion_data["resource_scope_version"] = action_data.get("resource_scope_version")
@@ -602,19 +626,29 @@ def record_microphone(duration: int = 5, device: int | None = None) -> Path:
     return path
 
 
-def play_audio(path: Path, process_registry: list[object] | None = None) -> None:
+def play_audio(path: Path, process_registry: list[object] | None = None) -> bool:
+    """Return whether the player finished reading the file before returning."""
     system = platform.system()
     try:
         if system == "Windows":
+            if process_registry is not None and path.suffix.lower() == ".wav":
+                import winsound
+                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+                return True
             os.startfile(str(path))  # type: ignore[attr-defined]
-            return
+            return False
         commands = [["afplay", str(path)]] if system == "Darwin" else [["mpv", "--no-video", str(path)], ["ffplay", "-nodisp", "-autoexit", str(path)], ["xdg-open", str(path)]]
         for command in commands:
             try:
                 process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if process_registry is not None:
-                    process_registry.append(process)
-                return
+                if process_registry is None or command[0] == "xdg-open":
+                    return False
+                process_registry.append(process)
+                try:
+                    process.wait()
+                finally:
+                    process_registry.remove(process)
+                return True
             except FileNotFoundError:
                 continue
         raise LumenAPIError("No hay reproductor disponible. En Linux instala mpv o ffmpeg.")

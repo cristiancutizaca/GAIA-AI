@@ -51,3 +51,30 @@ La rama se apila sobre el PR #1. La integración en `main` requiere revisar esa 
 - [RegisterHotKey y MOD_NOREPEAT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey)
 - [Modelos cargados en Ollama](https://docs.ollama.com/api/ps)
 - [Diagnóstico oficial de OpenCode](https://docs.opencode.ai/docs/troubleshooting/)
+
+## Segunda auditoría de código · Base `main@5edac5b4`
+
+Se retomaron los informes de memoria, voz, pantalla, Qwen y acciones. Los siguientes hallazgos describen el código después de los PR #1 y #2. La causa de una falla reproducida con un escenario de prueba puede ser distinta de la causa en la instalación del usuario.
+
+| ID | Hallazgo reproducido o verificado en el código | Cambio y evidencia |
+|---|---|---|
+| R01 | Si sounddevice estaba instalado sin PortAudio, importar el residente fallaba con `OSError`. Un WAV encolado podía sobrevivir a apagar y volver a encender el micrófono | Desktop sigue disponible sin el backend de audio. El aviso de audio lleva el identificador de la captura y se descartan WAV de un turno anterior. Regresión de importación y prueba Qt con dobles |
+| R02 | Voz aceptaba metadatos que el contrato de chat rechazaba y omitía el host y los permisos en su respuesta de acción | Se valida el formulario antes de decodificar, se devuelve HTTP 422 para datos inválidos y se conserva el contrato completo. El temporal pertenece al hilo de decodificación hasta que termina. Pruebas HTTP y de contrato |
+| R03 | El Kill Switch podía dejar pasar una acción estructurada en un mensaje conversacional. Un host podía reclamar una propuesta dos veces. La decisión `DENY` podía dejarla aprobada | El Core verifica el estado al generar y reclamar propuestas. El residente reclama la acción antes de ejecutarla. SQLite permite una sola reclamación por propuesta. La denegación elimina la propuesta y el corte conserva la auditoría de acciones ya reclamadas. Prueba HTTP real con observación de RAM y pruebas de permisos |
+| R04 | Ollama podía cerrar un stream incompleto y GAIA tratarlo como finalizado. Un fragmento con texto y razonamiento perdía también el texto. Las herramientas en texto solo se detectaban al principio de la respuesta | Se valida el formato y la señal `done`, se conserva el contenido visible y se bloquea el marcado de herramientas fuera del contrato. Pruebas de protocolo con un transporte HTTP de prueba. El Core y el escritorio respetan los alias de URL de Ollama |
+| R05 | Cancelar antes del primer token dejaba a GAIA esperando al backend. Un fallo SSE podía dejar audio pendiente en el cliente alternativo y los fragmentos podían borrarse antes de que el reproductor leyera el WAV | Se cancela la tarea de generación activa y se libera el stream. El cliente exige un resultado final, limpia la síntesis fallida y usa síntesis local para leer recuerdos explícitos. Conserva cada WAV hasta que termina la lectura en un reproductor síncrono. Pruebas de cancelación, cierre y ciclo de vida del WAV |
+| R06 | El administrador podía recibir un error al guardar una respuesta de una sesión abierta por otro dispositivo | Las escrituras de chat conservan la identidad autenticada. La reclamación inicial de una sesión y el guardado son transaccionales. Pruebas con SQLite, un dispositivo emparejado de prueba y el administrador |
+| R07 | La enumeración Win32 declaraba dos argumentos para una función de cuatro. El índice de monitor podía reasignarse después de la autorización. `ShowWindow` se interpretaba como una confirmación del estado nuevo | Se corrige el callback y se revalida la identidad del monitor inmediatamente antes de la captura. Se comprueba el estado posterior de minimizar, maximizar y restaurar. Pruebas con dobles Win32. La comprobación física queda pendiente |
+| R08 | El host remoto heredaba una variable de proxy incompatible y fallaba al arrancar. Un encabezado Bearer no ASCII podía provocar un error interno | El cliente de host usa transporte directo. La comparación de credenciales se hace en bytes y el encabezado inválido se rechaza con 401. Pruebas del host y de SSE autenticado |
+
+La verificación final aprobó 128 pruebas de pytest y 17 regresiones históricas ejecutadas por separado.
+
+El Core real de esta auditoría arrancó con un backend conversacional de prueba. Se usaron HTTP loopback, SQLite y ActionHost reales para comprobar la lectura de RAM, el bloqueo de una segunda ejecución, la escritura y recuperación de memoria por SSE y el rechazo de un formulario de voz inválido. Las pruebas de protocolo de Ollama emplearon respuestas controladas. La prueba con motores de voz reales descrita en la primera auditoría corresponde a la base anterior.
+
+Quedan pendientes la sesión física con MCHOSE V9 PRO, el atajo global, la selección de monitores con DPI distintos, la latencia audible, la RX 9060 XT y el instalador. La causa del error privado de OpenCode requiere el Doctor desde la carpeta donde falla. El wake word depende de un modelo `gaia.onnx` auténtico. La cancelación del stream cubre generación de chat. La transcripción y síntesis iniciadas tienen un ciclo de vida independiente.
+
+Referencias de los contratos revisados.
+
+- [Callback de enumeración de monitores](https://learn.microsoft.com/es-es/windows/win32/api/winuser/nc-winuser-monitorenumproc)
+- [Valor de retorno de ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
+- [Respuesta de chat de Ollama](https://docs.ollama.com/api/chat)

@@ -23,9 +23,12 @@ VISION_DEFAULT_MODEL = "qwen2.5vl:7b"
 
 
 def local_ollama_url() -> str:
-    url = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+    candidates = (os.getenv(name, "").strip() for name in ("OLLAMA_URL", "GAIA_OLLAMA_URL", "LUMEN_OLLAMA_URL"))
+    url = next((value for value in candidates if value), "http://127.0.0.1:11434").rstrip("/")
     parts = urlsplit(url)
-    if parts.scheme != "http" or parts.hostname not in {"localhost", "127.0.0.1", "::1"} or parts.username or parts.password or parts.path not in {"", "/"}:
+    if (parts.scheme != "http" or parts.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or parts.username is not None or parts.password is not None
+            or parts.path not in {"", "/"} or parts.query or parts.fragment):
         raise RuntimeError("La visión solo admite Ollama local (127.0.0.1). No se enviará tu pantalla a servidores externos.")
     return url
 
@@ -72,7 +75,13 @@ def available_displays() -> list[dict]:
     return [d for d in display_list() if d.get("available", True) and int(d.get("width", 0)) > 0 and int(d.get("height", 0)) > 0]
 
 
-def capture_monitor_png(display_id: str) -> bytes:
+def _verify_display(display: dict, expected: dict | None) -> None:
+    fields = ("device_name", "name", "x", "y", "width", "height")
+    if expected and any(display.get(field) != expected.get(field) for field in fields):
+        raise RuntimeError("La configuración de monitores cambió. Selecciona el monitor otra vez.")
+
+
+def capture_monitor_png(display_id: str, *, expected_display: dict | None = None) -> bytes:
     """Only after a person explicitly requests screen inspection."""
     import platform
     if platform.system() != "Windows":
@@ -80,6 +89,7 @@ def capture_monitor_png(display_id: str) -> bytes:
     from PIL import ImageGrab
     from platform_capabilities import display_info
     screen = display_info(display_id)
+    _verify_display(screen, expected_display)
     if not int(screen.get("width", 0)) or not int(screen.get("height", 0)):
         raise RuntimeError("Monitor no disponible.")
     x, y = int(screen["x"]), int(screen["y"])
@@ -99,18 +109,18 @@ def describe_monitor(display_id: str, question: str = "Describe lo que ves en mi
     display = next((d for d in available_displays() if d["display_id"] == display_id), None)
     if display is None:
         raise ValueError("El monitor seleccionado ya no está disponible.")
-    identity = ("name", "x", "y", "width", "height")
-    if expected_display and any(display.get(field) != expected_display.get(field) for field in identity):
-        raise RuntimeError("La configuración de monitores cambió. Selecciona el monitor otra vez.")
+    _verify_display(display, expected_display)
     if on_stage:
         on_stage("Capturando el monitor autorizado…")
     try:
-        png = (capture or capture_monitor_png)(display_id)
+        png = capture(display_id) if capture else capture_monitor_png(display_id, expected_display=display)
         if not png or len(png) > 12 * 1024 * 1024:
             raise ValueError("Captura vacía o fuera del tamaño permitido.")
         from PIL import Image
         with Image.open(BytesIO(png), formats=["PNG"]) as image:
             image.verify()
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"No se obtuvo una captura válida del monitor ({type(exc).__name__}).") from exc
     model = ready["model"]
@@ -133,7 +143,10 @@ def describe_monitor(display_id: str, question: str = "Describe lo que ves en mi
         with make_client() as client:
             response = client.post(local_ollama_url() + "/api/generate", json=payload)
             response.raise_for_status()
-            answer = str(response.json().get("response", "")).strip()
+            answer = response.json().get("response", "")
+            if not isinstance(answer, str):
+                raise ValueError("Respuesta visual inválida.")
+            answer = answer.strip()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(f"Captura válida. Ollama rechazó el análisis (HTTP {exc.response.status_code}).") from exc
     except (httpx.RequestError, ValueError, AttributeError) as exc:

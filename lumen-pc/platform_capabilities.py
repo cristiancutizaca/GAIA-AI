@@ -63,7 +63,11 @@ def window_action(window_id: str, operation: str) -> dict:
     user32, hwnd = _window(window_id)
     constants = {"minimize": 6, "maximize": 3, "restore": 9}
     if operation in constants:
-        ok = bool(user32.ShowWindow(hwnd, constants[operation]))
+        user32.ShowWindow(hwnd, constants[operation])
+        minimized = bool(user32.IsIconic(hwnd))
+        maximized = bool(user32.IsZoomed(hwnd))
+        ok = {"minimize": minimized, "maximize": maximized,
+              "restore": bool(user32.IsWindowVisible(hwnd)) and not (minimized or maximized)}[operation]
     elif operation == "focus":
         ok = bool(user32.SetForegroundWindow(hwnd))
     elif operation == "close":
@@ -323,6 +327,7 @@ def _normalize_display_rows(raw_rows: list[dict]) -> list[dict]:
         work_bottom = int(work.get("bottom", bottom))
         rows.append({
             "display_id": str(raw.get("display_id") or f"display-{index}"),
+            "device_name": str(raw.get("device_name") or ""),
             "name": str(raw.get("name") or f"Monitor {index}"),
             "primary": bool(raw.get("primary", index == 1)),
             "x": left,
@@ -338,16 +343,18 @@ def display_list() -> list[dict]:
     if platform.system() == "Windows":
         user32 = _windows_user32()
         raw_rows: list[dict] = []
-        enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                                       ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
 
-        def callback(hmonitor, _lparam):
+        def callback(hmonitor, _hdc, _rect, _lparam):
             monitor_info = _MonitorInfoEx()
             monitor_info.cbSize = ctypes.sizeof(_MonitorInfoEx)
-            if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(monitor_info)):
+            if not user32.GetMonitorInfoW(ctypes.c_void_p(hmonitor), ctypes.byref(monitor_info)):
                 return True
             rect = monitor_info.rcMonitor
             work = monitor_info.rcWork
-            friendly_name = str(monitor_info.szDevice or "").strip()
+            device_name = str(monitor_info.szDevice or "").strip()
+            friendly_name = device_name
             try:
                 display_device = _DisplayDevice()
                 display_device.cb = ctypes.sizeof(_DisplayDevice)
@@ -357,6 +364,7 @@ def display_list() -> list[dict]:
                 pass
             raw_rows.append({
                 "display_id": f"display-{len(raw_rows) + 1}",
+                "device_name": device_name,
                 "name": friendly_name[:160] or f"Monitor {len(raw_rows) + 1}",
                 "primary": bool(monitor_info.dwFlags & 1),
                 "rect": {"left": rect.left, "top": rect.top, "right": rect.right, "bottom": rect.bottom},

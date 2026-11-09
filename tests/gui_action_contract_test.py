@@ -87,6 +87,9 @@ try:
     assert len(api.confirmed) == 1 and seen[-1][0].startswith("Confirmar acción")
     gui._receive_chat(plan)
     assert len(api.confirmed) == 2 and "1. Abrir VS Code" in seen[-1][1] and "3. Mostrar proyecto" in seen[-1][1]
+    gui._receive_chat({**plan, "kind": "chat", "response": "Plan completado.",
+                       "local_result": {"success": True}})
+    assert len(api.confirmed) == 2 and len(seen) == 2
 finally:
     gui_module.messagebox.askyesno = original
 

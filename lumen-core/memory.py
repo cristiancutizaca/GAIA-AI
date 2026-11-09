@@ -539,8 +539,11 @@ def _migrate_session_owners(conn: sqlite3.Connection) -> None:
 
 def claim_session(session_id: str, *, device_id: str = "", principal_id: str = "", is_master: bool = False) -> bool:
     init_db()
+    if is_master:
+        return True
     with get_db() as conn:
-        return bool(is_master or _ensure_session_owner(conn, session_id, device_id, principal_id))
+        conn.execute("BEGIN IMMEDIATE")
+        return _ensure_session_owner(conn, session_id, device_id, principal_id)
 
 
 def get_session_owner(session_id: str) -> dict[str, Any]:
@@ -564,10 +567,9 @@ def session_access_allowed(session_id: str, *, device_id: str = "", principal_id
 def save_message(session_id: str, role: str, content: str, device: str = "unknown", principal_id: str = "", is_master: bool = False) -> None:
     init_db()
     with get_db() as conn:
-        if not is_master and not _ensure_session_owner(conn, session_id, device, principal_id):
+        conn.execute("BEGIN IMMEDIATE")
+        if not _ensure_session_owner(conn, session_id, device, principal_id) and not is_master:
             raise PermissionError("La sesión pertenece a otro dispositivo o está en cuarentena.")
-        if is_master:
-            _ensure_session_owner(conn, session_id, device, principal_id)
         conn.execute("INSERT INTO conversations (session_id, role, content, device) VALUES (?, ?, ?, ?)", (session_id, role, content[:20000], device[:80]))
 
 
@@ -752,6 +754,16 @@ def get_state(key: str, default: str = "") -> str:
     with get_db() as conn:
         row = conn.execute("SELECT value FROM lumen_state WHERE key = ?", (key,)).fetchone()
     return row["value"] if row else default
+
+
+def replace_state_if_current(key: str, current: str, value: str | None) -> bool:
+    with get_db() as conn:
+        if value is None:
+            result = conn.execute("DELETE FROM lumen_state WHERE key=? AND value=?", (key, current))
+        else:
+            result = conn.execute("UPDATE lumen_state SET value=?, updated_at=CURRENT_TIMESTAMP WHERE key=? AND value=?",
+                                  (value, key, current))
+        return result.rowcount == 1
 
 
 def delete_state(key: str) -> None:

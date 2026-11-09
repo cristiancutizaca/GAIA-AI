@@ -127,7 +127,7 @@ async def chat_completion(system_prompt: str, messages: list[dict], temperature:
     finally:
         if not acquired and _METRICS["queued"] > 0:
             _METRICS["queued"] -= 1
-        if _METRICS["generating"] > 0:
+        if acquired:
             _METRICS["generating"] -= 1
         total_ms = (time.perf_counter() - started) * 1000
         _METRICS["llm_total_ms"] += total_ms
@@ -182,7 +182,6 @@ async def chat_completion_stream(system_prompt: str, messages: list[dict], profi
             except LLMError as first_error:
                 fallback = fallback_selection(selection, str(first_error))
                 if not fallback or emitted:
-                    _METRICS["failed"] += 1
                     raise
                 async for chunk in _stream_once(system_prompt, messages, options, fallback):
                     emitted = True
@@ -199,7 +198,7 @@ async def chat_completion_stream(system_prompt: str, messages: list[dict], profi
     finally:
         if not acquired and _METRICS["queued"] > 0:
             _METRICS["queued"] -= 1
-        if _METRICS["generating"] > 0:
+        if acquired:
             _METRICS["generating"] -= 1
         total_ms = (time.perf_counter() - started) * 1000
         _METRICS["llm_total_ms"] += total_ms
@@ -279,6 +278,8 @@ async def _post_json(url: str, *, trust_env: bool = True, **kwargs) -> dict:
             if exc.response.status_code == 404:
                 raise LLMError(f"El modelo configurado no está disponible en el backend: {detail or 'modelo no encontrado'}.") from exc
             raise LLMError(f"El backend LLM devolvió HTTP {exc.response.status_code}: {detail or 'error remoto'}.") from exc
+        except httpx.RequestError as exc:
+            raise LLMError("Se interrumpió la comunicación con el backend LLM.") from exc
         except (ValueError, KeyError, TypeError) as exc:
             raise LLMError("El backend LLM devolvió una respuesta inválida.") from exc
     raise LLMError(f"Falló el backend LLM: {last_error}")
@@ -292,13 +293,25 @@ def _ollama_options(options: dict) -> dict:
     return {"temperature": options["temperature"], "num_predict": options["num_predict"], "num_ctx": options.get("num_ctx", LLM_CONTEXT)}
 
 
+def _ollama_content(data: object, *, stream: bool = False) -> str:
+    if not isinstance(data, dict):
+        raise LLMError("Ollama devolvió una respuesta inválida.")
+    if data.get("error"):
+        raise LLMError("Ollama informó un error durante la generación.")
+    message = data.get("message")
+    if message is None and stream and data.get("done") is True:
+        return ""
+    if not isinstance(message, dict) or not isinstance(message.get("content", ""), str):
+        raise LLMError("Ollama devolvió una respuesta inválida.")
+    if message.get("tool_calls"):
+        raise LLMError("Ollama propuso una herramienta fuera del canal de acciones de GAIA.")
+    return message.get("content", "")
+
+
 async def _ollama_chat(system_prompt: str, messages: list[dict], options: dict, model: str) -> str:
     payload = {"model": model, "messages": _payload_messages(system_prompt, messages), "stream": False, "keep_alive": LLM_KEEP_ALIVE, "options": _ollama_options(options)}
     data = await _post_json(f"{OLLAMA_URL}/api/chat", trust_env=_ollama_trust_env(), json=payload)
-    message = data.get("message") or {}
-    if message.get("tool_calls"):
-        raise LLMError("Ollama propuso una herramienta fuera del canal de acciones de GAIA.")
-    text = _visible_text(message.get("content", ""))
+    text = _visible_text(_ollama_content(data))
     if not text:
         logger.warning("event=llm_empty_visible_output backend=ollama model=%s reasoning_filtered=true", model)
         return ""
@@ -332,39 +345,35 @@ async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options:
     try:
         client = await _http_client(trust_env=_ollama_trust_env())
         async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as response:
-                if response.status_code == 404:
-                    raise LLMError(f"Ollama no encuentra el modelo {model!r}. Instálalo o configura GAIA_MODEL_FALLBACK.")
-                response.raise_for_status()
-                filterer = _ReasoningFilter()
-                first_token = True
-                started = time.perf_counter()
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.debug("Ignorando línea no JSON de Ollama")
-                        continue
-                    if data.get("error"):
-                        raise LLMError("Ollama interrumpió la generación con un error.")
-                    message = data.get("message") or {}
-                    if message.get("tool_calls"):
-                        raise LLMError("Ollama propuso una herramienta fuera del canal de acciones de GAIA.")
-                    chunk = message.get("content", "")
-                    if message.get("thinking") or not chunk:
-                        continue
-                    visible = filterer.feed(chunk)
-                    if visible:
-                        if first_token:
-                            first_token_ms = (time.perf_counter() - started) * 1000
-                            _METRICS["llm_ttft_ms"] += first_token_ms
-                            logger.info("LLM first_token_ms=%.0f backend=ollama model=%s", first_token_ms, model)
-                            first_token = False
-                        yield visible
-                tail = filterer.finish()
-                if tail:
-                    yield tail
+            if response.status_code == 404:
+                raise LLMError(f"Ollama no encuentra el modelo {model!r}. Instálalo o configura GAIA_MODEL_FALLBACK.")
+            response.raise_for_status()
+            filterer = _ReasoningFilter()
+            first_token = True
+            started = time.perf_counter()
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError as exc:
+                    raise LLMError("Ollama devolvió una respuesta de streaming inválida.") from exc
+                chunk = _ollama_content(data, stream=True)
+                visible = filterer.feed(chunk) if chunk else ""
+                if visible:
+                    if first_token:
+                        first_token_ms = (time.perf_counter() - started) * 1000
+                        _METRICS["llm_ttft_ms"] += first_token_ms
+                        logger.info("LLM first_token_ms=%.0f backend=ollama model=%s", first_token_ms, model)
+                        first_token = False
+                    yield visible
+                if data.get("done") is True:
+                    break
+            else:
+                raise LLMError("Ollama cerró la respuesta sin finalizar la generación.")
+            tail = filterer.finish()
+            if tail:
+                yield tail
     except asyncio.CancelledError:
         logger.info("Ollama stream cancellation requested model=%s", model)
         raise
@@ -374,6 +383,8 @@ async def _ollama_chat_stream(system_prompt: str, messages: list[dict], options:
         raise LLMError(f"Ollama tardó más de {LLM_TIMEOUT_SECONDS:g} s. El Core sigue funcionando; puedes reintentar.") from exc
     except httpx.HTTPStatusError as exc:
         raise LLMError(f"Ollama devolvió HTTP {exc.response.status_code}.") from exc
+    except httpx.RequestError as exc:
+        raise LLMError("Se interrumpió la comunicación con Ollama.") from exc
 
 
 async def _openai_chat_stream(system_prompt: str, messages: list[dict], options: dict, model: str) -> AsyncIterator[str]:
