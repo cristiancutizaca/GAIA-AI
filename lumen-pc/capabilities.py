@@ -268,6 +268,7 @@ ACTION_TO_CAPABILITY: dict[str, tuple[str, dict[str, object]]] = {
     "windows_close": ("windows.close", {"window_id": ""}),
     "windows_move_to_display": ("windows.move_to_display", {"window_id": "", "display_id": ""}),
     "desktop_context": ("desktop.context", {"force_refresh": False}),
+    "desktop_show": ("desktop.show", {}),
     "uia_inspect_window": ("uia.inspect_window", {"window_id": "", "max_controls": 100, "expected_target": {}}),
     "uia_list_controls": ("uia.list_controls", {"window_id": "", "max_controls": 100, "expected_target": {}}),
     "uia_get_focused_control": ("uia.get_focused_control", {"window_id": "", "max_controls": 200, "expected_target": {}}),
@@ -281,6 +282,7 @@ ACTION_TO_CAPABILITY: dict[str, tuple[str, dict[str, object]]] = {
     "vscode_open_terminal_trusted": ("vscode.open_terminal_trusted", {"project": "default"}),
     "media_status": ("media.status", {}),
     "media_play_pause": ("media.play_pause", {}),
+    "media_pause": ("media.pause", {}),
     "media_next": ("media.next", {}),
     "media_previous": ("media.previous", {}),
     "media_stop": ("media.stop", {}),
@@ -289,6 +291,7 @@ ACTION_TO_CAPABILITY: dict[str, tuple[str, dict[str, object]]] = {
     "list_audio_devices": ("audio.list_devices", {}),
     "get_volume": ("audio.get_volume", {}),
     "set_volume": ("audio.set_volume", {"level": ""}),
+    "volume_down": ("audio.volume_down", {}),
     "mute": ("audio.mute", {}),
     "unmute": ("audio.unmute", {}),
     "clipboard_read": ("clipboard.read", {}),
@@ -307,14 +310,14 @@ ACTION_TO_CAPABILITY: dict[str, tuple[str, dict[str, object]]] = {
 }
 
 
-def _definition(name: str, category: str, description: str, risk: int, executor: str, params: tuple[str, ...] = (), *, implemented: bool = False, confirmation: str = "AUTO", reversible: bool = True, timeout: float = 30.0) -> CapabilityDefinition:
+def _definition(name: str, category: str, description: str, risk: int, executor: str, params: tuple[str, ...] = (), *, implemented: bool = False, confirmation: str = "AUTO", reversible: bool = True, timeout: float = 30.0, supported_os: tuple[str, ...] = ("windows", "linux", "darwin")) -> CapabilityDefinition:
     return CapabilityDefinition(
         name=name,
         category=category,
         description=description,
         risk_level=risk,
         required_permissions=("actions_execute",),
-        supported_os=("windows", "linux", "darwin"),
+        supported_os=supported_os,
         executor=executor,
         parameter_schema=params,
         confirmation_policy=confirmation,
@@ -363,6 +366,7 @@ def default_capability_registry() -> CapabilityRegistry:
         "windows.restore": _definition("windows.restore", "windows", "Restaura una ventana identificada.", 1, "ActionEngine._windows_restore", ("window_id!",), implemented=True),
         "windows.close": _definition("windows.close", "windows", "Cierra una ventana identificada con policy.", 2, "ActionEngine._windows_close", ("window_id!",), implemented=True, confirmation="ASK_ONCE"),
         "windows.move_to_display": _definition("windows.move_to_display", "windows", "Mueve una ventana a un monitor enumerado mediante SetWindowPos.", 1, "ActionEngine._windows_move_to_display", ("window_id!", "display_id!"), implemented=True),
+        "desktop.show": _definition("desktop.show", "desktop", "Muestra el escritorio de Windows.", 1, "ActionEngine._desktop_show", implemented=True, supported_os=("windows",)),
         "desktop.context": _definition("desktop.context", "desktop", "Consulta el contexto activo estructurado sin screenshots.", 0, "ActionEngine._desktop_context", ("force_refresh",), implemented=True),
         "uia.inspect_window": _definition("uia.inspect_window", "uia", "Inspecciona controles UIA de una ventana seleccionada en read-only.", 0, "ActionEngine._uia_inspect_window", ("window_id!", "max_controls", "expected_target"), implemented=True),
         "uia.list_controls": _definition("uia.list_controls", "uia", "Lista controles UIA normalizados sin exponer valores sensibles.", 0, "ActionEngine._uia_list_controls", ("window_id!", "max_controls", "expected_target"), implemented=True),
@@ -376,6 +380,7 @@ def default_capability_registry() -> CapabilityRegistry:
         "vscode.open_file_trusted": _definition("vscode.open_file_trusted", "vscode", "Abre un archivo dentro de un scope trusted en VS Code.", 1, "ActionEngine._vscode_open_file_trusted", ("path!",), implemented=True, confirmation="ASK_ONCE"),
         "vscode.open_terminal_trusted": _definition("vscode.open_terminal_trusted", "vscode", "Abre terminal solo en un proyecto trusted registrado.", 1, "ActionEngine._vscode_open_terminal_trusted", ("project",), implemented=True, confirmation="ASK_ONCE"),
         "media.status": _definition("media.status", "media", "Consulta la sesión multimedia activa mediante SMTC del sistema operativo.", 0, "ActionEngine._media_status", implemented=True),
+        "media.pause": _definition("media.pause", "media", "Pausa la sesión multimedia activa mediante SMTC.", 1, "ActionEngine._media_pause", implemented=True, supported_os=("windows",)),
         "media.play_pause": _definition("media.play_pause", "media", "Alterna reproducción/pausa mediante SMTC, sin credenciales de proveedor.", 1, "ActionEngine._media_play_pause", implemented=True),
         "media.next": _definition("media.next", "media", "Avanza la sesión multimedia mediante SMTC.", 1, "ActionEngine._media_next", implemented=True),
         "media.previous": _definition("media.previous", "media", "Retrocede la sesión multimedia mediante SMTC.", 1, "ActionEngine._media_previous", implemented=True),
@@ -384,6 +389,7 @@ def default_capability_registry() -> CapabilityRegistry:
         "screen.capture_window": _definition("screen.capture_window", "screen", "Captura una ventana únicamente bajo demanda y con cleanup.", 1, "ActionEngine._screen_capture_window", ("window_id!", "expected_target"), implemented=True, confirmation="ASK_ONCE"),
         "audio.list_devices": _definition("audio.list_devices", "audio", "Enumera endpoints de audio sin cambiar configuración.", 0, "ActionEngine._list_audio_devices", implemented=True),
         "audio.get_volume": _definition("audio.get_volume", "audio", "Consulta el volumen del sistema.", 0, "ActionEngine._get_volume", implemented=True),
+        "audio.volume_down": _definition("audio.volume_down", "audio", "Baja diez puntos el volumen de la salida predeterminada.", 1, "ActionEngine._volume_down", implemented=True),
         "audio.set_volume": _definition("audio.set_volume", "audio", "Cambia el volumen del sistema.", 1, "ActionEngine._set_volume", ("level!",), implemented=True),
         "audio.mute": _definition("audio.mute", "audio", "Silencia el sistema.", 1, "ActionEngine._mute", implemented=True),
         "audio.unmute": _definition("audio.unmute", "audio", "Restaura el silencio del sistema.", 1, "ActionEngine._unmute", implemented=True),

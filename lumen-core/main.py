@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import memory
-from config import HOST, PORT, CORS_ORIGINS, BACKUP_ENABLED, BRAIN_BACKUP_ENABLED, SAFE_MODE, VERSION, ASSISTANT_NAME, validate_configuration
+from config import HOST, PORT, CORS_ORIGINS, DB_PATH, BACKUP_ENABLED, BRAIN_BACKUP_ENABLED, SAFE_MODE, VERSION, ASSISTANT_NAME, validate_configuration
 from logging_setup import configure_logging
 from routes.api import router
 
@@ -22,7 +22,7 @@ async def lifespan(app: FastAPI):
     warnings = validate_configuration()
     memory.init_db()
     from platform_runtime import PlatformRuntime
-    platform_runtime = PlatformRuntime(Path(__file__).resolve().parents[1])
+    platform_runtime = PlatformRuntime(Path(__file__).resolve().parents[1], memory_db=DB_PATH)
     app.state.platform_runtime = platform_runtime
     await platform_runtime.start()
     logger.info("%s Core %s iniciando", ASSISTANT_NAME, VERSION)

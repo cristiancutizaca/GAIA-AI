@@ -69,8 +69,8 @@ def run(*, models_probe=None, platform_name=None, audio_probe=None, display_prob
     if piper:
         try:
             sys.path.insert(0, str(ROOT / "lumen-core"))
-            from voice import piper_voice_ready, _piper_model_name
-            model = _piper_model_name()
+            from voice import piper_voice_ready, _piper_model
+            model = _piper_model()
             model_ready = piper_voice_ready(model)
         except Exception:
             model_ready = False

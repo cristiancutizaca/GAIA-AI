@@ -30,6 +30,11 @@ class MockMediaSession:
         self.state = "playing" if self.state != "playing" else "paused"
         return self.status()
 
+    def pause(self) -> dict[str, Any]:
+        if self.state == "playing":
+            self.state = "paused"
+        return {**self.status(), "accepted": True}
+
     def next(self) -> dict[str, Any]:
         return {**self.status(), "command": "next"}
 
@@ -127,6 +132,7 @@ def media_status() -> dict[str, Any]:
 async def _command_async(session: Any, command: str) -> bool:
     method = {
         "play_pause": "try_toggle_play_pause_async",
+        "pause": "try_pause_async",
         "next": "try_skip_next_async",
         "previous": "try_skip_previous_async",
         "stop": "try_stop_async",
@@ -139,6 +145,19 @@ async def _command_async(session: Any, command: str) -> bool:
     return bool(await operation())
 
 
+async def _command_result(session: Any, command: str) -> dict[str, Any]:
+    before = _state_name(session.get_playback_info()) if command == "pause" else ""
+    already_paused = before in {"paused", "stopped"}
+    accepted = already_paused or await _command_async(session, command)
+    if accepted and command == "pause" and not already_paused:
+        for _ in range(12):
+            if _state_name(session.get_playback_info()) in {"paused", "stopped"}:
+                break
+            await asyncio.sleep(0.025)
+    status = await _status_async(session)
+    return {**status, "command": command, "accepted": accepted}
+
+
 def _command(command: str) -> dict[str, Any]:
     if _MOCK_SESSION is not None:
         return getattr(_MOCK_SESSION, command)()
@@ -148,11 +167,7 @@ def _command(command: str) -> dict[str, Any]:
         session = _current_session()
         if session is None:
             return _unavailable("no_active_session")
-        accepted = _run(_command_async(session, command))
-        status = media_status()
-        status["command"] = command
-        status["accepted"] = bool(accepted)
-        return status
+        return _run(_command_result(session, command))
     except MediaSessionError as exc:
         result = _unavailable(str(exc))
         result["command"] = command
@@ -167,6 +182,10 @@ def _command(command: str) -> dict[str, Any]:
 
 def media_play_pause() -> dict[str, Any]:
     return _command("play_pause")
+
+
+def media_pause() -> dict[str, Any]:
+    return _command("pause")
 
 
 def media_next() -> dict[str, Any]:

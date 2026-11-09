@@ -41,6 +41,9 @@ _MUTATING_CAPABILITIES = {
     "uia.invoke_control",
     "uia.set_value",
     "media.play_pause",
+    "media.pause",
+    "audio.volume_down",
+    "desktop.show",
     "media.next",
     "media.previous",
     "media.stop",
@@ -200,6 +203,12 @@ def resolve_resource_scope(capability: str, parameters: Mapping[str, object] | N
         display = _safe_token(params.get("display_id")) if capability == "windows.move_to_display" else ""
         scope = f"window:{identity}{'|display=' + display if display else ''}"
         return _scope_result(scope, f"ventana {identity}{' al monitor ' + display if display else ''}", persistent=False, kind="window")
+
+    if capability == "desktop.show":
+        return _scope_result("desktop:show", "escritorio local", persistent=False, kind="desktop")
+
+    if capability == "audio.volume_down":
+        return _scope_result("audio:default_output", "salida de audio predeterminada", persistent=False, kind="audio")
 
     if capability == "desktop.context":
         return _scope_result("desktop:active_context", "contexto activo efímero del escritorio", persistent=False, kind="observation")

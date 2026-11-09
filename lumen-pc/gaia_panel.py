@@ -39,6 +39,7 @@ class GaiaControlPanel(QWidget):
     comfy_diagnostic_requested = Signal()
     readiness_requested = Signal()
     tasks_requested = Signal()
+    memory_requested = Signal()
     def __init__(self):
         super().__init__()
         self.setObjectName("gaiaPanel"); self.setWindowTitle("GAIA · Centro de Control")
@@ -67,6 +68,9 @@ class GaiaControlPanel(QWidget):
         self.comfy_button=QPushButton("◈  Diagnosticar ComfyUI");self.comfy_button.clicked.connect(self.comfy_diagnostic_requested);left.addWidget(self.comfy_button)
         self.readiness_button=QPushButton("⚙  Comprobar voz e IA");self.readiness_button.clicked.connect(self.readiness_requested);left.addWidget(self.readiness_button)
         self.tasks_button=QPushButton("≡  Historial de tareas");self.tasks_button.clicked.connect(self.tasks_requested);left.addWidget(self.tasks_button)
+        self.memory_button = QPushButton("Recuerdos")
+        self.memory_button.clicked.connect(self.memory_requested)
+        left.addWidget(self.memory_button)
         left.addStretch()
         caution=self._small("Privacidad: monitor solo con permiso.\nLas acciones de PC se confirman\nantes de ejecutarse.")
         caution.setWordWrap(True);left.addWidget(caution)

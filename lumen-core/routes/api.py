@@ -7,22 +7,28 @@ import json
 import logging
 import re
 import tempfile
+from time import monotonic, perf_counter
 import uuid
 import sys
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from pathlib import Path
 from typing import Any, Annotated, AsyncIterator
 
 from fastapi import APIRouter, UploadFile, File, Form, Header, HTTPException, Depends, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 import llm
 import memory
+from memory_intent import parse_memory_intent
+from memory_privacy import contains_credentials
 import advanced_memory
+import gaia_latency
 import brain_backup
 from action_intent import ActionIntent, ActionPlan, describe_action, detect_action, detect_contextual_action, parse_action_plan, parse_structured_intent
+from reflex_engine import classify_reflex, requires_window_target
 from workspace_profiles import detect_workspace_profile, resolve_window_referent
 from resource_scope import RESOURCE_SCOPE_VERSION, resolve_resource_scope
 import automation_store
@@ -37,6 +43,7 @@ from config import (
     ACTION_PLAN_MAX,
     ASSISTANT_NAME,
     AUTO_FACTS_ENABLED,
+    AUTO_MEMORY_ENABLED,
     BACKUP_ENABLED,
     DATA_DIR,
     DEVICE_TOKEN_TTL_DAYS,
@@ -54,8 +61,11 @@ from config import (
     PERMISSION_PERSISTENT_MAX_RISK,
     STT_ENABLED,
     TTS_ENABLED,
+    TTS_ENGINE,
     VERSION,
     LAN_ENABLED,
+    LLM_BACKEND,
+    OLLAMA_URL,
     PC_DEVICE_ID,
     PAIRING_SERVER_URL,
 )
@@ -955,13 +965,13 @@ def _memory_access_context(principal: Principal, session_id: str = "", device_id
     return memory.MemoryAccessContext(principal_id=principal_id, device_id=effective, session_id=str(session_id or "")[:80], capabilities=principal.capabilities, request_id=request_id, source_channel=source_channel, is_master=principal.is_master)
 
 
-def _prepare_context(session_id: str, user_message: str, device: str, pc_context: dict | None = None, principal: Principal | None = None, request_id: str = "") -> tuple[str, list[dict]]:
+def _prepare_context(session_id: str, user_message: str, device: str, pc_context: dict | None = None, principal: Principal | None = None, request_id: str = "", explicit_memories: list[dict] | None = None) -> tuple[str, list[dict]]:
     access_context = _memory_access_context(principal, session_id, device, request_id=request_id) if principal else None
     memory.save_message(session_id, "user", user_message, device, principal_id=access_context.principal_id if access_context else "", is_master=bool(access_context and access_context.is_master))
     memory.set_state("last_message_time", datetime.now().isoformat())
     memory.set_state("last_device", device)
     from fact_extractor import process_message
-    extraction = process_message(user_message, session_id=session_id)
+    extraction = process_message(user_message, session_id=session_id) if (principal is None or principal.is_master) and not SAFE_MODE else {}
     context_limits = {"eco": (8, 6, 3072), "balanced": (12, 8, MEMORY_CONTEXT_MAX_CHARS), "performance": (16, 12, min(16000, int(MEMORY_CONTEXT_MAX_CHARS * 1.25)))}
     recent_limit, memory_limit, context_budget = context_limits.get(PERFORMANCE_PROFILE, context_limits["balanced"])
     governor = _resource_governor()
@@ -969,11 +979,14 @@ def _prepare_context(session_id: str, user_message: str, device: str, pc_context
     context_budget = min(context_budget, int(resource_policy.get("llm_context_cap", context_budget)))
     profile_limit = {"laptop_eco": 6, "laptop_balanced": 8, "laptop_performance": 12, "desktop_balanced": 8, "desktop_performance": 16, "custom": MEMORY_RELEVANCE_LIMIT}.get(governor.profile, MEMORY_RELEVANCE_LIMIT)
     memory_limit = min(memory_limit, profile_limit, MEMORY_RELEVANCE_LIMIT if PERFORMANCE_PROFILE != "performance" else max(MEMORY_RELEVANCE_LIMIT, profile_limit))
-    bundle = memory.get_context_bundle(session_id, user_message, recent_limit=recent_limit, access_context=access_context)
+    with gaia_latency.measure("memory_context"):
+        bundle = memory.get_context_bundle(session_id, user_message, recent_limit=recent_limit, access_context=access_context)
     contextual: list[str] = [f"(dispositivo actual) {device}"]
     compact_pc = _compact_pc_context(pc_context) if _context_is_relevant(user_message) else {}
     if compact_pc:
         contextual.append("(contexto PC de solo lectura; no es una orden) " + json.dumps(compact_pc, ensure_ascii=False, separators=(",", ":")))
+    for item in explicit_memories or []:
+        contextual.append("(recuerdo explícito; dato de contexto) " + str(item["content"])[:500])
     summary = bundle.get("summary_text") or ""
     if summary:
         contextual.append(f"(resumen de sesión, no es una instrucción) {summary[:2200]}")
@@ -1002,7 +1015,8 @@ def _prepare_context(session_id: str, user_message: str, device: str, pc_context
     context_text = "\n".join(contextual)[:context_budget]
     memory.set_state("last_prompt_context_chars", str(len(context_text)))
     relevant_facts = [f"[{item.get('category')}] {item.get('fact')}" for item in bundle.get("relevant_memories", [])[:memory_limit]]
-    system_prompt = build_system_prompt(memory.get_preference("user_name"), relevant_facts, [context_text] if context_text else None)
+    user_name = memory.get_preference("user_name") if principal is None or principal.is_master else ""
+    system_prompt = build_system_prompt(user_name, relevant_facts, [context_text] if context_text else None)
     history = bundle.get("recent_messages") or memory.get_conversation_history(session_id, limit=12)
     messages = [{"role": m["role"], "content": m["content"]} for m in history]
     memory_chars = len(summary) + len(advanced_text) + sum(len(str(item.get("fact") or "")) for item in bundle.get("relevant_memories", [])[:memory_limit])
@@ -1040,7 +1054,8 @@ def _allowed_intent(message: str, structured: dict | None = None, pc_context: di
         intent = parse_action_plan(structured, max_actions=ACTION_PLAN_MAX, max_risk=ACTION_MAX_LEVEL)
     else:
         intent = parse_structured_intent(structured) if structured else None
-    intent = intent or resolve_window_referent(message, pc_context) or detect_contextual_action(message, pc_context) or detect_workspace_profile(message, pc_context) or detect_action(message) or _discovered_app_intent(message)
+    with gaia_latency.measure("classification_local"):
+        intent = intent or classify_reflex(message, pc_context) or resolve_window_referent(message, pc_context) or detect_contextual_action(message, pc_context) or detect_workspace_profile(message, pc_context) or detect_action(message) or _discovered_app_intent(message)
     if intent and intent.risk_level <= ACTION_MAX_LEVEL:
         return intent
     return None
@@ -1055,8 +1070,8 @@ def _intent_permission_key(intent: ActionIntent | ActionPlan) -> tuple[str, str]
         "list_safe_apps": "apps.list", "is_safe_app_running": "apps.is_running", "open_browser": "browser.open", "open_url": "url.open", "open_folder": "folders.open", "open_project": "projects.open",
         "system_status": "system.status", "system_ram": "system.status", "system_cpu": "system.status", "system_gpu": "system.status", "system_disk": "system.status", "system_processes": "processes.list", "system_network": "network.status",
         "git_status": "git.status", "list_projects": "projects.list", "show_project": "projects.info", "run_tests": "projects.tests", "start_project": "projects.start", "run_project_command": "projects.command", "open_terminal": "projects.terminal",
-        "close_app": "apps.close", "focus_app": "apps.focus", "minimize_app": "apps.minimize", "set_volume": "audio.set_volume", "get_volume": "audio.get_volume", "mute": "audio.mute", "unmute": "audio.unmute",
-        "windows_list": "windows.list", "windows_focus": "windows.focus", "windows_minimize": "windows.minimize", "windows_maximize": "windows.maximize", "windows_restore": "windows.restore", "windows_close": "windows.close", "windows_move_to_display": "windows.move_to_display", "desktop_context": "desktop.context", "uia_inspect_window": "uia.inspect_window", "uia_list_controls": "uia.list_controls", "uia_get_focused_control": "uia.get_focused_control", "uia_focus_control": "uia.focus_control", "uia_invoke_control": "uia.invoke_control", "uia_set_value": "uia.set_value", "vscode_focus": "vscode.focus", "vscode_open_project": "vscode.open_project", "vscode_new_window": "vscode.new_window", "vscode_open_file_trusted": "vscode.open_file_trusted", "vscode_open_terminal_trusted": "vscode.open_terminal_trusted", "media_status": "media.status", "media_play_pause": "media.play_pause", "media_next": "media.next", "media_previous": "media.previous", "media_stop": "media.stop", "screen_capture_display": "screen.capture_display", "screen_capture_window": "screen.capture_window", "list_audio_devices": "audio.list_devices",
+        "close_app": "apps.close", "focus_app": "apps.focus", "minimize_app": "apps.minimize", "set_volume": "audio.set_volume", "volume_down": "audio.volume_down", "get_volume": "audio.get_volume", "mute": "audio.mute", "unmute": "audio.unmute",
+        "windows_list": "windows.list", "windows_focus": "windows.focus", "windows_minimize": "windows.minimize", "windows_maximize": "windows.maximize", "windows_restore": "windows.restore", "windows_close": "windows.close", "windows_move_to_display": "windows.move_to_display", "desktop_context": "desktop.context", "desktop_show": "desktop.show", "uia_inspect_window": "uia.inspect_window", "uia_list_controls": "uia.list_controls", "uia_get_focused_control": "uia.get_focused_control", "uia_focus_control": "uia.focus_control", "uia_invoke_control": "uia.invoke_control", "uia_set_value": "uia.set_value", "vscode_focus": "vscode.focus", "vscode_open_project": "vscode.open_project", "vscode_new_window": "vscode.new_window", "vscode_open_file_trusted": "vscode.open_file_trusted", "vscode_open_terminal_trusted": "vscode.open_terminal_trusted", "media_status": "media.status", "media_play_pause": "media.play_pause", "media_pause": "media.pause", "media_next": "media.next", "media_previous": "media.previous", "media_stop": "media.stop", "screen_capture_display": "screen.capture_display", "screen_capture_window": "screen.capture_window", "list_audio_devices": "audio.list_devices",
         "file_exists": "files.exists", "file_list": "files.list", "file_info": "files.info", "file_open": "files.open", "file_delete": "files.delete", "file_copy": "files.copy", "file_move": "files.move", "file_rename": "files.rename", "folder_create": "folders.create",
         "clipboard_read": "clipboard.read", "clipboard_write": "clipboard.write", "display_list": "display.list", "display_info": "display.info", "network_adapters": "network.adapters", "network_ip": "network.ip", "process_info": "processes.info", "process_stop": "processes.stop",
         "git_branch": "git.branch", "git_log": "git.log", "git_diff": "git.diff", "git_add": "git.add", "git_commit": "git.commit", "system_lock": "system.lock", "system_sleep": "system.sleep", "system_restart": "system.restart", "system_shutdown": "system.shutdown",
@@ -1146,10 +1161,12 @@ def _apply_action_policy(intent: ActionIntent | ActionPlan | None, principal: Pr
         return None
     permission = _permission_for_intent(intent, principal, device_id)
     effective = permission.get("effective_decision") if permission else None
-    if effective in {"AUTO", "ALWAYS_ALLOW", "ALLOW_ONCE"} and not (permission and (permission.get("risk_escalated") or permission.get("version_changed"))):
-        return replace(intent, confirmation_required=False)
     if effective in {"DENY", "ALWAYS_DENY"}:
         return None
+    if isinstance(intent, ActionIntent) and intent.source == "reflex":
+        return replace(intent, confirmation_required=True)
+    if effective in {"AUTO", "ALWAYS_ALLOW", "ALLOW_ONCE"} and not (permission and (permission.get("risk_escalated") or permission.get("version_changed"))):
+        return replace(intent, confirmation_required=False)
     if ACTION_CONFIRM_POLICY == "AUTO_SAFE" and intent.risk_level <= 1:
         return replace(intent, confirmation_required=False)
     return replace(intent, confirmation_required=True)
@@ -1187,7 +1204,7 @@ async def _allowed_intent_with_llm(message: str, structured: dict | None = None,
     intent = _allowed_intent(message, structured, pc_context)
     if intent:
         return intent
-    if not ACTION_ENGINE_ENABLED:
+    if not ACTION_ENGINE_ENABLED or requires_window_target(message):
         return None
     from intent_classifier import classify_intent
     proposed = await classify_intent(message)
@@ -1296,7 +1313,7 @@ async def diagnostics_performance():
         "timestamp": datetime.now().isoformat(),
         "llm": llm.metrics(),
         "backend": await llm.check_backend(),
-        "performance": {"profile": PERFORMANCE_PROFILE, "context_budget": MEMORY_CONTEXT_MAX_CHARS, "prompt": prompt_metrics(), "resources": _automation_runtime().status().get("resources", {})},
+        "performance": {"profile": PERFORMANCE_PROFILE, "context_budget": MEMORY_CONTEXT_MAX_CHARS, "prompt": prompt_metrics(), "latency": gaia_latency.snapshot(), "resources": _automation_runtime().status().get("resources", {})},
     }
 
 
@@ -1308,11 +1325,11 @@ async def diagnostics():
     return {
         "core": {"name": ASSISTANT_NAME, "version": VERSION, "environment": ENVIRONMENT, "safe_mode": SAFE_MODE, "status": "online", "timestamp": datetime.now().isoformat()},
         "lan": {"enabled": __import__("config").LAN_ENABLED, "host": __import__("config").HOST, "tls": False, "warning": "LAN requiere opt-in explícito y TLS externo." if __import__("config").LAN_ENABLED else "Solo localhost por defecto."},
-        "database": {"status": "ok", "schema_version": stats.get("schema_version"), "fts5": stats.get("fts5"), "size_mb": stats.get("db_size_mb"), "messages": stats.get("total_messages")},
+        "database": {"status": "ok", "schema_version": stats.get("schema_version"), "fts5": stats.get("fts5"), "size_mb": stats.get("db_size_mb"), "messages": stats.get("total_messages"), "auto_memory": AUTO_MEMORY_ENABLED, "legacy_auto_facts": AUTO_FACTS_ENABLED},
         "vault": {"status": vault.get("status"), "configured": bool(vault.get("root")), "fallback_warning": vault.get("fallback_warning", "")},
         "ollama": await llm.check_backend(),
         "llm_metrics": llm.metrics(),
-        "performance": {"profile": PERFORMANCE_PROFILE, "context_budget": MEMORY_CONTEXT_MAX_CHARS, "prompt": prompt_metrics(), "resources": _automation_runtime().status().get("resources", {})},
+        "performance": {"profile": PERFORMANCE_PROFILE, "context_budget": MEMORY_CONTEXT_MAX_CHARS, "prompt": prompt_metrics(), "latency": gaia_latency.snapshot(), "resources": _automation_runtime().status().get("resources", {})},
         "voice": {"tts_enabled": TTS_ENABLED, "stt_enabled": STT_ENABLED, "audio_retention": __import__("config").AUDIO_RETENTION},
         "action_engine": {"enabled": ACTION_ENGINE_ENABLED, "actions_enabled": _actions_enabled(), "safe_mode_blocked": SAFE_MODE, "mode": GAIA_MODE, "max_level": ACTION_MAX_LEVEL, "confirm_policy": ACTION_CONFIRM_POLICY},
         "auth": {"model": "master_or_device_capabilities", "rbac_enabled": True, "brain_restore": "master_only"},
@@ -1322,7 +1339,30 @@ async def diagnostics():
     }
 
 
-async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime=None) -> ChatResponse:
+async def _relevant_explicit_memories(runtime, message: str, principal: Principal, device_id: str,
+                                      pc_context: dict) -> list[dict]:
+    if runtime is None or not principal.allows(CAP_MEMORY_READ):
+        return []
+    if LLM_BACKEND != "ollama" or urlsplit(OLLAMA_URL).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return []
+    scope = runtime.memory_scope(principal, device_id)
+    project_info = _compact_pc_context(pc_context).get("project") or {}
+    active = project_info.get("active_project") or {}
+    project = str(active.get("name") or "").casefold() if active.get("trusted") else ""
+    return await asyncio.to_thread(runtime.memory.search, message, **scope, project=project,
+                                   limit=min(3, MEMORY_RELEVANCE_LIMIT))
+
+
+def _platform_chat_response(result: dict, session_id: str, request_id: str | None = None) -> ChatResponse:
+    return ChatResponse(
+        response=str(result.get("response") or ""), session_id=session_id, request_id=request_id,
+        timestamp=datetime.now().isoformat(), request_state="PLATFORM_CAPABILITY",
+        active_context={"capability": result.get("capability"), "status": result.get("status"),
+                        "metadata": {key: value for key, value in result.items() if key not in {"response", "results"}}},
+    )
+
+
+async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime=None, *, memory_only=False) -> ChatResponse:
     session_id = _session_id(req)
     user_message = req.message.strip()
     if not user_message:
@@ -1335,23 +1375,21 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
         raise HTTPException(status_code=403, detail="La sesión pertenece a otro dispositivo o está en cuarentena.")
     memory.touch_device(device_id)
     if platform_runtime is not None:
-        platform_result = await platform_runtime.handle_chat(
-            user_message,
-            principal=principal,
-            session_id=session_id,
-            device_id=device_id,
+        result = await platform_runtime.handle_memory_chat(
+            user_message, principal=principal, session_id=session_id, device_id=device_id,
         )
-        if platform_result is not None:
-            memory.save_message(session_id, "user", user_message, device_id)
-            memory.save_message(session_id, "assistant", str(platform_result.get("response") or ""), device_id)
-            return ChatResponse(
-                response=str(platform_result.get("response") or ""),
-                session_id=session_id,
-                timestamp=datetime.now().isoformat(),
-                request_state="PLATFORM_CAPABILITY",
-                active_context={"capability": platform_result.get("capability"), "status": platform_result.get("status"), "metadata": {k: v for k, v in platform_result.items() if k not in {"response", "results"}}},
+        if result is not None:
+            return _platform_chat_response(result, session_id)
+        if not memory_only and not classify_reflex(user_message, request_context):
+            result = await platform_runtime.handle_chat(
+                user_message, principal=principal, session_id=session_id, device_id=device_id,
+                include_memory=False,
             )
-    request_state = "ACTION_REQUEST" if _is_action_request(user_message) else "CONVERSATION"
+            if result is not None:
+                memory.save_message(session_id, "user", user_message, device_id)
+                memory.save_message(session_id, "assistant", str(result.get("response") or ""), device_id)
+                return _platform_chat_response(result, session_id)
+    request_state = "ACTION_REQUEST" if _is_action_request(user_message) or classify_reflex(user_message, request_context) else "CONVERSATION"
     if SAFE_MODE and request_state == "ACTION_REQUEST":
         memory.save_message(session_id, "user", user_message, device_id)
         memory.save_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id)
@@ -1365,7 +1403,7 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
         deterministic = _allowed_intent(user_message, req.intent, request_context)
         candidate = deterministic
         if candidate is None and request_state == "ACTION_REQUEST":
-            candidate = await _allowed_intent_with_llm(user_message, req.intent)
+            candidate = await _allowed_intent_with_llm(user_message, req.intent, request_context)
     else:
         candidate = None
     if can_actions and request_state == "ACTION_REQUEST" and candidate is None:
@@ -1385,7 +1423,8 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
         memory.set_state(f"pending_action:{action_id}", json.dumps(pending_state, ensure_ascii=False))
         contract = _action_contract(intent, action_id, session_id, requesting_device=device_id, target_host=target_host, approved=bool(pending_state["approved"]), permission_entries=_permission_entries(intent, principal, device_id))
         return ChatResponse(timestamp=datetime.now().isoformat(), **contract)
-    system_prompt, messages = _prepare_context(session_id, user_message, device_id, request_context, principal=principal)
+    explicit = await _relevant_explicit_memories(platform_runtime, user_message, principal, device_id, request_context)
+    system_prompt, messages = _prepare_context(session_id, user_message, device_id, request_context, principal=principal, explicit_memories=explicit)
     try:
         response_text = await llm.chat_completion(system_prompt, messages, profile=req.profile or None, context_override=req.context)
     except llm.LLMError as exc:
@@ -1398,14 +1437,15 @@ async def _chat_service(req: ChatRequest, principal: Principal, platform_runtime
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, req: ChatRequest, principal: Annotated[Principal, Depends(require_chat)]):
-    return await _chat_service(req, principal, getattr(request.app.state, "platform_runtime", None))
+    with gaia_latency.measure("chat_http_total"):
+        return await _chat_service(req, principal, getattr(request.app.state, "platform_runtime", None))
 
 
 async def _sse_event(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIterator[str]:
+async def _assistant_stream(req: ChatRequest, principal: Principal, platform_runtime=None) -> AsyncIterator[str]:
     session_id = _session_id(req)
     user_message = req.message.strip()
     if not user_message:
@@ -1425,7 +1465,18 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
     memory.set_state(cancel_key, "0")
     memory.set_state(owner_key, json.dumps({"request_id": request_id, "principal_type": principal.type, "device_id": principal.device_id, "token_id": principal.token_id, "session_id": session_id, "created_at": datetime.now().isoformat()}))
     yield await _sse_event("meta", {"session_id": session_id, "request_id": request_id})
-    request_state = "ACTION_REQUEST" if _is_action_request(user_message) else "CONVERSATION"
+    if platform_runtime is not None:
+        result = await platform_runtime.handle_memory_chat(
+            user_message, principal=principal, session_id=session_id, device_id=device_id, request_id=request_id,
+        )
+        if result is not None:
+            response = _platform_chat_response(result, session_id, request_id)
+            memory.delete_state(owner_key)
+            memory.delete_state(cancel_key)
+            yield await _sse_event("token", {"text": response.response})
+            yield await _sse_event("done", response.model_dump())
+            return
+    request_state = "ACTION_REQUEST" if _is_action_request(user_message) or classify_reflex(user_message, request_context) else "CONVERSATION"
     if SAFE_MODE and request_state == "ACTION_REQUEST":
         memory.save_message(session_id, "user", user_message, device_id)
         memory.save_message(session_id, "assistant", _SAFE_MODE_ACTION_FALLBACK, device_id)
@@ -1445,7 +1496,7 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
         deterministic = _allowed_intent(user_message, req.intent, request_context)
         candidate = deterministic
         if candidate is None and request_state == "ACTION_REQUEST":
-            candidate = await _allowed_intent_with_llm(user_message, req.intent)
+            candidate = await _allowed_intent_with_llm(user_message, req.intent, request_context)
     else:
         candidate = None
     if can_actions and request_state == "ACTION_REQUEST" and candidate is None:
@@ -1476,8 +1527,10 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
         memory.delete_state(cancel_key)
         return
 
-    system_prompt, messages = _prepare_context(session_id, user_message, device_id, request_context, principal=principal, request_id=request_id)
+    explicit = await _relevant_explicit_memories(platform_runtime, user_message, principal, device_id, request_context)
+    system_prompt, messages = _prepare_context(session_id, user_message, device_id, request_context, principal=principal, request_id=request_id, explicit_memories=explicit)
     chunks: list[str] = []
+    model_started = perf_counter()
     try:
         async for chunk in llm.chat_completion_stream(system_prompt, messages, profile=req.profile or None, context_override=req.context):
             if memory.get_state(cancel_key, "0") == "1":
@@ -1486,6 +1539,8 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
                 memory.delete_state(cancel_key)
                 return
             if chunk:
+                if not chunks:
+                    gaia_latency.record("llm_first_internal_token", model_started)
                 # Buffer until policy grounding has inspected the complete visible response.
                 # Safety wins over token-by-token display for untrusted conversational text.
                 chunks.append(chunk)
@@ -1497,6 +1552,7 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
         return
     raw_response_text = "".join(chunks).strip()
     response_text = _ground_conversation_response(raw_response_text, user_message=user_message, profile=req.profile or "auto", request_state=request_state)
+    gaia_latency.record("llm_grounded_text", model_started)
     yield await _sse_event("token", {"text": response_text})
     memory.save_message(session_id, "assistant", response_text, device_id)
     memory.set_state(cancel_key, "done")
@@ -1506,13 +1562,13 @@ async def _assistant_stream(req: ChatRequest, principal: Principal) -> AsyncIter
 
 
 @router.post("/assistant/stream")
-async def assistant_stream(req: ChatRequest, principal: Annotated[Principal, Depends(require_chat)]):
-    return StreamingResponse(_assistant_stream(req, principal), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+async def assistant_stream(request: Request, req: ChatRequest, principal: Annotated[Principal, Depends(require_chat)]):
+    return StreamingResponse(_assistant_stream(req, principal, getattr(request.app.state, "platform_runtime", None)), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 
 @router.post("/chat/stream")
-async def chat_stream(req: ChatRequest, principal: Annotated[Principal, Depends(require_chat)]):
-    return StreamingResponse(_assistant_stream(req, principal), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+async def chat_stream(request: Request, req: ChatRequest, principal: Annotated[Principal, Depends(require_chat)]):
+    return StreamingResponse(_assistant_stream(req, principal, getattr(request.app.state, "platform_runtime", None)), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
 
 @router.post("/assistant/cancel")
@@ -1833,6 +1889,27 @@ async def complete_action(req: ActionCompleteRequest, principal: Annotated[Princ
     return {"status": "completed", "action_id": req.action_id, "session_id": req.session_id, "request_state": request_state, "response": natural_response, "deterministic_response": deterministic_response or verified.message, "success": verified.success, "data": verified.data, "verified_result": verified_payload, "result_status": status, "capability_available": verified.capability_available, "side_effect_performed": verified.side_effect_performed, "effect_verified": verified.effect_verified, "observation_completed": verified.observation_completed, "execution_verified": verified.execution_verified, "generated_by_llm": generated_by_llm, "timestamp": datetime.now().isoformat()}
 
 
+_private_voice_files: dict[str, tuple[tuple[str, str], float]] = {}
+_PRIVATE_AUDIO_PREFIX = "lumen_tts_private_"
+
+
+def _voice_owner(principal: Principal) -> tuple[str, str]:
+    return principal.type, str(principal.token_id or principal.device_id or "")
+
+
+def _register_private_voice(path: Path, principal: Principal) -> None:
+    now = monotonic()
+    for name, (_owner, expiry) in list(_private_voice_files.items()):
+        if expiry <= now:
+            del _private_voice_files[name]
+            (DATA_DIR / "audio" / name).unlink(missing_ok=True)
+    if len(_private_voice_files) >= 128:
+        oldest = next(iter(_private_voice_files))
+        del _private_voice_files[oldest]
+        (DATA_DIR / "audio" / oldest).unlink(missing_ok=True)
+    _private_voice_files[path.name] = (_voice_owner(principal), now + 120)
+
+
 @router.post("/chat/voice")
 async def chat_voice(
     principal: Annotated[Principal, Depends(require_voice_chat)],
@@ -1843,7 +1920,9 @@ async def chat_voice(
     channel: str = Form(default="desktop_voice", max_length=32),
     request_envelope: str = Form(default="", max_length=24000),
     desktop_snapshot: str = Form(default="", max_length=24000),
+    request: Request = None,
 ):
+    voice_started = perf_counter()
     suffix = Path(audio.filename or "audio.wav").suffix.lower() or ".wav"
     if suffix not in {".wav", ".mp3", ".m4a", ".ogg", ".webm"}:
         raise HTTPException(status_code=415, detail="Formato de audio no admitido.")
@@ -1855,7 +1934,8 @@ async def chat_voice(
         tmp_path = tmp.name
     try:
         try:
-            user_text = await asyncio.to_thread(speech_to_text, tmp_path)
+            with gaia_latency.measure("stt_final_transcript"):
+                user_text = await asyncio.to_thread(speech_to_text, tmp_path)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"Falló la transcripción: {exc}") from exc
     finally:
@@ -1873,28 +1953,40 @@ async def chat_voice(
     # A desktop screen request must be handled by the local desktop only.
     # Do not invoke a text LLM or claim to see a monitor from this API.
     from vision_intent import is_screen_vision_request
-    if channel == "desktop_voice" and is_screen_vision_request(user_text):
+    memory_request = parse_memory_intent(user_text) is not None
+    if channel == "desktop_voice" and not memory_request and is_screen_vision_request(user_text):
         return {"user_text": user_text, "response": "Selecciona el monitor en GAIA para autorizar una captura local.",
                 "session_id": envelope_session, "kind": "desktop_vision", "vision_requested": True,
                 "audio_url": None, "tts_error": None}
     # Diagnóstico local reconocido por voz: delegar al escritorio del usuario,
     # que conserva permisos y dispositivo. No ejecutar herramientas en el Core.
     from operator_intent import is_local_diagnostic_request
-    if channel == "desktop_voice" and is_local_diagnostic_request(user_text):
+    if channel == "desktop_voice" and not memory_request and is_local_diagnostic_request(user_text):
         return {"user_text": user_text, "response": "GAIA va a diagnosticar el equipo localmente.",
                 "session_id": envelope_session, "kind": "desktop_diagnostic",
                 "operator_requested": True, "audio_url": None, "tts_error": None}
-    chat_resp = await _chat_service(ChatRequest(message=user_text, session_id=envelope_session, device=envelope_device, target_host=envelope_target, channel=str(channel or "desktop_voice")[:32], request_envelope=envelope, desktop_snapshot=snapshot or None, pc_context=voice_context), principal)
+    chat_resp = await _chat_service(ChatRequest(message=user_text, session_id=envelope_session, device=envelope_device, target_host=envelope_target, channel=str(channel or "desktop_voice")[:32], request_envelope=envelope, desktop_snapshot=snapshot or None, pc_context=voice_context), principal, getattr(request.app.state, "platform_runtime", None) if request else None, memory_only=True)
     audio_url: str | None = None
     tts_error: str | None = None
+    private_recall = (chat_resp.active_context or {}).get("capability") == "memory.read"
     if TTS_ENABLED and chat_resp.kind == "chat":
         try:
-            audio_path = await text_to_speech(chat_resp.response)
+            with gaia_latency.measure("tts_audio_file"):
+                if private_recall:
+                    if TTS_ENGINE not in {"piper", "local"}:
+                        raise RuntimeError("La lectura de recuerdos por voz requiere síntesis local.")
+                    target = DATA_DIR / "audio" / f"{_PRIVATE_AUDIO_PREFIX}{uuid.uuid4().hex}.wav"
+                    audio_path = await text_to_speech(chat_resp.response, output_path=str(target))
+                    _register_private_voice(Path(audio_path), principal)
+                else:
+                    audio_path = await text_to_speech(chat_resp.response)
+            gaia_latency.record("voice_audio_file_ready", voice_started)
             audio_url = f"/api/voice/audio/{Path(audio_path).name}"
         except Exception as exc:
             tts_error = str(exc)
             logger.warning("Respuesta generada, pero TTS falló: %s", exc)
-    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "audio_url": audio_url, "tts_error": tts_error}
+    gaia_latency.record("voice_http_total", voice_started)
+    return {"user_text": user_text, "response": chat_resp.response, "session_id": chat_resp.session_id, "timestamp": chat_resp.timestamp, "kind": chat_resp.kind, "action_id": chat_resp.action_id, "request_id": chat_resp.request_id, "confirmation_required": chat_resp.confirmation_required, "preview": chat_resp.preview, "action": chat_resp.action, "plan": chat_resp.plan, "confirmation_options": chat_resp.confirmation_options, "audio_url": audio_url, "tts_error": tts_error, "active_context": chat_resp.active_context}
 
 
 @router.get("/captures/{capture_id}")
@@ -1907,15 +1999,23 @@ async def get_capture(capture_id: str, principal: Annotated[Principal, Depends(r
     return FileResponse(str(record["path"]), media_type="image/png", filename=f"{capture_id}.png", headers={"Cache-Control": "no-store"})
 
 
-@router.get("/voice/audio/{filename}", dependencies=[Depends(require_voice)])
-async def get_audio(filename: str):
+@router.get("/voice/audio/{filename}")
+async def get_audio(filename: str, principal: Annotated[Principal, Depends(require_voice)]):
     if Path(filename).name != filename:
         raise HTTPException(status_code=400, detail="Nombre de audio inválido.")
     audio_path = DATA_DIR / "audio" / filename
-    if not audio_path.exists():
+    if not audio_path.is_file():
         raise HTTPException(status_code=404, detail="Audio no encontrado.")
     media = "audio/wav" if audio_path.suffix.lower() == ".wav" else "audio/mpeg"
-    return FileResponse(str(audio_path), media_type=media, filename=filename)
+    background = None
+    if filename.startswith(_PRIVATE_AUDIO_PREFIX):
+        owner, expiry = _private_voice_files.get(filename, (None, 0))
+        if owner != _voice_owner(principal) or expiry <= monotonic():
+            raise HTTPException(status_code=404, detail="Audio no encontrado.")
+        del _private_voice_files[filename]
+        background = BackgroundTask(audio_path.unlink, missing_ok=True)
+    return FileResponse(str(audio_path), media_type=media, filename=filename, background=background,
+                        headers={"Cache-Control": "no-store"})
 
 
 @router.post("/voice/tts", dependencies=[Depends(require_voice)])
@@ -1961,6 +2061,66 @@ async def fact_history(fact_id: int):
 @router.get("/memory/search", dependencies=[Depends(require_memory_read)])
 async def memory_search(query: str = Query(default="", max_length=500), category: str | None = Query(default=None, max_length=80), limit: int = Query(default=12, ge=1, le=50)):
     return memory.search_memories(query, category, limit)
+
+
+class ChatMemoryEdit(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)
+
+
+def _chat_memory_runtime(request: Request):
+    runtime = getattr(request.app.state, "platform_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=503, detail="La memoria explícita no está inicializada.")
+    return runtime
+
+
+@router.get("/memory/explicit")
+async def explicit_memory_list(request: Request, principal: Annotated[Principal, Depends(require_memory_read)],
+                               device: str = Query(default=PC_DEVICE_ID, max_length=40),
+                               query: str = Query(default="", max_length=500),
+                               project: str = Query(default="", max_length=80)):
+    runtime = _chat_memory_runtime(request)
+    scope = runtime.memory_scope(principal, effective_device(principal, device))
+    rows = await asyncio.to_thread(runtime.memory.search, query, **scope, project=project.strip().casefold(), limit=50)
+    return JSONResponse(rows, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/memory/explicit/export")
+async def explicit_memory_export(request: Request, principal: Annotated[Principal, Depends(require_memory_read)],
+                                 device: str = Query(default=PC_DEVICE_ID, max_length=40)):
+    runtime = _chat_memory_runtime(request)
+    scope = runtime.memory_scope(principal, effective_device(principal, device))
+    rows = await asyncio.to_thread(runtime.memory.export, **scope)
+    rows = [row for row in rows if row["privacy_level"] in {"PUBLIC", "PRIVATE"}
+            and not contains_credentials(row["content"])]
+    return JSONResponse(rows, headers={"Cache-Control": "no-store"})
+
+
+@router.put("/memory/explicit/{item_id}")
+@router.delete("/memory/explicit/{item_id}")
+async def explicit_memory_mutation(item_id: str, request: Request,
+                                   principal: Annotated[Principal, Depends(require_memory_write)],
+                                   payload: ChatMemoryEdit | None = None,
+                                   device: str = Query(default=PC_DEVICE_ID, max_length=40)):
+    from authority import LOW_RISK, authorize
+    runtime = _chat_memory_runtime(request)
+    scope = runtime.memory_scope(principal, effective_device(principal, device))
+    decision = authorize(principal, capability="memory.write", permission=CAP_MEMORY_WRITE,
+                         risk=LOW_RISK, resource_scope=f"memory:{scope['owner_id']}", confirmed=True)
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
+    if request.method == "PUT":
+        if payload is None:
+            raise HTTPException(status_code=422, detail="Escribe el contenido actualizado.")
+        try:
+            changed = await asyncio.to_thread(runtime.memory.update, item_id, payload.content, **scope)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    else:
+        changed = await asyncio.to_thread(runtime.memory.delete, item_id, **scope)
+    if not changed:
+        raise HTTPException(status_code=404, detail="Recuerdo no encontrado.")
+    return {"status": "updated" if request.method == "PUT" else "deleted", "memory_id": item_id}
 
 
 def _advanced_memory_context(principal: Principal, *, session_id: str = "") -> memory.MemoryAccessContext:
@@ -2301,7 +2461,7 @@ async def brain_backup_create(principal: Annotated[Principal, Depends(require_ba
 
 
 @router.post("/backup/brain/restore", dependencies=[Depends(require_master_auth)])
-async def brain_backup_restore(archive: UploadFile = File(...)):
+async def brain_backup_restore(request: Request, archive: UploadFile = File(...)):
     suffix = Path(archive.filename or "backup.zip").suffix.lower()
     if suffix != ".zip":
         raise HTTPException(status_code=415, detail="El Brain Backup debe ser un ZIP.")
@@ -2313,6 +2473,9 @@ async def brain_backup_restore(archive: UploadFile = File(...)):
         temp_path = Path(temp.name)
     try:
         result = await asyncio.to_thread(brain_backup.restore_brain_backup, temp_path)
+        runtime = getattr(request.app.state, "platform_runtime", None)
+        if runtime is not None:
+            await asyncio.to_thread(runtime.memory.initialize)
         memory.record_admin_audit("master", None, "brain_restore", Path(archive.filename or "backup.zip").name, "success", {"manifest_verified": bool(result.get("manifest_verified")), "integrity": result.get("integrity")})
         return result
     except RuntimeError as exc:

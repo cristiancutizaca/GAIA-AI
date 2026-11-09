@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import platform
+import sys
 import uuid
 from urllib.parse import urlencode
 
@@ -26,6 +27,9 @@ from context_providers import collect_desktop_context
 from request_envelope import build_request_envelope
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+CORE_DIR = str(PROJECT_DIR / "lumen-core")
+if CORE_DIR not in sys.path:
+    sys.path.append(CORE_DIR)
 logger = logging.getLogger("lumen.desktop_api")
 
 load_dotenv(PROJECT_DIR / ".env")
@@ -172,8 +176,12 @@ class LumenDesktopAPI:
     def status(self) -> dict:
         return self._request("GET", "/api/status", timeout=6.0).json()
 
-    def desktop_context(self, *, level: str = "FOREGROUND", force_refresh: bool = False) -> dict:
+    def desktop_context(self, *, level: str = "FOREGROUND", force_refresh: bool = False,
+                        snapshot_only: bool = False) -> dict:
         try:
+            if snapshot_only:
+                from desktop_context import get_desktop_context
+                return {"desktop_snapshot": get_desktop_context(level=level, force_refresh=force_refresh)}
             return collect_desktop_context(base_dir=PROJECT_DIR, projects_file=PROJECT_DIR / "projects.json", level=level, force_refresh=force_refresh)
         except Exception:
             return {"active_window": None, "ollama": {"status": "unavailable"}, "project": {"active_project": None, "status": "unavailable"}, "system": {}, "desktop_snapshot": {"desktop_available": False, "context_level": level}}
@@ -208,14 +216,23 @@ class LumenDesktopAPI:
     def enable_actions(self) -> dict:
         return self._request("POST", "/api/actions/enable", timeout=10.0).json()
 
+    def _text_context(self, text: str) -> dict:
+        from memory_intent import parse_memory_intent
+        from reflex_engine import classify_reflex, requires_window_target
+        if requires_window_target(text):
+            return self.desktop_context(snapshot_only=True, force_refresh=True)
+        if classify_reflex(text) or parse_memory_intent(text) is not None:
+            return {"desktop_snapshot": {}}
+        return self.desktop_context(level="FOREGROUND")
+
     def send_message(self, text: str) -> dict:
-        context = self.desktop_context(level="FOREGROUND")
+        context = self._text_context(text)
         data = self._request("POST", "/api/chat", json={"message": text, "session_id": self.session_id, "device": DEVICE, "channel": "desktop_text", "pc_context": context, "desktop_snapshot": context.get("desktop_snapshot"), "request_envelope": self.request_envelope(text, channel="desktop_text", context=context)}).json()
         self.session_id = data.get("session_id", self.session_id)
         return data
 
     def send_voice(self, audio_path: Path) -> dict:
-        context = self.desktop_context(level="FOREGROUND")
+        context = self.desktop_context(snapshot_only=True, force_refresh=True)
         envelope = self.request_envelope(channel="desktop_voice", context=context)
         form = {"channel": "desktop_voice", "request_envelope": json.dumps(envelope, ensure_ascii=False), "desktop_snapshot": json.dumps(context.get("desktop_snapshot") or {}, ensure_ascii=False)}
         with audio_path.open("rb") as handle:
@@ -239,7 +256,7 @@ class LumenDesktopAPI:
         self._active_tts = tts_buffer
         try:
             with httpx.Client(timeout=LLM_CLIENT_TIMEOUT) as client:
-                context = self.desktop_context(level="FOREGROUND")
+                context = self._text_context(text)
                 with client.stream("POST", f"{self.base_url}/api/assistant/stream", headers=self.headers, json={"message": text, "session_id": self.session_id, "device": DEVICE, "profile": profile, "channel": "desktop_text", "pc_context": context, "desktop_snapshot": context.get("desktop_snapshot"), "request_envelope": self.request_envelope(text, channel="desktop_text", context=context)}) as response:
                     response.raise_for_status()
                     for line in response.iter_lines():
@@ -454,6 +471,20 @@ class LumenDesktopAPI:
 
     def diagnostics(self) -> dict:
         return self._request("GET", "/api/diagnostics", timeout=20.0).json()
+
+    def explicit_memories(self, query: str = "", project: str = "") -> list[dict]:
+        return self._request("GET", "/api/memory/explicit",
+                             params={"device": DEVICE, "query": query, "project": project}, timeout=10).json()
+
+    def edit_explicit_memory(self, item_id: str, content: str) -> dict:
+        return self._request("PUT", f"/api/memory/explicit/{item_id}", params={"device": DEVICE},
+                             json={"content": content}, timeout=10).json()
+
+    def delete_explicit_memory(self, item_id: str) -> dict:
+        return self._request("DELETE", f"/api/memory/explicit/{item_id}", params={"device": DEVICE}, timeout=10).json()
+
+    def export_explicit_memories(self) -> list[dict]:
+        return self._request("GET", "/api/memory/explicit/export", params={"device": DEVICE}, timeout=15).json()
 
     def facts(self) -> list[dict]:
         return self._request("GET", "/api/memory/facts", timeout=10.0).json()

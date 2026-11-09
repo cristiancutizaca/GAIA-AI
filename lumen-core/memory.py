@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from memory_privacy import contains_credentials
 from config import BACKUP_DIR, BACKUP_INTERVAL_HOURS, DB_PATH, DEVICE_TOKEN_TTL_DAYS, MAX_BACKUPS, MEMORY_RELEVANCE_LIMIT, SESSION_SUMMARY_EVERY_TURNS
 
 SCHEMA_VERSION = 9
@@ -836,7 +837,8 @@ def get_session_summary(session_id: str) -> str:
 
 
 def _summary_topics(messages: list[dict]) -> tuple[list[str], list[str], list[str], list[str]]:
-    text = " ".join(item["content"] for item in messages)
+    text = "\n".join(item["content"] for item in messages
+                     if item["role"] == "user" and not contains_credentials(item["content"]))
     topics: list[str] = []
     projects: list[str] = []
     decisions: list[str] = []
@@ -858,14 +860,25 @@ def _summary_topics(messages: list[dict]) -> tuple[list[str], list[str], list[st
     return list(dict.fromkeys(topics))[:8], list(dict.fromkeys(projects))[:8], list(dict.fromkeys(decisions))[:8], list(dict.fromkeys(tasks))[:8]
 
 
+def _session_turn_count(session_id: str) -> int:
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM conversations WHERE session_id=?", (session_id,)).fetchone()[0]
+    return int(count) // 2
+
+
 def build_session_summary(session_id: str, limit: int = 32, access_context: MemoryAccessContext | None = None) -> str:
     messages = get_conversation_history(session_id, limit=limit, access_context=access_context)
     if not messages:
         return ""
+    previous = get_session_summary_record(session_id)
     topics, projects, decisions, tasks = _summary_topics(messages)
-    lines = [f"{item['role']}: {item['content'][:260]}" for item in messages[-12:]]
+    decisions = list(dict.fromkeys([*previous.get("important_decisions", []), *decisions]))[-32:]
+    lines = [f"Decisión: {decision}" for decision in decisions[-5:] if not contains_credentials(decision)]
+    lines.extend(f"{item['role']}: {item['content'][:260]}" for item in messages[-12:]
+                 if not contains_credentials(item["content"]))
     summary = "\n".join(lines)
-    set_session_summary(session_id, summary, topics, projects, decisions, tasks, turn_count=len(messages) // 2, access_context=access_context)
+    set_session_summary(session_id, summary, topics, projects, decisions, tasks,
+                        turn_count=_session_turn_count(session_id), access_context=access_context)
     return summary
 
 
@@ -873,8 +886,7 @@ def maybe_update_session_summary(session_id: str, force: bool = False, access_co
     if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
         raise PermissionError("La sesión no pertenece al Principal autenticado.")
     record = get_session_summary_record(session_id)
-    messages = get_conversation_history(session_id, limit=SESSION_SUMMARY_EVERY_TURNS * 4, access_context=access_context)
-    turn_count = len(messages) // 2
+    turn_count = _session_turn_count(session_id)
     last_count = int(record.get("turn_count", 0) or 0)
     if force or (turn_count >= 1 and turn_count - last_count >= SESSION_SUMMARY_EVERY_TURNS):
         return build_session_summary(session_id, access_context=access_context)
@@ -885,18 +897,25 @@ def get_context_bundle(session_id: str, user_message: str, recent_limit: int = 1
     if access_context and not session_access_allowed(session_id, device_id=access_context.device_id, principal_id=access_context.principal_id, is_master=access_context.is_master):
         raise PermissionError("La sesión no pertenece al Principal autenticado.")
     summary = maybe_update_session_summary(session_id, access_context=access_context)
-    memories = search_memories(user_message, limit=MEMORY_RELEVANCE_LIMIT)
-    active_project = get_active_project()
+    owner_access = access_context is None or access_context.is_master
+    can_read_memory = owner_access or "memory_read" in access_context.capabilities or "admin" in access_context.capabilities
+    memories = search_memories(user_message, limit=MEMORY_RELEVANCE_LIMIT) if owner_access else []
+    active_project = get_active_project() if owner_access else ""
     project_notes = get_project_notes(active_project) if active_project else []
-    advanced: dict[str, Any] = {"items": [], "context_text": "", "truncated": False, "retrieval_ms": 0}
-    try:
-        from advanced_memory import retrieve
-        advanced = retrieve(user_message, project=active_project or None, session_id=session_id, device_id=access_context.device_id if access_context and not access_context.is_master else None, include_all_devices=bool(access_context and access_context.is_master), limit=MEMORY_RELEVANCE_LIMIT, max_chars=4000)
-    except (ImportError, OSError, ValueError):
-        # Advanced memory is an additive layer; legacy facts remain available.
-        advanced = {"items": [], "context_text": "", "truncated": False, "retrieval_ms": 0}
-    work_session = get_work_session()
-    tasks = get_open_tasks(12)
+    advanced: dict[str, Any] = {}
+    if can_read_memory:
+        try:
+            from advanced_memory import retrieve
+            advanced = retrieve(
+                user_message, project=active_project or None, session_id=session_id,
+                include_all_devices=bool(access_context and access_context.is_master),
+                limit=MEMORY_RELEVANCE_LIMIT, max_chars=4000, access_context=access_context,
+            )
+        except (ImportError, OSError, ValueError):
+            # Advanced memory is additive. Existing conversational history remains available.
+            pass
+    work_session = get_work_session() if owner_access else {}
+    tasks = get_open_tasks(12) if owner_access else []
     recent_actions = get_action_history(session_id, 8)
     return {"recent_messages": get_conversation_history(session_id, recent_limit, access_context=access_context), "session_summary": get_session_summary_record(session_id), "relevant_memories": memories, "advanced_memories": advanced.get("items", []), "advanced_memory_text": str(advanced.get("context_text", ""))[:4000], "advanced_memory_truncated": bool(advanced.get("truncated")), "summary_text": summary, "active_project": active_project, "project_notes": project_notes, "work_session": work_session, "open_tasks": tasks, "recent_actions": recent_actions}
 

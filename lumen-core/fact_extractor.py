@@ -6,6 +6,7 @@ from datetime import datetime
 
 import memory
 from config import AUTO_FACTS_ENABLED, AUTO_MEMORY_ENABLED
+from memory_privacy import contains_credentials
 
 logger = logging.getLogger("lumen.facts")
 
@@ -30,6 +31,8 @@ def _clean(value: str, maximum: int = 400) -> str:
 
 
 def extract_memory_candidates(text: str) -> list[dict]:
+    if contains_credentials(text):
+        return []
     candidates: list[dict] = []
     for category, key, source, pattern, confidence in _PATTERNS:
         for match in pattern.finditer(text):

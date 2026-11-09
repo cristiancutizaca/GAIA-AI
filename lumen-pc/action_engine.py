@@ -25,9 +25,9 @@ from desktop_context import get_desktop_context
 from screen_capture import capture_display, capture_window
 from uia import UIAutomationError, dynamic_control_risk, focus_control, get_focused_control, inspect_window, invoke_control, list_controls, resolve_control_risk, set_control_value, verify_window_identity, window_identity
 from capabilities import ACTION_TO_CAPABILITY, CapabilityRequest, CapabilityValidationError, VerifiedCapabilityResult, default_capability_registry
-from platform_capabilities import PlatformCapabilityError, audio_devices, audio_get, audio_mute, audio_set, clipboard_read, clipboard_write, display_info, display_list, move_window_to_display, network_adapters, network_ip, power_action, list_windows, window_action
+from platform_capabilities import PlatformCapabilityError, audio_devices, audio_get, audio_mute, audio_set, clipboard_read, clipboard_write, display_info, display_list, move_window_to_display, network_adapters, network_ip, power_action, list_windows, show_desktop, window_action
 from app_adapters import get_app_adapter
-from media_session import media_status, media_play_pause, media_next, media_previous, media_stop
+from media_session import media_status, media_pause, media_play_pause, media_next, media_previous, media_stop
 
 
 @dataclass(frozen=True)
@@ -143,6 +143,7 @@ class ActionEngine:
         "windows_close": (2, False),
         "windows_move_to_display": (1, False),
         "desktop_context": (0, False),
+        "desktop_show": (1, False),
         "uia_inspect_window": (0, False),
         "uia_list_controls": (0, False),
         "uia_get_focused_control": (0, False),
@@ -156,6 +157,7 @@ class ActionEngine:
         "vscode_open_terminal_trusted": (1, False),
         "media_status": (0, False),
         "media_play_pause": (1, False),
+        "media_pause": (1, False),
         "media_next": (1, False),
         "media_previous": (1, False),
         "media_stop": (1, False),
@@ -164,6 +166,7 @@ class ActionEngine:
         "list_audio_devices": (0, False),
         "get_volume": (0, False),
         "set_volume": (1, False),
+        "volume_down": (1, False),
         "mute": (1, False),
         "unmute": (1, False),
         "clipboard_read": (1, False),
@@ -256,8 +259,8 @@ class ActionEngine:
             "apps.close": "close_app", "apps.focus": "focus_app", "apps.minimize": "minimize_app",
             "files.exists": "file_exists", "files.list": "file_list", "files.info": "file_info", "files.open": "file_open", "files.delete": "file_delete", "files.copy": "file_copy", "files.move": "file_move", "files.rename": "file_rename", "folders.create": "folder_create",
             "windows.list": "windows_list", "windows.focus": "windows_focus", "windows.minimize": "windows_minimize", "windows.maximize": "windows_maximize", "windows.restore": "windows_restore", "windows.close": "windows_close", "windows.move_to_display": "windows_move_to_display",
-            "desktop.context": "desktop_context", "uia.inspect_window": "uia_inspect_window", "uia.list_controls": "uia_list_controls", "uia.get_focused_control": "uia_get_focused_control", "uia.focus_control": "uia_focus_control", "uia.invoke_control": "uia_invoke_control", "uia.set_value": "uia_set_value", "vscode.focus": "vscode_focus", "vscode.open_project": "vscode_open_project", "vscode.new_window": "vscode_new_window", "vscode.open_file_trusted": "vscode_open_file_trusted", "vscode.open_terminal_trusted": "vscode_open_terminal_trusted", "media.status": "media_status", "media.play_pause": "media_play_pause", "media.next": "media_next", "media.previous": "media_previous", "media.stop": "media_stop", "screen.capture_display": "screen_capture_display", "screen.capture_window": "screen_capture_window",
-            "audio.list_devices": "list_audio_devices", "audio.get_volume": "get_volume", "audio.set_volume": "set_volume", "audio.mute": "mute", "audio.unmute": "unmute",
+            "desktop.context": "desktop_context", "desktop.show": "desktop_show", "uia.inspect_window": "uia_inspect_window", "uia.list_controls": "uia_list_controls", "uia.get_focused_control": "uia_get_focused_control", "uia.focus_control": "uia_focus_control", "uia.invoke_control": "uia_invoke_control", "uia.set_value": "uia_set_value", "vscode.focus": "vscode_focus", "vscode.open_project": "vscode_open_project", "vscode.new_window": "vscode_new_window", "vscode.open_file_trusted": "vscode_open_file_trusted", "vscode.open_terminal_trusted": "vscode_open_terminal_trusted", "media.status": "media_status", "media.play_pause": "media_play_pause", "media.pause": "media_pause", "media.next": "media_next", "media.previous": "media_previous", "media.stop": "media_stop", "screen.capture_display": "screen_capture_display", "screen.capture_window": "screen_capture_window",
+            "audio.list_devices": "list_audio_devices", "audio.get_volume": "get_volume", "audio.set_volume": "set_volume", "audio.volume_down": "volume_down", "audio.mute": "mute", "audio.unmute": "unmute",
             "clipboard.read": "clipboard_read", "clipboard.write": "clipboard_write", "display.list": "display_list", "display.info": "display_info",
             "network.adapters": "network_adapters", "network.ip": "network_ip", "processes.info": "process_info", "processes.stop": "process_stop",
             "git.branch": "git_branch", "git.log": "git_log", "git.diff": "git_diff", "git.add": "git_add", "git.commit": "git_commit",
@@ -383,6 +386,15 @@ class ActionEngine:
 
     def _media_play_pause(self, _args: dict) -> ExecutionResult:
         return self._media_result("media_play_pause", media_play_pause())
+
+    def _media_pause(self, _args: dict) -> ExecutionResult:
+        data = media_pause()
+        if not data.get("available"):
+            return self._media_result("media_pause", data)
+        verified = bool(data.get("accepted") and data.get("state") in {"paused", "stopped"})
+        return ExecutionResult(verified, "media_pause",
+                               "La música está en pausa." if verified else "La pausa no quedó confirmada.",
+                               data, effect_verified=verified)
 
     def _media_next(self, _args: dict) -> ExecutionResult:
         return self._media_result("media_next", media_next())
@@ -831,6 +843,13 @@ class ActionEngine:
         """Dispatch alias for folders.create; path scope is checked by _create_folder."""
         return self._create_folder(args)
 
+    def _desktop_show(self, _args: dict) -> ExecutionResult:
+        data = show_desktop()
+        verified = bool(data["verified"])
+        return ExecutionResult(verified, "desktop_show",
+                               "El escritorio está visible." if verified else "No pude confirmar que el escritorio esté visible.",
+                               data, effect_verified=verified)
+
     def _windows_list(self, _args: dict) -> ExecutionResult:
         try:
             rows = list_windows()
@@ -853,7 +872,13 @@ class ActionEngine:
         try:
             self._verify_expected_window_target(args)
             data = window_action(str(args.get("window_id", "")), operation)
-            return ExecutionResult(True, action, f"Operación de ventana verificada: {operation}.", data)
+            verified = bool(data["verified"])
+            message = f"Operación de ventana verificada: {operation}." if verified else (
+                "Windows recibió la solicitud de cierre, pero la ventana sigue abierta. Revisa si hay un diálogo pendiente."
+            )
+            return ExecutionResult(verified, action, message, data,
+                                   side_effect_performed=verified or bool(data.get("close_requested")),
+                                   effect_verified=verified)
         except PlatformCapabilityError as exc:
             raise ActionEngineError(str(exc)) from exc
 
@@ -870,6 +895,9 @@ class ActionEngine:
         return self._windows_window_action(args, "restore", "windows_restore")
 
     def _windows_close(self, args: dict) -> ExecutionResult:
+        target = args.get("expected_target")
+        if isinstance(target, dict) and str(target.get("pid")) == str(os.getpid()):
+            raise ActionEngineError("La ventana identificada pertenece al propio asistente.")
         return self._windows_window_action(args, "close", "windows_close")
 
     def _windows_move_to_display(self, args: dict) -> ExecutionResult:
@@ -1036,6 +1064,14 @@ class ActionEngine:
             return ExecutionResult(bool(data["verified"]), "set_volume", f"Volumen ajustado al {int(float(args.get('level', 0)))}%.", data)
         except PlatformCapabilityError as exc:
             raise ActionEngineError(str(exc)) from exc
+
+    def _volume_down(self, _args: dict) -> ExecutionResult:
+        before = int(audio_get()["level"])
+        target = max(0, before - 10)
+        result = self._set_volume({"level": target})
+        return ExecutionResult(result.success, "volume_down",
+                               result.message if result.success else "El cambio de volumen no quedó confirmado.",
+                               {**result.data, "previous_level": before}, effect_verified=result.success)
 
     def _mute(self, _args: dict) -> ExecutionResult:
         try:

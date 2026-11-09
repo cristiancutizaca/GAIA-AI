@@ -7,6 +7,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -67,11 +68,46 @@ def window_action(window_id: str, operation: str) -> dict:
         ok = bool(user32.SetForegroundWindow(hwnd))
     elif operation == "close":
         ok = bool(user32.PostMessageW(hwnd, 0x0010, 0, 0))
+        if ok:
+            deadline = time.monotonic() + 0.75
+            while user32.IsWindow(hwnd) and time.monotonic() < deadline:
+                time.sleep(0.025)
+            return {"window_id": str(window_id), "operation": operation,
+                    "verified": not bool(user32.IsWindow(hwnd)), "close_requested": True}
     else:
         raise PlatformCapabilityError("Operación de ventana no permitida.")
     if not ok:
         raise PlatformCapabilityError("Windows rechazó la operación de ventana.")
     return {"window_id": str(window_id), "operation": operation, "verified": True}
+
+
+def show_desktop() -> dict:
+    _windows_user32()
+    try:
+        import pythoncom
+        import pywintypes
+        import win32gui
+        from win32com.client import Dispatch
+    except ImportError as exc:
+        raise PlatformCapabilityError("Mostrar el escritorio requiere pywin32.") from exc
+
+    def desktop_visible():
+        hwnd = win32gui.GetForegroundWindow()
+        return bool(hwnd and win32gui.GetClassName(hwnd) in {"Progman", "WorkerW"})
+
+    pythoncom.CoInitialize()
+    try:
+        already_visible = desktop_visible()
+        if not already_visible:
+            Dispatch("Shell.Application").MinimizeAll()
+            deadline = time.monotonic() + 0.75
+            while not desktop_visible() and time.monotonic() < deadline:
+                time.sleep(0.025)
+        return {"verified": desktop_visible(), "already_visible": already_visible}
+    except (pywintypes.error, pythoncom.com_error) as exc:
+        raise PlatformCapabilityError("Windows no pudo verificar que el escritorio quedó visible.") from exc
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def _run_fixed(command: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
