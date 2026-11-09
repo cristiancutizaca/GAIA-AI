@@ -69,18 +69,11 @@ Browser Use, OpenHands, Windows UI Automation, PyAutoGUI, MCP, voice and Android
 
 ## Voice status
 
-The connected Desktop voice path in this RC is:
-
-```text
-wake or PTT
-→ local microphone capture
-→ /api/chat/voice
-→ faster-whisper
-→ normal GAIA Core chat/authority path
-→ Piper
-→ WAV
-→ Desktop audio output
-```
+The resident Desktop sends the recorded WAV to `/api/chat/voice` and displays the
+grounded response as soon as the Core returns it. It then requests local Piper
+or configured TTS one sentence at a time and plays each result in order. Piper
+keeps a single lazy CPU voice warm. Legacy clients can still request a complete
+WAV in the original voice response.
 
 Silero is used for endpointing and barge-in monitoring. Production defaults are CPU-safe and do not require NVIDIA/CUDA.
 
@@ -130,6 +123,9 @@ pytest -q
 The repair report also records critical legacy regression scripts for Authority, Core E2E, Security, Kill Switch, permission levels, memory security and voice permissions.
 
 ## Current documents
+
+- `GAIA_BUG_FIX_REPORT.md` — incident audit and evidence for the stabilization branch.
+- `GAIA_WINDOWS_STABILITY_CHECKLIST.md` — physical Windows 11 validation and repair commands.
 
 - `GAIA_PROGRESO.md` — audit, memory, Reflex, measured timings and remaining Windows checks.
 

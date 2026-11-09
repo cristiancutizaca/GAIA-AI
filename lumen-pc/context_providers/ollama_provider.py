@@ -8,13 +8,13 @@ from typing import Any
 import httpx
 
 
-OLLAMA_URL = os.getenv("GAIA_OLLAMA_URL", os.getenv("LUMEN_OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
+OLLAMA_URL = (os.getenv("OLLAMA_URL") or os.getenv("GAIA_OLLAMA_URL") or os.getenv("LUMEN_OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
 
 
 def collect_ollama_context(timeout: float = 1.5) -> dict[str, Any]:
     """Return loaded-model and runtime hints, or ``offline`` when unavailable."""
     try:
-        with httpx.Client(timeout=max(0.2, float(timeout))) as client:
+        with httpx.Client(timeout=max(0.2, float(timeout)), trust_env=False) as client:
             ps_response = client.get(f"{OLLAMA_URL}/api/ps")
             tags_response = client.get(f"{OLLAMA_URL}/api/tags")
         if ps_response.status_code >= 400 and tags_response.status_code >= 400:

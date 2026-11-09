@@ -1,7 +1,7 @@
 """GAIA local-first speech stack.
 
-Production defaults: faster-whisper (CPU-safe) + Piper invoked as a separate
-local process. Legacy openai-whisper/Edge are optional fallbacks only.
+Production defaults: CPU-safe faster-whisper and one lazy, reusable Piper voice.
+Legacy openai-whisper/Edge remain optional.
 """
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import logging
 import os
 import subprocess
 import sys
+from threading import Lock
+import wave
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +27,9 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 PIPER_DIR.mkdir(parents=True, exist_ok=True)
 _faster_model = None
 _whisper_model = None
+_stt_lock = Lock()
+_piper_lock = Lock()
+_piper_cached = None
 
 
 def _piper_model() -> str:
@@ -70,6 +75,25 @@ def _windows_tts(text: str, target: str) -> str:
     return target
 
 
+def _piper_tts(model: Path, text: str, target: str) -> str:
+    """Keep one model warm, and reload if its files change."""
+    from piper import PiperVoice
+
+    global _piper_cached
+    config = model.with_suffix(".onnx.json")
+    with _piper_lock:
+        key = (model.resolve(), model.stat().st_mtime_ns, config.stat().st_mtime_ns)
+        if _piper_cached is None or _piper_cached[0] != key:
+            _piper_cached = None
+            _piper_cached = (key, PiperVoice.load(model, config_path=config, use_cuda=False))
+        with wave.open(target, "wb") as output:
+            _piper_cached[1].synthesize_wav(text[:4000], output)
+    with wave.open(target, "rb") as output:
+        if output.getnframes() == 0:
+            raise RuntimeError("Piper produjo un WAV sin audio.")
+    return target
+
+
 async def text_to_speech(text: str, output_path: str | None = None) -> str:
     if not TTS_ENABLED:
         raise RuntimeError("TTS está desactivado en la configuración.")
@@ -77,39 +101,25 @@ async def text_to_speech(text: str, output_path: str | None = None) -> str:
         raise ValueError("No hay texto para convertir a voz.")
     engine = (TTS_ENGINE or "piper").lower().strip()
     if engine in {"piper", "local"}:
-        model = _piper_model()
-        data_dir = _piper_data_dir()
-        if importlib.util.find_spec("piper") is None or not piper_voice_ready(model):
-            if _windows_fallback_ready():
-                target = output_path or str(AUDIO_DIR / f"gaia_windows_tts_{uuid.uuid4().hex}.wav")
-                return await asyncio.to_thread(_windows_tts, text, target)
-            raise RuntimeError(f"Falta Piper o la voz '{model}'. Instala Voice/Full y gaia models install piper --voice {model}.")
+        name = _piper_model()
+        model = _piper_data_dir() / f"{name}.onnx"
         target = output_path or str(AUDIO_DIR / f"lumen_tts_{uuid.uuid4().hex}.wav")
-        cmd = [
-            sys.executable,
-            "-m",
-            "piper",
-            "-m",
-            model,
-            "--data-dir",
-            str(data_dir),
-            "-f",
-            target,
-            "--",
-            text[:4000],
-        ]
-        try:
-            await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                check=True,
-                timeout=90,
-                capture_output=True,
-                text=True,
-            )
-            return target
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"Piper TTS falló: {(exc.stderr or exc.stdout or '')[-1000:]}") from exc
+        if piper_voice_ready(name):
+            try:
+                return await asyncio.to_thread(_piper_tts, model, text, target)
+            except Exception as exc:
+                Path(target).unlink(missing_ok=True)
+                reason = f"Piper no pudo sintetizar con '{name}' ({type(exc).__name__})."
+        else:
+            reason = f"Falta Piper o la voz '{name}'. Instala el perfil de voz y ejecuta gaia models install piper."
+        if _windows_fallback_ready():
+            logger.warning("%s Usando SAPI.", reason)
+            try:
+                return await asyncio.to_thread(_windows_tts, text, target)
+            except Exception as exc:
+                Path(target).unlink(missing_ok=True)
+                raise RuntimeError(f"{reason} El respaldo SAPI también falló ({type(exc).__name__}).") from exc
+        raise RuntimeError(reason)
     if engine == "edge":
         target = output_path or str(AUDIO_DIR / f"lumen_tts_{uuid.uuid4().hex}.mp3")
         try:
@@ -132,16 +142,30 @@ def speech_to_text(audio_path: str) -> str:
     if engine in {"faster-whisper", "faster_whisper", "auto"}:
         try:
             from faster_whisper import WhisperModel
-            if _faster_model is None:
-                device = os.getenv("LUMEN_STT_DEVICE", "cpu").strip()
-                compute = os.getenv("LUMEN_STT_COMPUTE_TYPE", "int8" if device == "cpu" else "float16").strip()
-                logger.info("Cargando faster-whisper '%s' device=%s compute=%s", WHISPER_MODEL, device, compute)
-                _faster_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+            with _stt_lock:
+                if _faster_model is None:
+                    device = os.getenv("LUMEN_STT_DEVICE", "cpu").strip()
+                    compute = os.getenv("LUMEN_STT_COMPUTE_TYPE", "int8" if device == "cpu" else "float16").strip()
+                    logger.info("Cargando faster-whisper '%s' device=%s compute=%s", WHISPER_MODEL, device, compute)
+                    allow_download = os.getenv("LUMEN_STT_ALLOW_DOWNLOAD", "false").casefold() in {"1", "true", "yes"}
+                    try:
+                        _faster_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute,
+                                                     local_files_only=not allow_download)
+                    except Exception as exc:
+                        if type(exc).__name__ == "LocalEntryNotFoundError":
+                            raise RuntimeError(f"Falta el modelo local {WHISPER_MODEL!r}. Prepara el modelo con gaia models install stt.") from exc
+                        raise
             segments, _info = _faster_model.transcribe(audio_path, language=language, vad_filter=True, beam_size=5)
             return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
         except ImportError:
             if engine != "auto":
                 raise RuntimeError("Falta faster-whisper. Instala el perfil Voice/Full.")
+        except TypeError as exc:
+            if "metadata_errors" in str(exc):
+                raise RuntimeError("faster-whisper es incompatible con el PyAV instalado. Repara las dependencias del perfil de voz con requirements-voice.txt.") from exc
+            if engine != "auto":
+                raise RuntimeError(f"faster-whisper falló: {exc}") from exc
+            logger.warning("faster-whisper rechazó el formato de audio; intentando Whisper legacy.")
         except Exception as exc:
             if engine != "auto":
                 raise RuntimeError(f"faster-whisper falló: {exc}") from exc

@@ -11,6 +11,9 @@ class VisualizerStream:
  async def subscribe(self):
   q=asyncio.Queue(maxsize=64); self.clients.append(q)
   try:
-   while True: yield await q.get()
+   while True:
+    try: payload = await asyncio.wait_for(q.get(), timeout=15)
+    except asyncio.TimeoutError: payload = None
+    yield payload
   finally:
    if q in self.clients:self.clients.remove(q)

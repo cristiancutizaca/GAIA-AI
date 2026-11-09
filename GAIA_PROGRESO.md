@@ -2,6 +2,8 @@
 
 Base auditada `main@83d09069df3010cb6592d971ce61ffbe2a001eb7`. Rama de trabajo `dev/gaia-memory-reflex`. La identidad canónica es **GAIA-AI 2.0.0**, release `2.0-WINDOWS-COMPLETE-RC3`, protocolo compatible `1.0-RC6` y esquema SQLite 9. Los informes que dicen RC1 o RC2 describen entregas anteriores.
 
+La rama `fix/gaia-windows-stability` continúa la estabilización del PR de memoria y Reflex. El [informe de errores](GAIA_BUG_FIX_REPORT.md) separa las reparaciones probadas en el entorno de integración de las comprobaciones físicas.
+
 ## Fase 1 · Auditoría
 
 Se inventariaron los archivos versionados, los puntos de entrada de `lumen-core/`, `lumen-pc/`, `tools/` y las suites actuales e históricas de `tests/`. Se contrastaron el README, los informes de reparación e instalación, la guía de aislamiento RC3, las guías de escritorio y voz, y los documentos de arquitectura de memoria con el código que ejecuta cada flujo.

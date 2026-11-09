@@ -39,13 +39,35 @@ def test_hotkey_parser_and_dispatch_are_behavioral():
 def test_audio_capture_finalizes_wav_and_calls_callback(monkeypatch,tmp_path):
     import desktop_shell
     if desktop_shell.np is None: pytest.skip('numpy unavailable')
-    called=[]; done=threading.Event()
+    import desktop_api
+    from types import SimpleNamespace
+    called = []
+    done = threading.Event()
+
     class Stream:
-        def stop(self): pass
-        def close(self): pass
-    cap=desktop_shell.AudioCapture(lambda p:(called.append(Path(p)),done.set()))
-    cap.recording=True; cap._stream=Stream(); cap._frames=[desktop_shell.np.ones((320,1),dtype='int16')]
-    result=cap.stop(); assert result['status']=='FINALIZED'; assert done.wait(2); assert called and called[0].is_file() and called[0].suffix=='.wav'; called[0].unlink(missing_ok=True)
+        def __init__(self, callback, **options):
+            self.callback = callback
+
+        def start(self):
+            self.callback(desktop_shell.np.ones((320, 1), dtype="int16"), 320, None, None)
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(desktop_api, "get_preferred_microphone", lambda: None)
+    monkeypatch.setattr(desktop_shell, "sd", SimpleNamespace(
+        InputStream=Stream, query_devices=lambda *_: {"name": "Fixture", "default_samplerate": 16000},
+        check_input_settings=lambda **_: None,
+    ))
+    cap = desktop_shell.AudioCapture(lambda path: (called.append(Path(path)), done.set()))
+    cap.start()
+    result = cap.stop()
+    assert result["status"] == "FINALIZED" and result["frames"] == 320
+    assert done.wait(2) and called[0].is_file()
+    called[0].unlink()
 
 def test_no_fake_pipecat_placeholder_pipeline():
     text=(ROOT/'lumen-core/gaia_platform/real_backends.py').read_text(encoding='utf-8')
@@ -66,10 +88,23 @@ def test_wakeword_is_truthful_not_jarvis_fallback():
     prep=(ROOT/'assets/wakeword/gaia_training.yml').read_text(encoding='utf-8').lower()
     assert 'target_phrase' in prep and '"gaia"' in prep
 
-def test_restart_protocol_is_supervised():
-    shell=(ROOT/'lumen-pc/desktop_shell.py').read_text(encoding='utf-8'); launcher=(ROOT/'lumen-pc/gaia_desktop_launcher.py').read_text(encoding='utf-8')
-    assert 'RESTART_EXIT_CODE = 75' in shell and 'RESTART_EXIT_CODE=75' in launcher
-    assert "rc!=RESTART_EXIT_CODE" in launcher and 'stop_process(core_proc); core_proc=start_core()' in launcher
+def test_restart_protocol_is_supervised(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import gaia_desktop_launcher as launcher
+
+    core1, core2 = object(), object()
+    started = iter((core1, core2))
+    exits = iter((launcher.RESTART_EXIT_CODE, 0))
+    stopped = []
+    monkeypatch.setattr(launcher, "SingleInstance", nullcontext)
+    monkeypatch.setattr(launcher, "healthy", lambda: False)
+    monkeypatch.setattr(launcher, "wait_healthy", lambda _: True)
+    monkeypatch.setattr(launcher, "start_core", lambda: next(started))
+    monkeypatch.setattr(launcher, "stop_process", stopped.append)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_, **__: SimpleNamespace(wait=lambda: next(exits)))
+    assert launcher.launch() == 0
+    assert stopped[0] is core1 and stopped[-1] is core2
 
 def test_doctor_and_dependency_status_execute():
     from gaia_dependencies import load, component_status

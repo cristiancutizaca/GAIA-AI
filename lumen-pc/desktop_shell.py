@@ -1,17 +1,9 @@
 """GAIA resident Desktop Shell. The UI is a client; GAIA Core remains authority."""
 from __future__ import annotations
-import ctypes, json, os, platform, sys, tempfile, threading, time, wave, webbrowser
+import ctypes, json, os, platform, re, sys, tempfile, threading, time, wave, webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
-
-# Load the project configuration BEFORE evaluating ShellConfig dataclass defaults.
-# Otherwise GAIA_WAKEWORD_ENABLED/ORB_MODE can silently ignore .env settings.
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parents[1] / '.env', override=False)
-except ImportError:
-    pass
 
 # The resident launcher imports this module directly. Load the same .env as
 # GAIA Core BEFORE ShellConfig defaults are evaluated (secret/hotkeys/wake).
@@ -50,7 +42,7 @@ try:
 except ImportError:
     sf = None
 
-CORE_DEFAULT = os.getenv("LUMEN_CORE_URL", "http://127.0.0.1:8090").rstrip("/")
+CORE_DEFAULT = os.getenv("LUMEN_CORE_URL") or f"http://127.0.0.1:{os.getenv('LUMEN_PORT', '8090')}"
 RESTART_EXIT_CODE = 75
 
 @dataclass
@@ -78,9 +70,9 @@ class DesktopEventClient:
         while not self._stop.is_set():
             try:
                 if httpx is None: raise RuntimeError("httpx unavailable")
-                timeout=httpx.Timeout(connect=5.0,read=None,write=5.0,pool=5.0)
+                timeout=httpx.Timeout(connect=5.0,read=20.0,write=5.0,pool=5.0)
                 headers={"Authorization":f"Bearer {self.secret}"} if self.secret else {}
-                with httpx.stream("GET",self.url,headers=headers,timeout=timeout) as response:
+                with httpx.stream("GET",self.url,headers=headers,timeout=timeout,trust_env=False) as response:
                     response.raise_for_status(); self.connected=True; delay=1.0; event_name="message"
                     self.on_event({"state":"IDLE","source":"event_client","connected":True})
                     for line in response.iter_lines():
@@ -92,7 +84,9 @@ class DesktopEventClient:
                             except Exception: continue
                             if isinstance(payload,dict): payload.setdefault("event",event_name); self.on_event(payload)
             except Exception as exc:
-                self.connected=False; self.on_event({"state":"OFFLINE","source":"event_client","error":type(exc).__name__})
+                self.connected=False
+                if not self._stop.is_set():
+                    self.on_event({"state":"OFFLINE","source":"event_client","error":type(exc).__name__})
                 self._stop.wait(delay); delay=min(self.backoff_max,delay*2)
     def stop(self):
         self._stop.set()
@@ -107,7 +101,13 @@ class GlobalHotkey:
     def __init__(self,on_down:Callable[[],None],on_up:Callable[[],None],key:str="Ctrl+Space",hotkey_id:int=0x4741):
         self.on_down=on_down; self.on_up=on_up; self.key=key; self.hotkey_id=hotkey_id
         self.registered=False; self._pressed=False; self._thread=None; self._thread_id=0; self._ready=threading.Event(); self._result={"status":"UNREGISTERED"}
-        self.modifiers,self.vk=self._parse(key)
+        self._stop = threading.Event()
+        self._release_thread = None
+        try:
+            self.modifiers, self.vk = self._parse(key)
+        except ValueError as exc:
+            self.vk = None
+            self._result = {"status": "HOTKEY_INVALID", "key": key, "detail": str(exc)}
     @classmethod
     def _parse(cls,key:str):
         parts=[p.strip().upper() for p in key.replace("-","+").split("+") if p.strip()]
@@ -123,121 +123,242 @@ class GlobalHotkey:
         else: raise ValueError(f"unsupported key: {last}")
         return mods,vk
     def register(self):
+        if self.vk is None: return self._result
         if platform.system()!="Windows":
-            return {"status":"PHYSICAL_WINDOWS_VALIDATION_PENDING","backend":"win32-registerhotkey","key":self.key}
+            self._result = {"status":"PHYSICAL_WINDOWS_VALIDATION_PENDING","backend":"win32-registerhotkey","key":self.key}
+            return self._result
         if self._thread and self._thread.is_alive(): return self._result
-        self._ready.clear(); self._thread=threading.Thread(target=self._message_loop,name=f"gaia-hotkey-{self.hotkey_id}",daemon=True); self._thread.start(); self._ready.wait(3)
+        self._stop.clear()
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._message_loop, name=f"gaia-hotkey-{self.hotkey_id}", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(3):
+            self._stop.set()
+            self._result = {"status": "HOTKEY_TIMEOUT", "key": self.key}
         return dict(self._result)
+
     def _message_loop(self):
-        user32=ctypes.windll.user32; kernel32=ctypes.windll.kernel32
-        self._thread_id=int(kernel32.GetCurrentThreadId())
-        ok=bool(user32.RegisterHotKey(None,self.hotkey_id,self.modifiers,self.vk))
+        from ctypes.wintypes import MSG
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32")
+        self._thread_id = int(kernel32.GetCurrentThreadId())
+        ok = bool(user32.RegisterHotKey(None, self.hotkey_id, self.modifiers | 0x4000, self.vk))
         if not ok:
-            self.registered=False; self._result={"status":"HOTKEY_CONFLICT","backend":"RegisterHotKey","key":self.key,"winerror":int(kernel32.GetLastError())}; self._ready.set(); return
-        self.registered=True; self._result={"status":"REGISTERED","backend":"RegisterHotKey","key":self.key}; self._ready.set()
-        class MSG(ctypes.Structure):
-            _fields_=[("hwnd",ctypes.c_void_p),("message",ctypes.c_uint),("wParam",ctypes.c_size_t),("lParam",ctypes.c_ssize_t),("time",ctypes.c_uint),("pt_x",ctypes.c_long),("pt_y",ctypes.c_long),("lPrivate",ctypes.c_uint)]
-        msg=MSG()
-        while user32.GetMessageW(ctypes.byref(msg),None,0,0)>0:
-            if msg.message==self.WM_HOTKEY and int(msg.wParam)==self.hotkey_id:
-                if not self._pressed:
-                    self._pressed=True
-                    try: self.on_down()
-                    except Exception: pass
-                    threading.Thread(target=self._watch_release,name=f"gaia-hotkey-release-{self.hotkey_id}",daemon=True).start()
-        user32.UnregisterHotKey(None,self.hotkey_id); self.registered=False; self._pressed=False
+            self._result = {"status": "HOTKEY_CONFLICT", "backend": "RegisterHotKey",
+                            "key": self.key, "winerror": ctypes.get_last_error()}
+            self._ready.set()
+            return
+        try:
+            if self._stop.is_set():
+                return
+            self.registered = True
+            self._result = {"status": "REGISTERED", "backend": "RegisterHotKey", "key": self.key}
+            self._ready.set()
+            msg = MSG()
+            while not self._stop.is_set() and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == self.WM_HOTKEY and int(msg.wParam) == self.hotkey_id and not self._pressed:
+                    self._pressed = True
+                    self.on_down()
+                    self._release_thread = threading.Thread(target=self._watch_release,
+                                                           name=f"gaia-hotkey-release-{self.hotkey_id}", daemon=True)
+                    self._release_thread.start()
+        finally:
+            user32.UnregisterHotKey(None, self.hotkey_id)
+            self.registered = self._pressed = False
+
     def _watch_release(self):
         if platform.system()!="Windows": return
         user32=ctypes.windll.user32
         # RegisterHotKey has no key-up event; polling the primary key preserves hold-to-talk semantics.
-        while self.registered and (user32.GetAsyncKeyState(self.vk)&0x8000): time.sleep(0.015)
-        if self._pressed:
+        while self.registered and self._keys_down(user32) and not self._stop.wait(.015):
+            pass
+        if self._pressed and not self._stop.is_set():
             self._pressed=False
             try: self.on_up()
             except Exception: pass
+    def _keys_down(self, user32):
+        held = lambda key: bool(user32.GetAsyncKeyState(key) & 0x8000)
+        return held(self.vk) and all(
+            not self.modifiers & flag or any(held(key) for key in keys)
+            for flag, keys in ((1, (0x12,)), (2, (0x11,)), (4, (0x10,)), (8, (0x5B, 0x5C)))
+        )
+
     def dispatch(self,event:str):
         # deterministic test hook; never pretends to register with the OS.
         if event=="down" and not self._pressed: self._pressed=True; self.on_down(); return True
         if event=="up" and self._pressed: self._pressed=False; self.on_up(); return True
         return False
     def unregister(self):
+        self._stop.set()
         if platform.system()=="Windows" and self._thread_id:
             try: ctypes.windll.user32.PostThreadMessageW(self._thread_id,self.WM_QUIT,0,0)
             except Exception: pass
         if self._thread and self._thread is not threading.current_thread(): self._thread.join(timeout=2)
+        if self._release_thread and self._release_thread is not threading.current_thread():
+            self._release_thread.join(timeout=.2)
         self._thread=None; self._thread_id=0; self.registered=False; self._pressed=False
 
 class AudioCapture:
-    """Hold-to-talk capture. stop() finalizes a WAV and invokes on_audio exactly once."""
-    def __init__(self,on_audio:Callable[[Path],Any],sample_rate:int=16000):
-        self.on_audio=on_audio; self.sample_rate=sample_rate; self.recording=False; self._stream=None; self._frames=[]; self._lock=threading.Lock()
+    """One input stream per press. Cancel closes it without creating a WAV."""
+
+    def __init__(self, on_audio: Callable[[Path], Any], sample_rate: int = 16000):
+        self.on_audio = on_audio
+        self.sample_rate = sample_rate
+        self.recording = False
+        self._stream = None
+        self._frames = []
+        self._lock = threading.Lock()
+        self._frame_count = 0
+
     def start(self):
-        if sd is None or np is None: raise RuntimeError("sounddevice/numpy unavailable")
-        if self.recording: return {"status":"ALREADY_CAPTURING"}
-        with self._lock: self._frames=[]
-        def callback(indata,frames,time_info,status):
-            if self.recording:
-                with self._lock: self._frames.append(indata.copy())
-        self._stream=sd.InputStream(samplerate=self.sample_rate,channels=1,dtype="int16",callback=callback)
-        self._stream.start(); self.recording=True; return {"status":"CAPTURING","sample_rate":self.sample_rate}
+        if sd is None or np is None:
+            raise RuntimeError("Falta sounddevice o NumPy en el entorno del escritorio.")
+        if self.recording:
+            return {"status": "ALREADY_CAPTURING"}
+        from audio_input import input_settings
+        from desktop_api import get_preferred_microphone
+        options, name = input_settings(sd, get_preferred_microphone(), self.sample_rate, allow_native=True)
+        self._rate = options["samplerate"]
+        # The held key may outlive the max duration. Cap buffered audio even then.
+        limit = self._rate * 30
+
+        def callback(indata, frames, time_info, status):
+            with self._lock:
+                remaining = limit - self._frame_count
+                if self.recording and remaining > 0:
+                    block = indata[:remaining].copy()
+                    self._frames.append(block)
+                    self._frame_count += len(block)
+
+        self._stream = sd.InputStream(**options, callback=callback)
+        self.recording = True
+        self._started = time.perf_counter()
+        try:
+            self._stream.start()
+        except Exception:
+            self.cancel()
+            raise
+        return {"status": "CAPTURING", "sample_rate": self._rate, "device_name": name}
+
+    def _close(self):
+        with self._lock:
+            self.recording = False
+            frames, self._frames = self._frames, []
+            self._frame_count = 0
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+            finally:
+                stream.close()
+        return frames
+
+    def cancel(self):
+        self._close()
+
     def stop(self):
         if not self.recording:
-            return {"status":"IDLE"}
-        self.recording=False
-        stream=self._stream; self._stream=None
+            return {"status": "IDLE"}
+        frames = self._close()
+        if not frames:
+            return {"status": "EMPTY"}
+        audio = np.concatenate(frames, axis=0)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            path = Path(tmp.name)
         try:
-            if stream is not None: stream.stop(); stream.close()
-        finally:
-            with self._lock:
-                frames=list(self._frames); self._frames=[]
-        if not frames: return {"status":"EMPTY"}
-        audio=np.concatenate(frames,axis=0).astype("int16",copy=False)
-        with tempfile.NamedTemporaryFile(suffix=".wav",delete=False) as tmp: path=Path(tmp.name)
-        with wave.open(str(path),"wb") as wav:
-            wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(self.sample_rate); wav.writeframes(audio.tobytes())
-        threading.Thread(target=self.on_audio,args=(path,),name="gaia-captured-audio",daemon=True).start()
-        return {"status":"FINALIZED","path":str(path),"frames":int(audio.shape[0])}
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(self._rate)
+                wav.writeframes(audio.tobytes())
+            self.on_audio(path)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return {"status": "FINALIZED", "path": str(path), "frames": int(audio.shape[0]),
+                "capture_ms": round((time.perf_counter() - self._started) * 1000, 1)}
+
 
 class AudioPlayer:
-    """Single-owner cancellable local player using soundfile + sounddevice."""
-    def __init__(self): self._stop=threading.Event(); self._thread=None; self._lock=threading.Lock()
+    """Plays one stream at a time, with cancellable synthesis and short output blocks."""
+
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+
     @property
-    def playing(self): return bool(self._thread and self._thread.is_alive())
-    def play(self,path:Path,on_done:Callable[[],None]|None=None,on_error:Callable[[str],None]|None=None):
-        if sd is None or sf is None: raise RuntimeError("sounddevice/soundfile unavailable")
-        self.stop(); self._stop.clear()
+    def playing(self):
+        return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
+    def play(self, path: Path, on_done=None, on_error=None, on_start=None):
+        self.play_segments(lambda _cancelled: iter((path,)), on_done, on_error, on_start)
+
+    def play_segments(self, paths, on_done=None, on_error=None, on_start=None):
+        if sd is None or sf is None:
+            raise RuntimeError("Falta sounddevice o soundfile para reproducir el audio.")
+        self.stop()
+        cancelled = self._stop = threading.Event()
+
         def worker():
+            first = True
             try:
-                data,rate=sf.read(str(path),dtype="float32",always_2d=True)
-                if self._stop.is_set(): return
-                sd.play(data,rate,blocking=False)
-                while not self._stop.wait(.03):
+                for path in paths(cancelled):
                     try:
-                        stream=sd.get_stream()
-                        if not getattr(stream,"active",False): break
-                    except Exception: break
-                if self._stop.is_set(): sd.stop()
-                elif on_done: on_done()
+                        if cancelled.is_set():
+                            break
+                        with sf.SoundFile(str(path)) as audio:
+                            with sd.OutputStream(samplerate=audio.samplerate, channels=audio.channels,
+                                                 dtype="float32") as output:
+                                frames = max(1, audio.samplerate // 40)
+                                while not cancelled.is_set():
+                                    block = audio.read(frames, dtype="float32", always_2d=True)
+                                    if not len(block):
+                                        break
+                                    output.write(block)
+                                    if first:
+                                        first = False
+                                        if on_start and not cancelled.is_set():
+                                            on_start()
+                    finally:
+                        from desktop_api import release_temp
+                        release_temp(path)
+                if not cancelled.is_set():
+                    if first:
+                        raise RuntimeError("El motor no entregó audio reproducible.")
+                    if on_done:
+                        on_done()
             except Exception as exc:
-                if on_error: on_error(f"{type(exc).__name__}: {exc}")
-            finally:
-                try: path.unlink(missing_ok=True)
-                except Exception: pass
-        self._thread=threading.Thread(target=worker,name="gaia-audio-player",daemon=True); self._thread.start()
+                if on_error and not cancelled.is_set():
+                    on_error(str(exc))
+
+        self._thread = threading.Thread(target=worker, name="gaia-audio-player", daemon=True)
+        self._thread.start()
+
     def stop(self):
         self._stop.set()
-        if sd is not None:
-            try: sd.stop()
-            except Exception: pass
-        t=self._thread
-        if t and t is not threading.current_thread(): t.join(timeout=1)
-        self._thread=None
+
+
+def _speech_segments(text: str):
+    """Keep complete, grounded sentences together and limit each TTS request."""
+    text = text.strip()[:1500]
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", text):
+        remaining = sentence.strip()
+        while remaining:
+            end = len(remaining)
+            if end > 320:
+                end = remaining.rfind(" ", 1, 321)
+                if end < 1:
+                    end = 320
+            yield remaining[:end].strip()
+            remaining = remaining[end:].lstrip()
+
 
 
 class BargeInMonitor:
     """Local Silero monitor active only while GAIA is speaking."""
     def __init__(self,on_barge:Callable[[],None],sample_rate:int=16000):
         self.on_barge=on_barge; self.sample_rate=sample_rate; self._stop=threading.Event(); self._thread=None
+        self._vad_model = None
     @property
     def running(self): return bool(self._thread and self._thread.is_alive())
     def start(self):
@@ -247,8 +368,15 @@ class BargeInMonitor:
         try:
             import torch
             from silero_vad import load_silero_vad, VADIterator
-            vad=VADIterator(load_silero_vad(),sampling_rate=self.sample_rate,threshold=float(os.getenv("GAIA_BARGE_IN_THRESHOLD","0.7")),min_silence_duration_ms=150)
-            with sd.InputStream(samplerate=self.sample_rate,channels=1,dtype="int16",blocksize=512) as stream:
+            if self._vad_model is None:
+                self._vad_model = load_silero_vad()
+            vad=VADIterator(self._vad_model,sampling_rate=self.sample_rate,threshold=float(os.getenv("GAIA_BARGE_IN_THRESHOLD","0.7")),min_silence_duration_ms=150)
+            from audio_input import input_settings
+            from desktop_api import get_preferred_microphone
+            options, _ = input_settings(sd, get_preferred_microphone(), self.sample_rate)
+            if self._stop.is_set():
+                return
+            with sd.InputStream(**options, blocksize=512) as stream:
                 while not self._stop.is_set():
                     data,_overflowed=stream.read(512); chunk=data[:,0]
                     event=vad(torch.from_numpy(chunk.astype(np.float32)/32768.0),return_seconds=True)
@@ -262,12 +390,13 @@ class BargeInMonitor:
     def stop(self):
         self._stop.set(); t=self._thread
         if t and t is not threading.current_thread():t.join(timeout=.7)
-        self._thread=None
+        if not t or not t.is_alive():
+            self._thread=None
 
 if PYSIDE_AVAILABLE:
     class QtBridge(QObject):
-        core_event=Signal(object); wake_audio=Signal(object); voice_result=Signal(object); voice_error=Signal(str)
-        quick_result=Signal(object); quick_error=Signal(str); hotkey_action=Signal(str); playback_done=Signal(); playback_error=Signal(str); barge_in=Signal()
+        core_event=Signal(object); wake_audio=Signal(object); voice_result=Signal(object); voice_error=Signal(object)
+        quick_result=Signal(object); quick_error=Signal(str); hotkey_action=Signal(str); playback_done=Signal(int); playback_started=Signal(int, float); barge_in=Signal()
 else:
     class QtBridge: pass
 
@@ -283,8 +412,10 @@ class PermissionDialog(QDialog if PYSIDE_AVAILABLE else object):
             b=QPushButton(label); b.clicked.connect(lambda _=False,d=decision:self._finish(d)); layout.addWidget(b)
     def _finish(self,decision): self.decide(str(self.request.get("request_id","")),decision); self.accept()
 
-class DesktopShell:
+class DesktopShell(QObject):
     def __init__(self,config:ShellConfig|None=None,api=None):
+        super().__init__()
+        self._voice_epoch = 0
         self.config=config or ShellConfig(); self.api=api; self.running=False; self.qt=False; self.app=None; self.tray=None; self.orb=None; self.wake=None
         self.quick_command_window=None; self.panel=None; self.permission_dialog=None; self.state="SLEEPING"; self._microphone_on=self.config.microphone; self._shutdown=threading.Event(); self.bridge=None
         self.ptt_hotkey=GlobalHotkey(lambda:self._queue_hotkey("ptt_down"),lambda:self._queue_hotkey("ptt_up"),self.config.ptt_hotkey,0x4741)
@@ -313,10 +444,26 @@ class DesktopShell:
     def _on_core_event_gui(self,event):
         if event.get("source")=="tts_error" and self.panel:
             self.panel.show_feedback(str(event.get("message", "TTS no disponible")))
-        state=str(event.get("state") or event.get("event_type") or "IDLE").upper().replace(".","_")
+        source = event.get("source")
+        if self._shutdown.is_set():
+            return
+        if source == "event_client":
+            if self.panel:
+                self.panel.set_systems(core="SSE conectado" if event.get("connected") else "SSE desconectado")
+            return
+        if source == "vision_progress":
+            if self.panel:
+                self.panel.show_feedback(str(event["message"]))
+            return
+        state=str(event.get("state") or event.get("event_type") or "").upper().replace(".","_")
         mapping={"USING_TOOL":"EXECUTING","SEARCHING_MEMORY":"THINKING","CORE_READY":"IDLE","CONNECTED":"IDLE"}
         allowed={"IDLE","LISTENING","TRANSCRIBING","THINKING","PLANNING","BROWSING","CODING","EXECUTING","SPEAKING","WAITING_PERMISSION","INTERRUPTED","SAFE_MODE","ERROR","OFFLINE"}
-        self._set_state(mapping.get(state,state if state in allowed else "IDLE"))
+        if state not in allowed and state not in mapping:
+            return
+        if self.state in {"LISTENING", "TRANSCRIBING", "SPEAKING", "ERROR"} and state != "WAITING_PERMISSION":
+            if not (source == "wake_session" and self.state == "LISTENING" and not self.capture.recording):
+                return
+        self._set_state(mapping.get(state, state))
         if state=="WAITING_PERMISSION": self._show_permission(event.get("metadata") or event)
         if state=="IDLE" and self.config.orb_mode=="wake_only" and not self.capture.recording and not self.player.playing: self._hide_orb()
     def _icon(self):
@@ -324,9 +471,20 @@ class DesktopShell:
     def start(self,hidden=True):
         if not PYSIDE_AVAILABLE: raise RuntimeError("PySide6 is required for resident shell; install the Desktop/Full profile")
         self.app=QApplication.instance() or QApplication(sys.argv); self.app.setQuitOnLastWindowClosed(False); self.qt=True; shell=self
-        self.bridge=QtBridge(); self.bridge.core_event.connect(self._on_core_event_gui); self.bridge.wake_audio.connect(self._handle_wake_audio_gui)
-        self.bridge.voice_result.connect(self._handle_voice_result_gui); self.bridge.voice_error.connect(self._handle_error_gui); self.bridge.quick_result.connect(self._handle_quick_result_gui); self.bridge.quick_error.connect(self._handle_error_gui)
-        self.bridge.hotkey_action.connect(self._handle_hotkey_gui); self.bridge.playback_done.connect(self._playback_done_gui); self.bridge.playback_error.connect(self._handle_error_gui); self.bridge.barge_in.connect(self._barge_in_gui)
+        self.bridge = QtBridge()
+        for signal, handler in (
+            (self.bridge.core_event, self._on_core_event_gui),
+            (self.bridge.wake_audio, self._handle_wake_audio_gui),
+            (self.bridge.voice_result, self._handle_voice_result_gui),
+            (self.bridge.voice_error, self._handle_voice_error_gui),
+            (self.bridge.quick_result, self._handle_quick_result_gui),
+            (self.bridge.quick_error, self._handle_error_gui),
+            (self.bridge.hotkey_action, self._handle_hotkey_gui),
+            (self.bridge.playback_done, self._playback_done_gui),
+            (self.bridge.playback_started, self._playback_started_gui),
+            (self.bridge.barge_in, self._barge_in_gui),
+        ):
+            signal.connect(handler, Qt.QueuedConnection)
         from gaia_hologram import GaiaHologram
         from gaia_panel import GaiaControlPanel
         self.orb=GaiaHologram(self.config.orb_size)
@@ -338,6 +496,7 @@ class DesktopShell:
         self.panel.send_requested.connect(self._submit_text)
         self.panel.vision_requested.connect(self._request_screen)
         self.panel.mic_requested.connect(self.toggle_mic)
+        self.panel.mic_selection_requested.connect(self.choose_microphone)
         self.panel.wake_requested.connect(self.toggle_wake)
         self.panel.refresh_requested.connect(self.refresh_diagnostics)
         self.panel.ptt_requested.connect(self.push_to_talk)
@@ -348,7 +507,9 @@ class DesktopShell:
         self.panel.memory_requested.connect(self.show_memory)
         self.tray=QSystemTrayIcon(self.app); self.tray.setIcon(self._icon()); self.tray.setToolTip("GAIA — Resident Desktop Assistant"); menu=QMenu()
         for title,fn in (("Open GAIA",self.show_quick),("Quick Command",self.show_quick),("Open Dashboard",self.open_dashboard),("Wake word ON/OFF",self.toggle_wake),("Microphone ON/OFF",self.toggle_mic),("Push-to-talk",self.push_to_talk),("Status",self.show_status),("Restart GAIA",self.restart),("Exit GAIA",self.stop)): self._add_action(menu,title,fn)
-        self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); self.ptt_hotkey.register(); self.quick_hotkey.register()
+        self.tray.setContextMenu(menu); self.tray.show(); self.running=True; self.events.start(); ptt_status = self.ptt_hotkey.register(); self.quick_hotkey.register()
+        if ptt_status["status"] in {"HOTKEY_CONFLICT", "HOTKEY_INVALID", "HOTKEY_TIMEOUT"}:
+            self.panel.show_feedback(f"Atajo {self.config.ptt_hotkey} no disponible ({ptt_status['status']}). Usa Hablar o cambia GAIA_PUSH_TO_TALK.")
         if self.config.wake_word and self._microphone_on: self._start_wake_word()
         if self.config.orb_mode == "always_visible": self._show_orb()
         self.refresh_diagnostics()
@@ -363,26 +524,88 @@ class DesktopShell:
         if self.orb and self.config.orb_mode!="hidden": self.orb.show(); self.orb.raise_()
     def _hide_orb(self):
         if self.orb and self.config.orb_mode!="always_visible": self.orb.hide()
-    def _on_wake_detected(self,audio_path):
-        if self.bridge is not None: self.bridge.wake_audio.emit(Path(audio_path))
-    def _handle_wake_audio_gui(self,path):
-        self._show_orb();self._set_state("TRANSCRIBING")
-        if self.panel:self.panel.show_feedback("Transcribiendo y enviando la orden de voz…")
-        threading.Thread(target=self._send_voice_worker,args=(Path(path),),name="gaia-voice-request",daemon=True).start()
-    def _send_voice_worker(self,path):
+    def _on_wake_detected(self, audio_path):
+        path = Path(audio_path)
+        if self.bridge is not None and self._microphone_on and not self._shutdown.is_set():
+            self.bridge.wake_audio.emit(path)
+        else:
+            path.unlink(missing_ok=True)
+    def _handle_wake_audio_gui(self, path):
+        if not self._microphone_on or self._shutdown.is_set() or self.capture.recording:
+            Path(path).unlink(missing_ok=True)
+            return
+        self._voice_epoch += 1
+        self._show_orb()
+        self._set_state("TRANSCRIBING")
+        if self.panel:
+            self.panel.show_feedback("Enviando el WAV al Core para transcribir y preparar la respuesta…")
+        threading.Thread(target=self._send_voice_worker, args=(Path(path), self._voice_epoch),
+                         name="gaia-voice-request", daemon=True).start()
+
+    def _send_voice_worker(self, path, epoch):
+        started = time.perf_counter()
         try:
-            if not self.api: raise RuntimeError("Core unavailable")
-            data=self.api.send_voice(path)
-            if data and data.get("audio_url"):
-                data=dict(data); data["_audio_path"]=self.api.download_audio(data["audio_url"])
-            if self.bridge is not None: self.bridge.voice_result.emit(data or {})
+            if not self.api:
+                raise RuntimeError("El Core de GAIA no está disponible.")
+            if epoch != self._voice_epoch or self._shutdown.is_set():
+                return
+            data = dict(self.api.send_voice(path, synthesize_audio=False) or {})
+            if epoch != self._voice_epoch or self._shutdown.is_set():
+                return
+            if data.get("audio_url"):  # compatibility with older Core builds
+                try:
+                    data["_audio_path"] = self.api.download_audio(data["audio_url"])
+                except Exception as exc:
+                    data["tts_error"] = f"No se pudo descargar el audio: {exc}"
+            data.update(_voice_epoch=epoch, _voice_started=started)
+            if self.bridge:
+                self.bridge.voice_result.emit(data)
+            elif data.get("_audio_path"):
+                from desktop_api import release_temp
+                release_temp(data["_audio_path"])
         except Exception as exc:
-            if self.bridge is not None: self.bridge.voice_error.emit(f"{type(exc).__name__}: {exc}")
+            payload = getattr(exc, "payload", {})
+            if self.bridge:
+                self.bridge.voice_error.emit({**payload, "_voice_epoch": epoch,
+                                              "detail": str(payload.get("detail") or exc)})
         finally:
-            try: path.unlink(missing_ok=True)
-            except Exception: pass
+            path.unlink(missing_ok=True)
+
+    def _handle_voice_error_gui(self, error):
+        if self._shutdown.is_set():
+            return
+        if not isinstance(error, dict):
+            self._handle_error_gui(str(error))
+            return
+        if error.get("_voice_epoch", self._voice_epoch) != self._voice_epoch:
+            return
+        stage = error.get("stage")
+        message = str(error.get("detail") or "No se pudo completar la solicitud de voz.")
+        if stage == "chat" and self.panel:
+            self.panel.add_message("Tú (voz)", error.get("user_text", ""))
+            message = f"Transcripción correcta. Falló el modelo de conversación: {message}"
+        elif stage == "speech":
+            self.barge.stop()
+            message = f"La respuesta escrita está disponible. Falló la síntesis o la reproducción: {message}"
+        elif stage == "wake":
+            self.config.wake_word = False
+        else:
+            message = f"Envío o transcripción de audio: {message}"
+        self._handle_error_gui(message)
+        if self.wake:
+            self.wake.end_session()
+        self._resume_wake()
+
     def _handle_voice_result_gui(self,data):
-        if isinstance(data,dict) and data.get("operator_requested"):
+        if not isinstance(data, dict):
+            return
+        epoch = data.get("_voice_epoch", self._voice_epoch)
+        if epoch != self._voice_epoch or self._shutdown.is_set() or self.capture.recording:
+            if data.get("_audio_path"):
+                from desktop_api import release_temp
+                release_temp(data["_audio_path"])
+            return
+        if data.get("operator_requested"):
             user_text=str(data.get("user_text", "GAIA, diagnostica mi PC"))
             if self.panel:self.panel.add_message("Tú (voz)",user_text)
             self._submit_text(user_text, display_user=False, voice_reply=True)
@@ -396,7 +619,7 @@ class DesktopShell:
         if isinstance(data,dict) and data.get('kind') in {'action', 'plan'} and not data.get('local_result'):
             if self.panel and data.get('user_text'):
                 self.panel.add_message('Tú (voz)',str(data['user_text']))
-            self._show_action_proposal(data)
+            self._show_action_proposal(data, speak=True)
             return
         if isinstance(data,dict):
             user_text=str(data.get("user_text", "")).strip()
@@ -405,29 +628,70 @@ class DesktopShell:
             if response and self.panel:self.panel.add_message("GAIA",response)
             if data.get("tts_error") and self.panel:
                 self.panel.show_feedback("La respuesta de texto funciona, pero la voz falló: " + str(data["tts_error"]))
-        audio_path=data.get("_audio_path") if isinstance(data,dict) else None
-        if audio_path:
-            self._set_state("SPEAKING")
+            elif response and data.get("tts_enabled") is False and self.panel:
+                self.panel.show_feedback("Síntesis desactivada mediante LUMEN_TTS_ENABLED.")
+        audio_path = data.get("_audio_path")
+        response = str(data.get("_speech_text") or data.get("response", "")).strip()
+        capability = str((data.get("active_context") or {}).get("capability") or "")
+        if audio_path or (response and data.get("tts_enabled") and not data.get("tts_error")):
+            started = data.get("_voice_started", time.perf_counter())
             try:
-                self.player.play(Path(audio_path),lambda:self.bridge.playback_done.emit(),lambda e:self.bridge.playback_error.emit(e))
-                self.barge.start()
-            except Exception as exc: self._handle_error_gui(str(exc))
+                on_start = lambda: self.bridge.playback_started.emit(epoch, (time.perf_counter() - started) * 1000)
+                on_done = lambda: self.bridge.playback_done.emit(epoch)
+                on_error = lambda message: self.bridge.voice_error.emit(
+                    {"_voice_epoch": epoch, "stage": "speech", "detail": message}
+                )
+                self._set_state("THINKING")
+                if self.panel:
+                    self.panel.show_feedback("Respuesta disponible. Preparando audio…")
+                if audio_path:
+                    self.player.play(Path(audio_path), on_done, on_error, on_start)
+                else:
+                    def paths(cancelled):
+                        for segment in _speech_segments(response):
+                            if cancelled.is_set():
+                                return
+                            try:
+                                yield self.api.request_tts(segment, local_only=bool(
+                                    data.get("_local_speech") or capability.startswith("memory.")
+                                ))
+                            except Exception as exc:
+                                raise RuntimeError(f"Síntesis de audio — {exc}") from exc
+                    self.player.play_segments(paths, on_done, on_error, on_start)
+            except Exception as exc:
+                if audio_path:
+                    from desktop_api import release_temp
+                    release_temp(audio_path)
+                self._handle_voice_error_gui({"stage": "speech", "detail": str(exc)})
         else:
-            response=str(data.get("response","")).strip() if isinstance(data,dict) else ""
-            capability = str((data.get("active_context") or {}).get("capability") or "") if isinstance(data, dict) else ""
             if response and self.tray and not capability.startswith("memory."):
                 self.tray.showMessage("GAIA", response[:300])
             self._continue_conversation_gui()
+
+    def _playback_started_gui(self, epoch, elapsed_ms):
+        if epoch != self._voice_epoch or self._shutdown.is_set():
+            return
+        self._set_state("SPEAKING")
+        if self.panel:
+            self.panel.show_feedback(f"Primer bloque enviado al audio en {elapsed_ms:.0f} ms después de la captura.")
+        if (self._microphone_on and self.player.playing and (self.wake is None or self.wake.session_active)
+                and os.getenv("GAIA_BARGE_IN_ENABLED", "true").casefold() in {"1", "true", "yes"}):
+            self.barge.start()
+
     def _continue_conversation_gui(self):
         if self.wake and self._microphone_on and self.wake.session_active:
             self._show_orb(); self._set_state("LISTENING")
             if self.wake.request_next_turn(): return
-        self._set_state("IDLE")
+        self._set_state("IDLE" if self._microphone_on else "SLEEPING")
+        self._resume_wake()
         if self.config.orb_mode=="wake_only": self._hide_orb()
-    def _playback_done_gui(self):
-        self.barge.stop(); self._continue_conversation_gui()
+    def _playback_done_gui(self, epoch):
+        if epoch == self._voice_epoch and not self._shutdown.is_set():
+            self.barge.stop()
+            self._continue_conversation_gui()
     def _barge_in_gui(self):
         if not self.player.playing:return
+        self._voice_epoch += 1
         self.barge.stop(); self.player.stop(); self._set_state("INTERRUPTED")
         try:
             if self.api and hasattr(self.api,"cancel_generation"): threading.Thread(target=self.api.cancel_generation,daemon=True).start()
@@ -448,13 +712,14 @@ class DesktopShell:
     def _start_wake_word(self):
         from wake_word import WakeWordListener
         if self.wake is None:
-            listener=WakeWordListener(on_wake=self._on_wake_detected,on_session_end=self._on_wake_session_end)
+            listener = WakeWordListener(on_wake=self._on_wake_detected, on_session_end=self._on_wake_session_end,
+                                        on_error=lambda message: self.bridge.voice_error.emit({"stage": "wake", "detail": message}))
             info=listener.health()
             if info.get("status") != "GAIA_MODEL_READY":
                 self.config.wake_word=False
-                self._handle_error_gui("Wake-word no disponible: falta el modelo personalizado gaia.onnx. "
-                                       "Puedes usar Ctrl+Espacio o el botón Hablar. "
-                                       "Estado: " + str(info.get("status")))
+                self._handle_error_gui(f"Activación por palabra — {info.get('status')}. "
+                                       f"{info.get('required') or info.get('error') or 'Revisa gaia.onnx.'} "
+                                       "Puedes usar Ctrl+Espacio o el botón Hablar.")
                 return
             self.wake=listener
             self.wake.start()
@@ -466,34 +731,90 @@ class DesktopShell:
     def toggle_mic(self,*_):
         self._microphone_on=not self._microphone_on
         if not self._microphone_on:
+            self._voice_epoch += 1
             if self.wake: self.wake.stop(); self.wake=None
-            if self.capture.recording: self.capture.stop()
-            self.player.stop(); self._set_state("SLEEPING")
+            try:
+                self.capture.cancel()
+            except Exception as exc:
+                self._handle_error_gui(f"No se pudo cerrar el micrófono: {exc}")
+            self.barge.stop()
+            self.player.stop()
+            self._set_state("SLEEPING")
         else:
             self._set_state("IDLE")
             if self.config.wake_word: self._start_wake_word()
         if self.panel:self.panel.set_systems(voice="Micrófono activo" if self._microphone_on else "Micrófono desactivado")
+    def choose_microphone(self):
+        if self.capture.recording:
+            self.panel.show_feedback("Detén la grabación antes de cambiar de micrófono.")
+            return
+        from PySide6.QtWidgets import QInputDialog
+        from desktop_api import select_microphone, set_preferred_microphone
+        try:
+            devices = select_microphone()
+            if not devices:
+                self.panel.show_feedback("Windows no devolvió entradas de audio disponibles.")
+                return
+            labels = ["Micrófono predeterminado de Windows"] + [
+                f"{item['name']} (entrada {item['index']})" for item in devices
+            ]
+            selected = next((i for i, item in enumerate(devices, 1) if item["preferred"]), 0)
+            label, confirmed = QInputDialog.getItem(self.panel, "Micrófono de GAIA",
+                                                    "Dispositivo de entrada", labels, selected, False)
+            if not confirmed:
+                return
+            index = labels.index(label)
+            set_preferred_microphone(devices[index - 1]["index"] if index else None)
+            self.barge.stop()
+            if self.wake:
+                self.wake.stop()
+                self.wake = None
+            self._resume_wake()
+            self.panel.show_feedback(f"Entrada seleccionada — {label}")
+        except Exception as exc:
+            self._handle_error_gui(f"Selección de micrófono: {exc}")
+
     def _handle_hotkey_gui(self,action):
         if action=="quick": self.show_quick()
         elif action=="ptt_down": self._ptt_down()
         elif action=="ptt_up": self._ptt_up()
     def _ptt_down(self):
-        if not self._microphone_on or self.capture.recording: return
+        if not self._microphone_on or self.capture.recording:
+            return
+        self._voice_epoch += 1
         self.player.stop()
+        self.barge.stop()
         if self.wake:
-            try:self.wake.begin_session()
-            except Exception:pass
+            self.wake.stop()
+            self.wake = None
         try:
-            if self.api and hasattr(self.api,"cancel_generation"): threading.Thread(target=self.api.cancel_generation,daemon=True).start()
-        except Exception: pass
-        self._show_orb(); self._set_state("LISTENING")
-        if self.panel:self.panel.show_feedback("Grabando… Suelta Ctrl+Espacio para enviar.")
-        try: self.capture.start()
-        except Exception as exc: self._handle_error_gui(str(exc))
+            info = self.capture.start()
+            self._show_orb()
+            self._set_state("LISTENING")
+            if self.panel:
+                self.panel.show_feedback(f"Grabando con {info['device_name']}. Suelta {self.config.ptt_hotkey} o pulsa Detener.")
+        except Exception as exc:
+            self._handle_error_gui(f"Captura de micrófono: {exc}")
+            self._resume_wake()
+
     def _ptt_up(self):
-        if not self.capture.recording: return
-        self._set_state("TRANSCRIBING"); result=self.capture.stop()
-        if result.get("status") in {"EMPTY","UNAVAILABLE"}: self._handle_error_gui("No audio captured")
+        if not self.capture.recording:
+            return
+        try:
+            result = self.capture.stop()
+            if result["status"] == "EMPTY":
+                self._handle_error_gui("El micrófono abrió, pero no entregó audio. Mantén el atajo mientras hablas.")
+                self._resume_wake()
+            elif self.panel:
+                self.panel.show_feedback(f"Audio capturado en {result['capture_ms']:.0f} ms. Enviando al Core…")
+        except Exception as exc:
+            self._handle_error_gui(f"No se pudo preparar el WAV: {exc}")
+            self._resume_wake()
+
+    def _resume_wake(self):
+        if self.config.wake_word and self._microphone_on and not self._shutdown.is_set():
+            self._start_wake_word()
+
     def push_to_talk(self,*_):
         # Menu action is a toggle; global hotkey remains hold-to-talk.
         self._ptt_up() if self.capture.recording else self._ptt_down()
@@ -527,6 +848,7 @@ class DesktopShell:
         threading.Thread(target=worker,name="gaia-quick-command",daemon=True).start()
 
     def _run_local_diagnostic(self,text, *, voice_reply=False):
+        epoch = self._voice_epoch
         self._show_orb(); self._set_state('EXECUTING')
         if self.panel:
             self.panel.set_busy(True)
@@ -537,7 +859,7 @@ class DesktopShell:
                 result = execute_diagnostic(text)
                 if self.bridge:self.bridge.quick_result.emit(result)
                 if voice_reply and result.get('state') == 'SUCCEEDED':
-                    self._speak_text_worker(str(result.get('response', ''))[:650])
+                    self._speak_text_worker(str(result.get('response', ''))[:650], epoch=epoch)
             except Exception as exc:
                 if self.bridge:self.bridge.quick_error.emit('Diagnóstico local: '+str(exc)[:400])
         threading.Thread(target=worker,daemon=True,name='gaia-desktop-diagnostic').start()
@@ -582,7 +904,8 @@ class DesktopShell:
             info=result.get("vision") or {}
             if self.panel:
                 self.panel.set_systems(core=result.get("core","Desconocido"),chat=result.get("chat","Desconocido"),
-                    vision=info.get("status","Desconocido"), voice=result.get("voice","PTT (wake opcional)"))
+                    vision=info.get("status","Desconocido"), voice=result.get("voice","PTT (wake opcional)"),
+                    memory=result.get("memory", "Sin verificar"))
                 if result.get("chat_hint"):
                     self.panel.show_feedback("Chat: " + str(result["chat_hint"]))
                 elif info.get("status") != "READY":
@@ -597,7 +920,7 @@ class DesktopShell:
         if self.tray and not capability.startswith("memory."):
             self.tray.showMessage("GAIA", response[:300])
 
-    def _show_action_proposal(self, contract):
+    def _show_action_proposal(self, contract, *, speak=False):
         """Never execute PC actions solely from an LLM or a voice transcript."""
         from action_response import parse_action_response, response_for_display
         parsed = parse_action_response(contract)
@@ -617,6 +940,7 @@ class DesktopShell:
         approved=(response==QMessageBox.Yes)
         self._set_state('EXECUTING' if approved else 'IDLE')
         if self.panel:self.panel.set_busy(True)
+        epoch = self._voice_epoch
         def worker():
             try:
                 if not self.api:raise RuntimeError('Core no disponible')
@@ -625,6 +949,8 @@ class DesktopShell:
                 else:
                     result=self.api.cancel_action(contract)
                 if self.bridge:self.bridge.quick_result.emit(result or {})
+                if speak and result.get("response"):
+                    self._speak_text_worker(result["response"], epoch=epoch)
             except Exception as exc:
                 if self.bridge:self.bridge.quick_error.emit('Acción de escritorio: '+str(exc)[:400])
         threading.Thread(target=worker,daemon=True,name='gaia-pc-action-approval').start()
@@ -639,41 +965,43 @@ class DesktopShell:
             # For a spoken/written request require conscious screen selection in UI.
             if not display_id:
                 from PySide6.QtWidgets import QInputDialog
-                labels=[f"{m['name']} ({m['width']}x{m['height']})" for m in monitors]
+                labels=[f"{m['display_id']} · {m['name']} ({m['width']}x{m['height']})" for m in monitors]
                 choice,ok=QInputDialog.getItem(self.panel,"GAIA · autorizar captura",
                       "Selecciona el monitor que GAIA puede analizar (una captura):",labels,0,False)
                 if not ok:
                     if self.panel:self.panel.show_feedback("Captura cancelada. GAIA no vio la pantalla.")
                     return
                 display_id=monitors[labels.index(choice)]["display_id"]
-            if display_id not in {d["display_id"] for d in monitors}:
+            selected = next((item for item in monitors if item["display_id"] == display_id), None)
+            if selected is None:
                 raise ValueError("Selecciona un monitor disponible.")
             self._show_orb();self._set_state("THINKING")
             if self.panel:
                 self.panel.show();self.panel.set_busy(True)
-                self.panel.show_feedback("Captura única autorizada; analizando localmente…")
-            threading.Thread(target=self._vision_worker,args=(display_id,question),name="gaia-vision",daemon=True).start()
+                self.panel.show_feedback("Captura autorizada. Verificando el modelo visual…")
+            threading.Thread(target=self._vision_worker,args=(selected, question, self._voice_epoch),name="gaia-vision",daemon=True).start()
         except Exception as exc:
             self._handle_error_gui(str(exc))
 
-    def _vision_worker(self,display_id,question):
+    def _vision_worker(self, display, question, epoch):
         try:
             from gaia_vision import describe_monitor
-            result=describe_monitor(display_id,question)
-            if self.bridge:self.bridge.quick_result.emit(result)
-            self._speak_text_worker(result["response"])
+
+            def progress(message):
+                if self.bridge:
+                    self.bridge.core_event.emit({"source": "vision_progress", "message": message})
+
+            result = describe_monitor(display["display_id"], question, expected_display=display, on_stage=progress)
+            if self.bridge:
+                self.bridge.quick_result.emit(result)
+            self._speak_text_worker(result["response"], epoch=epoch, local_only=True)
         except Exception as exc:
             if self.bridge:self.bridge.quick_error.emit(f"Visión: {exc}")
 
-    def _speak_text_worker(self,text):
-        try:
-            if not self.api:return
-            path=self.api.request_tts(str(text)[:1500])
-            if self.bridge:self.bridge.voice_result.emit({"_audio_path":str(path),"response":""})
-        except Exception as exc:
-            # Keep the visual answer even when Piper or the audio device is missing.
-            if self.bridge:self.bridge.core_event.emit({"state":"IDLE","source":"tts_error",
-                                                        "message":"TTS no disponible: "+str(exc)[:250]})
+    def _speak_text_worker(self, text, *, epoch, local_only=False):
+        if self.api and self.bridge and epoch == self._voice_epoch and not self._shutdown.is_set():
+            self.bridge.voice_result.emit({"response": "", "_voice_epoch": epoch,
+                                           "_speech_text": str(text), "_local_speech": local_only, "tts_enabled": True})
 
     def refresh_diagnostics(self,*_):
         from gaia_vision import available_displays
@@ -682,30 +1010,36 @@ class DesktopShell:
         except Exception as exc:
             if self.panel:self.panel.show_feedback("Monitores: " + str(exc))
         def worker():
+            from gaia_vision import vision_readiness
+            info = {"_gaia_diagnostic": True, "core": "Sin respuesta", "chat": "Sin verificar",
+                    "voice": "Sin verificar", "memory": "Sin verificar"}
             try:
-                from gaia_vision import vision_readiness
-                readiness=vision_readiness()
-                if not self.api:raise RuntimeError("Cliente de GAIA no disponible")
-                core_info=self.api._request("GET","/api/health",timeout=5).json()
-                core="Conectado" if core_info.get("status")=="online" else "Sin respuesta"
-                status=self.api._request("GET","/api/status",timeout=8).json()
-                llm=status.get("llm") or {}
-                chat=str(llm.get("status") or "desconocido")
-                voice_status="STT habilitado" if (status.get("voice") or {}).get("stt_enabled") else "STT desactivado"
-                try:
-                    voices=self.api._request("GET","/api/voice/voices",timeout=6).json()
-                    voice_list=voices if isinstance(voices,list) else voices.get("voices",[])
-                    if isinstance(voice_list,list) and voice_list and not any(v.get("Ready",False) for v in voice_list):
-                        voice_status += ", Piper sin modelo (SAPI Windows opcional)"
-                except Exception:
-                    voice_status += ", verificar Piper"
-                info={"_gaia_diagnostic":True,"core":core,"chat":chat,"chat_hint":llm.get("hint", ""),
-                      "vision":readiness,"voice":voice_status}
-                if self.bridge:self.bridge.quick_result.emit(info)
+                if not self.api:
+                    raise RuntimeError("Cliente de GAIA no disponible.")
+                core = self.api.health()
+                if core.get("status") == "online":
+                    info["core"] = "Conectado"
+                status = self.api.status()
+                llm = status.get("llm") or {}
+                info.update(chat=llm.get("status", "Sin verificar"), chat_hint=llm.get("hint", ""))
+                db = status.get("memory") or {}
+                if db:
+                    info["memory"] = f"SQLite · esquema {db.get('schema_version', '?')}"
+                voice = status.get("voice") or {}
+                info["voice"] = "STT habilitado" if voice.get("stt_enabled") else "STT desactivado"
+                if voice.get("tts_enabled"):
+                    voices = self.api._request("GET", "/api/voice/voices", timeout=6).json()
+                    if isinstance(voices, list) and any(item.get("Ready") for item in voices):
+                        info["voice"] += " · Piper presente"
+                    else:
+                        info["voice"] += " · verificar Piper"
+                else:
+                    info["voice"] += " · TTS desactivado"
             except Exception as exc:
-                from gaia_vision import vision_readiness
-                if self.bridge:self.bridge.quick_result.emit({"_gaia_diagnostic":True,"core":"Desconectado: "+str(exc)[:60],
-                                                              "chat":"Sin verificar","vision":vision_readiness(),"voice":"Sin verificar"})
+                info["chat_hint"] = f"No se completó el diagnóstico ({type(exc).__name__})."
+            info["vision"] = vision_readiness()
+            if self.bridge:
+                self.bridge.quick_result.emit(info)
         threading.Thread(target=worker,daemon=True,name="gaia-diagnostics").start()
 
     def _show_permission(self,request):
@@ -722,8 +1056,17 @@ class DesktopShell:
     def restart(self,*_): self._shutdown_ui(RESTART_EXIT_CODE)
     def stop(self,*_): self._shutdown_ui(0)
     def _shutdown_ui(self,exit_code:int):
+        self._shutdown.set()
+        self._voice_epoch += 1
         if self.wake: self.wake.stop(); self.wake=None
-        self.ptt_hotkey.unregister(); self.quick_hotkey.unregister(); self.events.stop(); self.capture.stop(); self.barge.stop(); self.player.stop()
+        self.ptt_hotkey.unregister(); self.quick_hotkey.unregister(); self.events.stop()
+        try:
+            self.capture.cancel()
+        except Exception:
+            pass
+        finally:
+            self.barge.stop()
+            self.player.stop()
         if self.quick_command_window: self.quick_command_window.close(); self.quick_command_window=None
         if self.panel:self.panel.close();self.panel=None
         if self.permission_dialog: self.permission_dialog.close(); self.permission_dialog=None
