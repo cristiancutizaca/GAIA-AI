@@ -31,7 +31,7 @@ except ImportError:
     httpx = None
 try:
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
     sd = None
 try:
     import numpy as np
@@ -39,7 +39,7 @@ except ImportError:
     np = None
 try:
     import soundfile as sf
-except ImportError:
+except (ImportError, OSError):
     sf = None
 
 CORE_DEFAULT = os.getenv("LUMEN_CORE_URL") or f"http://127.0.0.1:{os.getenv('LUMEN_PORT', '8090')}"
@@ -395,7 +395,7 @@ class BargeInMonitor:
 
 if PYSIDE_AVAILABLE:
     class QtBridge(QObject):
-        core_event=Signal(object); wake_audio=Signal(object); voice_result=Signal(object); voice_error=Signal(object)
+        core_event=Signal(object); wake_audio=Signal(object, int); voice_result=Signal(object); voice_error=Signal(object)
         quick_result=Signal(object); quick_error=Signal(str); hotkey_action=Signal(str); playback_done=Signal(int); playback_started=Signal(int, float); barge_in=Signal()
 else:
     class QtBridge: pass
@@ -527,11 +527,12 @@ class DesktopShell(QObject):
     def _on_wake_detected(self, audio_path):
         path = Path(audio_path)
         if self.bridge is not None and self._microphone_on and not self._shutdown.is_set():
-            self.bridge.wake_audio.emit(path)
+            self.bridge.wake_audio.emit(path, self._voice_epoch)
         else:
             path.unlink(missing_ok=True)
-    def _handle_wake_audio_gui(self, path):
-        if not self._microphone_on or self._shutdown.is_set() or self.capture.recording:
+    def _handle_wake_audio_gui(self, path, epoch=None):
+        if ((epoch is not None and epoch != self._voice_epoch)
+                or not self._microphone_on or self._shutdown.is_set() or self.capture.recording):
             Path(path).unlink(missing_ok=True)
             return
         self._voice_epoch += 1
@@ -970,6 +971,7 @@ class DesktopShell(QObject):
                       "Selecciona el monitor que GAIA puede analizar (una captura):",labels,0,False)
                 if not ok:
                     if self.panel:self.panel.show_feedback("Captura cancelada. GAIA no vio la pantalla.")
+                    self._continue_conversation_gui()
                     return
                 display_id=monitors[labels.index(choice)]["display_id"]
             selected = next((item for item in monitors if item["display_id"] == display_id), None)

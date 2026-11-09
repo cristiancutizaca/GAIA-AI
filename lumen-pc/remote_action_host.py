@@ -37,12 +37,13 @@ class RemoteActionHost:
         client: httpx.Client | None = None,
         action_host: ActionHost | None = None,
     ) -> None:
-        self.core_url = (core_url or os.getenv("LUMEN_CORE_URL", "http://127.0.0.1:8090")).rstrip("/")
+        self.core_url = (core_url or os.getenv("LUMEN_CORE_URL")
+                         or f"http://127.0.0.1:{os.getenv('LUMEN_PORT', '8090')}").rstrip("/")
         self.token = str(token or os.getenv("GAIA_REMOTE_HOST_TOKEN", "")).strip()
         self.device_id = str(device_id or os.getenv("GAIA_PC_DEVICE_ID", "pc-main")).strip() or "pc-main"
         self.poll_seconds = max(1.0, float(poll_seconds or os.getenv("GAIA_REMOTE_HOST_POLL_SECONDS", "2.0")))
         self.heartbeat_seconds = max(5.0, float(heartbeat_seconds or os.getenv("GAIA_REMOTE_HOST_HEARTBEAT_SECONDS", "15.0")))
-        self.client = client or httpx.Client(timeout=httpx.Timeout(20.0, connect=5.0))
+        self.client = client or httpx.Client(timeout=httpx.Timeout(20.0, connect=5.0), trust_env=False)
         self.owns_client = client is None
         self.action_host = action_host or ActionHost(project_dir or Path.cwd())
         self.stop_event = threading.Event()
@@ -111,6 +112,8 @@ class RemoteActionHost:
     def complete(self, item: dict, verified) -> dict:
         payload = verified.as_payload() if hasattr(verified, "as_payload") else verified.as_dict()
         data = dict(payload.get("data") or {})
+        if payload.get("plan_id"):
+            data["plan_id"] = payload["plan_id"]
         data.update({"execution_verified": bool(payload.get("execution_verified")), "host_version": payload.get("host_version"), "audit_digest": payload.get("audit_digest"), "verified_result": payload})
         return self._request("POST", "/api/actions/complete", json={"action_id": item["action_id"], "session_id": item["session_id"], "device": self.device_id, "success": bool(payload.get("success")), "message": str(payload.get("message") or "Acción completada."), "data": data}).json()
 

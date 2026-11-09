@@ -8,15 +8,14 @@ from typing import Any
 import httpx
 
 
-OLLAMA_URL = (os.getenv("OLLAMA_URL") or os.getenv("GAIA_OLLAMA_URL") or os.getenv("LUMEN_OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
-
-
 def collect_ollama_context(timeout: float = 1.5) -> dict[str, Any]:
     """Return loaded-model and runtime hints, or ``offline`` when unavailable."""
+    candidates = (os.getenv(name, "").strip() for name in ("OLLAMA_URL", "GAIA_OLLAMA_URL", "LUMEN_OLLAMA_URL"))
+    url = next((value for value in candidates if value), "http://127.0.0.1:11434").rstrip("/")
     try:
         with httpx.Client(timeout=max(0.2, float(timeout)), trust_env=False) as client:
-            ps_response = client.get(f"{OLLAMA_URL}/api/ps")
-            tags_response = client.get(f"{OLLAMA_URL}/api/tags")
+            ps_response = client.get(f"{url}/api/ps")
+            tags_response = client.get(f"{url}/api/tags")
         if ps_response.status_code >= 400 and tags_response.status_code >= 400:
             return {"status": "offline"}
         ps_payload = ps_response.json() if ps_response.status_code < 400 else {}
@@ -24,8 +23,11 @@ def collect_ollama_context(timeout: float = 1.5) -> dict[str, Any]:
     except (httpx.HTTPError, ValueError, OSError):
         return {"status": "offline"}
 
-    loaded = [_model_summary(item) for item in (ps_payload.get("models") or []) if isinstance(item, dict)]
-    available = [str(item.get("name", "")) for item in (tags_payload.get("models") or []) if isinstance(item, dict) and item.get("name")]
+    running, installed = _model_rows(ps_payload), _model_rows(tags_payload)
+    if running is None and installed is None:
+        return {"status": "unverified"}
+    loaded = [_model_summary(item) for item in running or []]
+    available = [str(item["name"]) for item in installed or [] if item.get("name")]
     primary = loaded[0] if loaded else {}
     return {
         "status": "online",
@@ -36,6 +38,11 @@ def collect_ollama_context(timeout: float = 1.5) -> dict[str, Any]:
         "context_length": primary.get("context_length"),
         "keep_alive": primary.get("keep_alive"),
     }
+
+
+def _model_rows(payload: object) -> list[dict] | None:
+    models = payload.get("models") if isinstance(payload, dict) else None
+    return [item for item in models if isinstance(item, dict)] if isinstance(models, list) else None
 
 
 def _model_summary(item: dict[str, Any]) -> dict[str, Any]:

@@ -80,7 +80,7 @@ def authenticate(authorization: str = Header(default="")) -> Principal:
     if not allowed:
         raise HTTPException(status_code=429, detail="Límite de solicitudes alcanzado.", headers={"Retry-After": str(retry_after)})
     expected = f"Bearer {API_SECRET}"
-    if hmac.compare_digest(authorization, expected):
+    if hmac.compare_digest(authorization.encode("utf-8"), expected.encode("utf-8")):
         return _master_principal()
     if DEVICE_TOKENS_ENABLED and authorization.startswith("Bearer "):
         verified = memory.verify_device_token(authorization[7:])

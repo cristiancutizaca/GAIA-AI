@@ -6,7 +6,7 @@ import queue
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, messagebox, simpledialog, filedialog
-from desktop_api import LumenDesktopAPI, LumenAPIError, POLL_SECONDS, record_microphone, play_audio
+from desktop_api import LumenDesktopAPI, LumenAPIError, POLL_SECONDS, record_microphone, play_audio, release_temp
 from action_response import parse_action_response, response_for_display
 
 BG = "#10121a"
@@ -191,7 +191,7 @@ class LumenGUI(tk.Tk):
 
     def _receive_chat(self, data: dict) -> None:
         self.generation_var.set("Cancelado" if data.get("kind") == "cancelled" else "Listo")
-        parsed = parse_action_response(data)
+        parsed = None if data.get("local_result") else parse_action_response(data)
         if parsed and parsed.confirmation_required:
             self.generation_var.set("Esperando decisión de permisos...")
             decision = self._permission_dialog(data, parsed)
@@ -269,7 +269,10 @@ class LumenGUI(tk.Tk):
         self._append("system", "Grabando 5 segundos...")
         def task():
             audio = record_microphone(5)
-            return self.api.send_voice(audio)
+            try:
+                return self.api.send_voice(audio)
+            finally:
+                release_temp(audio)
         self._run(task, self._receive_voice, self._generation_error)
 
     def _receive_voice(self, data: dict) -> None:
